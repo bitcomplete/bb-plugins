@@ -7408,6 +7408,51 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const TERMINAL_WORKER_REPORT_MS = 15 * 60_000;
 
     /**
+     * BB-386: the open work a binding still holds, by the mechanical
+     * definition: pull requests it opened that are still open, running
+     * workers, open escalations, open needs and a typed wait. Stacked and
+     * held bindings are not here: they are listed by the wrap-up wake but
+     * never keep a binding from ending. `pulls` is the open pull-request
+     * subset, for the follow-through default and the re-homing path.
+     */
+    async function openWorkFor(b: Binding, observed: Observed, opts: { includeWorkers?: boolean } = {}): Promise<{ items: string[]; pulls: string[] }> {
+      const items: string[] = [];
+      const pulls: string[] = [];
+      const ownPulls = await ownPullKeys(b, store.workers(b.id), observed);
+      for (const p of observedPulls(b, observed)) {
+        if (p.pull === null) continue;
+        if (p.pull.merged === true || lc(p.state) === "closed" || lc(p.state) === "merged") continue;
+        if (!pullBelongsToTicket(b, p, ownPulls)) continue;
+        pulls.push(p.key);
+        items.push(`pull request ${p.key} is still open`);
+      }
+      if (opts.includeWorkers !== false) {
+        for (const w of store.workers(b.id)) {
+          if (w.status === "running") items.push(`worker "${w.title}" (thread ${w.threadId}) is still running`);
+        }
+      }
+      for (const x of store.openEscalations(b.id)) items.push(`escalation ${x.id} (${x.kind}) is still open: ${x.question}`);
+      for (const n of store.openNeeds(b.id)) items.push(`need ${n.id} (${n.kind}) is still open: ${n.what}`);
+      if (b.wait !== null) items.push(`a typed wait is still open: ${b.wait.kind} ${b.wait.ref}`);
+      return { items, pulls };
+    }
+
+    /**
+     * BB-386: the bindings stacked on or held behind `b`, for the wrap-up
+     * wake's context. These never keep the binding from ending: a behind hold
+     * lifts when the binding ends, and a stacked binding waits for it.
+     */
+    function stackedOrHeld(b: Binding): string[] {
+      const out: string[] = [];
+      for (const h of store.open(b.projectId)) {
+        if (h.id === b.id) continue;
+        if (h.mergeBehind.some((k) => lc(k) === lc(b.entityKey) || lc(k) === lc(b.id))) out.push(`${h.entityKey} (held behind this binding)`);
+        if (b.stackedPulls.length > 0 && h.mergeBehind.some((k) => b.stackedPulls.some((p) => lc(p) === lc(k)))) out.push(`${h.entityKey} (stacked on this binding's pull request)`);
+      }
+      return [...new Set(out)];
+    }
+
+    /**
      * The one wrap-up (terminal) or stop (detach, disabled, reassigned,
      * moved) turn before the binding ends. A detach stops the workers now:
      * someone took the label off; a reassignment, an unassignment or a move to
@@ -7428,9 +7473,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const workerDone =
         kind === "terminal" &&
         store.workers(b.id).some((w) => w.result !== null && (w.endedAt === null || now() - w.endedAt <= TERMINAL_WORKER_REPORT_MS) && workerReportedTerminal(w.result, observed.entity.key, playbook));
-      const ownDone = kind === "terminal" && (stewardDone || workerDone);
+      // BB-386: the ownDone shortcut must not fire while the binding holds open
+      // work. A binding does not end silently over a pull request it opened, a
+      // running worker, an open escalation, need or typed wait; it takes its
+      // wrap-up wake, which names each item.
+      const work = kind === "terminal" ? await openWorkFor(b, observed) : { items: [] as string[], pulls: [] as string[] };
+      const ownDone = kind === "terminal" && (stewardDone || workerDone) && work.items.length === 0;
       signalNeedActionability(b, observed);
-      b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed, clearedToStart: false });
+      // BB-386: follow-through is the default for a still-open pull request the
+      // binding opened, so the ending waits until the wrap-up settles every
+      // item rather than ending quietly. A report without followThrough keeps
+      // it on while any item remains (the report path enforces that too).
+      const followThrough = work.items.length === 0 ? null : `Open work: ${work.items.join("; ")}`;
+      const followThroughUntil = followThrough === null ? null : now() + (playbook.followThroughMs ?? DEFAULT_FOLLOW_THROUGH_MS);
+      b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough, followThroughUntil, lastSnapshot: observed, clearedToStart: false });
       // Whatever its work was holding back can go now: landed, canceled or no longer managed, it is not merging later.
       await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "the project was switched off" : kind === "reassigned" ? "was reassigned away from this server" : kind === "moved" ? `moved to the ${observed.entity.unit} team, which this project does not watch` : "was detached");
       if (kind !== "terminal") await stopWorkers(b);
@@ -7449,7 +7505,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await finishEnding(b, "terminal");
         return;
       }
-      await wake(b, config, playbook, observed, [kind === "terminal" ? `Terminal: ${observed.entity.state}` : kind === "disabled" ? "Stewards for this project were switched off on this server" : kind === "reassigned" ? `Reassigned: ${observed.entity.assignees.join(", ") || "no assignee"}` : kind === "moved" ? `Moved: ${observed.entity.unit} is not a team this project watches` : `The ${config.file.label} label was removed`], kind);
+      await wake(b, config, playbook, observed, [
+        kind === "terminal" ? `Terminal: ${observed.entity.state}` : kind === "disabled" ? "Stewards for this project were switched off on this server" : kind === "reassigned" ? `Reassigned: ${observed.entity.assignees.join(", ") || "no assignee"}` : kind === "moved" ? `Moved: ${observed.entity.unit} is not a team this project watches` : `The ${config.file.label} label was removed`,
+        ...work.items.map((i) => `Open work, finish, transfer or close it: ${i}`),
+        ...(kind === "terminal" ? stackedOrHeld(b).map((i) => `Stacked on or held behind this binding (it never keeps it from ending): ${i}`) : []),
+      ], kind);
     }
 
     /**
@@ -7573,6 +7633,62 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const { b, closed } of byBinding.values()) noteEndingReport(b, `closed ${closed.join("; ")}.`);
     }
 
+    /** BB-386: the entity keys a pull request body says it fixes or closes. */
+    function pullFixesKeys(pull: EntitySnapshot): string[] {
+      const body = pull.description ?? "";
+      const out: string[] = [];
+      for (const m of body.matchAll(/(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#(\d+)/giu)) out.push(`${pull.unit}#${m[1]}`);
+      for (const m of body.matchAll(/(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+([A-Za-z][A-Za-z0-9]*-\d+)/giu)) out.push(m[1]!);
+      return [...new Set(out)];
+    }
+
+    /**
+     * BB-386: an open pull request whose owning binding ended is re-homed,
+     * never dropped. It goes to an open binding whose ticket the pull request
+     * body says it fixes or closes, or to the project steward as a need naming
+     * it. Only a pull request a binding on this server opened is moved: a
+     * teammate's, with no ended binding of ours behind it, is left alone.
+     */
+    async function rehomeOrphanedPulls(config: ProjectConfig): Promise<void> {
+      const projectId = config.projectId;
+      const seen = new Set<string>();
+      for (const b of store.all(projectId)) {
+        if (b.endedAt === null || b.lastSnapshot === null) continue;
+        const observed = b.lastSnapshot;
+        for (const p of observedPulls(b, observed)) {
+          if (p.pull === null || p.pull.merged === true || lc(p.state) === "closed" || lc(p.state) === "merged") continue;
+          const key = lc(p.key);
+          if (seen.has(key)) continue;
+          const ownPulls = await ownPullKeys(b, store.workers(b.id), observed);
+          if (!pullBelongsToTicket(b, p, ownPulls)) continue;
+          seen.add(key);
+          const handoff = store.pullHandoff(p.key);
+          if (handoff !== null && handoff.toBindingId !== b.id) continue;
+          const target = pullFixesKeys(p)
+            .map((k) => store.find(k, projectId))
+            .find((t): t is Binding => t !== null && t.endedAt === null && t.id !== b.id) ?? null;
+          if (target !== null) {
+            store.handOffPull(p.key, target.id, b.id);
+            scheduleReconcile(target.id);
+            bb.log.info(`stewards: re-homed ${p.key} from ended ${b.entityKey} to ${target.entityKey}`);
+            continue;
+          }
+          const what = `${p.key} has no steward: adopt it under a ticket, or close it`;
+          const already = store.openNeeds(b.id).some((n) => n.kind === "decide" && n.what === what);
+          store.fileNeed({
+            bindingId: b.id,
+            kind: "decide",
+            url: p.url ?? "",
+            what,
+            how: `The binding that opened it (${b.entityKey}) ended while it was still open.`,
+            why: "Re-homing found no open binding whose ticket this pull request fixes or closes.",
+            filedBy: "plugin",
+          });
+          if (!already) await wakeProject(projectId, `${p.key} has no steward`, { digestDue: false, notes: [what] });
+        }
+      }
+    }
+
     async function finishEnding(b: Binding, reason: string): Promise<void> {
       b = store.patch(b.id, { ending: null, endingAt: null, followThrough: null, followThroughUntil: null, endedAt: now(), endReason: reason, awaitingReport: false, requeueAt: null });
       // Mechanical cleanup, not a decision: the origin binding has ended, so
@@ -7639,12 +7755,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function followThroughRanOut(b: Binding): Promise<void> {
       const what = b.followThrough ?? "(not said)";
       const stopped = store.workers(b.id).filter((w) => w.status === "running").map((w) => w.title);
+      // BB-386: the deadline is not a quiet end. Any open work still held is
+      // named in a `decide` need for the owner, so the orphaned items are
+      // visible rather than dropped; the re-homing pass then gives an open
+      // pull request a new owner.
+      const work = b.lastSnapshot === null ? { items: [] as string[], pulls: [] as string[] } : await openWorkFor(b, b.lastSnapshot);
+      if (work.items.length > 0) {
+        store.fileNeed({
+          bindingId: b.id,
+          kind: "decide",
+          url: "",
+          what: `Finish the work ${b.entityKey} left open`,
+          how: `The binding reached a terminal state and kept following through, but its deadline passed with these still open:\n${work.items.map((i) => `- ${i}`).join("\n")}`,
+          why: "The binding's follow-through ran out before every open item was finished, transferred or closed.",
+          filedBy: "plugin",
+        });
+      }
       bb.log.warn(`stewards: ${b.entityKey}'s follow-through ran out (${what})`);
       await finishEnding(b, "terminal");
       await wakeProject(b.projectId, `follow-through ran out on ${b.entityKey}`, {
         digestDue: false,
         notes: [
           `${b.entityKey} reached a terminal state and its steward kept it open to follow through: ${JSON.stringify(what)}. That ran out before the steward said it was done, so the binding ended${stopped.length > 0 ? ` and these workers were stopped: ${stopped.join("; ")}` : ""}.`,
+          ...(work.items.length > 0 ? [`Open work it left behind: ${work.items.join("; ")}. The owner has a decide item naming it; an open pull request is re-homed on the next reconcile.`] : []),
           "Decide from the project's guidance whether the work needs finishing. Reopening the entity resumes its steward; do not do a steward's work yourself.",
         ],
       });
@@ -9125,6 +9258,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * naming branch or title is not recognized in this first cut (BB-239 spec).
      */
     function pullBelongsToTicket(b: Binding, pull: EntitySnapshot, ownPulls: ReadonlySet<string>): boolean {
+      // BB-386: a handoff is authoritative. A pull request moved to another
+      // binding belongs to the row's target and to no one else, whatever the
+      // opening worker's branch or the title says.
+      const handoff = store.pullHandoff(pull.key);
+      if (handoff !== null) return handoff.toBindingId === b.id;
       const escape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
       if (ownPulls.has(lc(pull.key)) || (pull.url !== null && ownPulls.has(lc(pull.url)))) return true;
       const key = b.entityKey.trim();
@@ -13155,6 +13293,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(20)
           .optional()
           .describe('A merge hold: entity keys of open bindings in this project whose work must finish before this binding\'s pull request is merged, like steward_update\'s behind. While it stands the plugin files no Merge item (so the page does not read as "needs you"), the binding shows as held, and it is a live wake source. Report it when a spec says "do not merge before X is Done"; the hold lifts itself, and you are woken, once every named binding has merged its pull requests or ended. Each report replaces the set; `mergeBehind: []` clears it.'),
+        handOff: z
+          .object({
+            pull: z.string().trim().min(1).max(500).describe("The pull request to transfer: its key (owner/repo#N) or URL. It must be one this binding opened."),
+            to: z.string().trim().min(1).max(200).describe("The binding that takes it: another open binding's entity key (or id) in this project."),
+          })
+          .optional()
+          .describe("BB-386: transfer one of this binding's open pull requests to another binding, so that binding merges it. The store records the move and the target files the Merge item; it changes which binding merges, never the lane, gate or an approval. Use it in the wrap-up turn instead of leaving a pull request behind."),
         needs: z
           .array(
             z.object({
@@ -13299,6 +13444,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (missing.length > 0) return toolError(new Error(`Not an open binding or pull request in this project to hold the merge behind: ${missing.join(", ")}.`));
             mergeBehind = [...named.map((x) => x.entityKey), ...prKeys];
           }
+          // BB-386: a handoff moves one of this binding's open pull requests to
+          // another open binding, so the target merges it. The store records the
+          // move; `pullBelongsToTicket` reads it first, so the opener no longer
+          // owns the pull and the target's merge item is not foreign. Only a
+          // pull this binding opened can be moved, and only to a binding on this
+          // server.
+          let handOffNote = "";
+          if (input.handOff !== undefined) {
+            const ref = parsePullRef(input.handOff.pull);
+            if (ref === null) return toolError(new Error(`handOff.pull must be a pull request key (owner/repo#N) or its URL; ${JSON.stringify(input.handOff.pull)} is not.`));
+            const pullKey = `${ref.repo}#${ref.number}`;
+            const target = store.find(input.handOff.to, b.projectId);
+            if (target === null || target.endedAt !== null) return toolError(new Error(`handOff.to must name an open binding in this project; ${JSON.stringify(input.handOff.to)} is not one.`));
+            if (target.id === b.id) return toolError(new Error("handOff.to is this binding; name the binding that takes the pull request."));
+            const observed = b.lastSnapshot;
+            const ownPulls = observed === null ? new Set<string>() : await ownPullKeys(b, store.workers(b.id), observed);
+            const pull = observed === null ? null : (observedPulls(b, observed).find((p) => lc(p.key) === lc(pullKey)) ?? null);
+            if (pull === null || !pullBelongsToTicket(b, pull, ownPulls)) return toolError(new Error(`${pullKey} is not an open pull request this binding opened, so it cannot be handed off. A pull request opened by another binding is that binding's to move.`));
+            store.handOffPull(pullKey, target.id, b.id);
+            scheduleReconcile(target.id);
+            handOffNote = ` ${pullKey} is now ${target.entityKey}'s to merge; it files the Merge item on its next look.`;
+          }
           // BB-231: a free-form escalation must say how it differs from every
           // open user-facing item on the binding, or it can duplicate the
           // plugin's gate item. The pairwise judgement is forced here; no
@@ -13332,7 +13499,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // unanswered (BB-60).
           const openBeforeReport = b.ending === "terminal" ? store.openEscalations(b.id) : [];
           const escalationFollowThrough = b.ending !== "terminal" ? null : (input.escalate?.question ?? openBeforeReport[0]?.question ?? null);
-          const followThrough = input.followThrough ?? escalationFollowThrough;
+          // BB-386: while the binding still holds open work (a pull request it
+          // opened, an open escalation, need or typed wait), follow-through
+          // stays on even when the report does not name it, so the wrap-up turn
+          // cannot end the binding over an unfinished item; the overdue path
+          // raises a need naming the orphans. A running worker is deliberately
+          // not counted here: the wrap-up report is the steward's affirmative
+          // decision, and ending the binding stops the worker (the mechanical
+          // tier's ownDone gate does count it, so no end is silent).
+          const openWork = b.ending === "terminal" && input.followThrough === undefined && b.lastSnapshot !== null ? await openWorkFor(b, b.lastSnapshot, { includeWorkers: false }) : { items: [] as string[], pulls: [] as string[] };
+          const followThrough = input.followThrough ?? escalationFollowThrough ?? (openWork.items.length === 0 ? null : `Open work: ${openWork.items.join("; ")}`);
           // Follow-through has one deadline from when it was first declared; a
           // requeue past it is a requeue at it.
           const followThroughUntil = b.ending !== "terminal" ? null : (b.followThroughUntil ?? (followThrough === null ? null : now() + (playbook?.followThroughMs ?? DEFAULT_FOLLOW_THROUGH_MS)));
@@ -13858,20 +14034,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // that would contradict it.
           const requeueOnly = `Until you name one, this wait is delivered only by requeue, ${requeuePhrase}.`;
           if (b.ending === "terminal") {
-            if (b.followThrough === null) return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
+            if (b.followThrough === null) return `Reported.${untilNote}${waitNote}${replacedNote}${handOffNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
             const followWake = noWakeSource
               ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} ${requeueOnly}`
               : `You will be woken when a worker finishes or something actionable changes, or ${requeuePhrase}. End the turn now.`;
-            return `Reported.${untilNote}${waitNote}${replacedNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. ${followWake}`;
+            return `Reported.${untilNote}${waitNote}${replacedNote}${handOffNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. ${followWake}`;
           }
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
           if (gateJustPassed && nothingPending) {
-            return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
+            return `Reported.${untilNote}${waitNote}${replacedNote}${handOffNote}${recorded}${filingNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
           }
           const wakeNote = noWakeSource
             ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} ${requeueOnly}`
             : `You will be woken when something actionable changes, or ${requeuePhrase}. End the turn now.`;
-          return `Reported.${untilNote}${waitNote}${replacedNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} ${wakeNote}`;
+          return `Reported.${untilNote}${waitNote}${replacedNote}${handOffNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} ${wakeNote}`;
         } catch (error) {
           return toolError(error);
         }
@@ -13953,6 +14129,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(10)
           .optional()
           .describe("With hold: the open bindings (entity keys) whose open pull request this stack-wait waits for. It lifts itself, and the steward is woken with that pull request's head branch, as soon as every one has opened a pull request; use it to start a ticket stacked on work still being built."),
+        adoptPull: z
+          .string()
+          .trim()
+          .min(1)
+          .max(500)
+          .optional()
+          .describe("Project steward only, with binding: take a pull request this server opened (its key owner/repo#N or URL) into that binding, so it merges it. It moves which binding merges, never the lane, gate or an approval. Refused for a pull request this server did not open (a teammate's)."),
         stewardModel: modelSpecSchema.optional().describe("The steward thread's model, provider/model/level."),
         workerModel: modelSpecSchema.optional().describe("The model for workers it starts from now."),
         reviewerModel: modelSpecSchema.optional().describe("The model for reviewers its workers start from now."),
@@ -14149,6 +14332,36 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           const self = target.threadId === threadId;
 
+          // BB-386: the project steward adopts a pull request this server
+          // opened into a named binding, so the binding that should merge it
+          // owns it. A teammate's pull request is never adopted; the move
+          // changes only which binding merges, never the lane, gate or an
+          // approval.
+          if (input.adoptPull !== undefined) {
+            if (projectOf === null) return toolError(new Error("adoptPull is the project steward's: a steward hands a pull request off with steward_report { handOff }."));
+            if (target.endedAt !== null) return toolError(new Error(endedBindingRefusal(target)));
+            const ref = parsePullRef(input.adoptPull);
+            if (ref === null) return toolError(new Error(`adoptPull must be a pull request key (owner/repo#N) or its URL; ${JSON.stringify(input.adoptPull)} is not.`));
+            const pullKey = `${ref.repo}#${ref.number}`;
+            const pull = await snapshot("github", pullKey).catch(() => null);
+            if (pull === null || pull.kind !== "pull") return toolError(new Error(`No pull request ${pullKey} to adopt.`));
+            const config = await loadConfig(target.projectId);
+            const login = config?.githubLogin ?? null;
+            if (login !== null && pull.author !== null && lc(pull.author) !== lc(login)) {
+              return toolError(new Error(`${pullKey} was not opened by this server's GitHub login, so it is not this server's to adopt.`));
+            }
+            const handoff = store.pullHandoff(pullKey);
+            const current = handoff === null ? null : store.binding(handoff.toBindingId);
+            if (current !== null && current.id === target.id) {
+              done.push(`${pullKey} is already ${target.entityKey}'s`);
+            } else {
+              store.handOffPull(pullKey, target.id, current?.id ?? handoff?.fromBindingId ?? null);
+              scheduleReconcile(target.id);
+              done.push(`adopted ${pullKey}; ${target.entityKey} files the Merge item on its next look`);
+              notes.push(`${pullKey} adopted by ${target.entityKey}; it files the Merge item on its next look.`);
+            }
+          }
+
           const forwarding = input.forward === undefined ? null : store.escalation(input.forward);
           if (input.forward !== undefined) {
             if (forwarding === null || forwarding.status !== "open" || forwarding.bindingId !== target.id) return toolError(new Error(`No open escalation ${input.forward} on ${target.entityKey}.`));
@@ -14277,7 +14490,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const info = await threadInfo(target.threadId);
               if (info !== null && info.providerId !== "" && info.providerId !== input.stewardModel.providerId) return toolError(new Error(`${target.entityKey}'s steward runs on ${info.providerId}; a model can be changed, the provider cannot.`));
             }
-            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.behind, input.stack, input.stewardModel, input.workerModel, input.reviewerModel, input.approve === true ? true : undefined, input.ask, input.lesson, closing ?? undefined];
+            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.behind, input.stack, input.stewardModel, input.workerModel, input.reviewerModel, input.approve === true ? true : undefined, input.ask, input.lesson, input.adoptPull, closing ?? undefined];
             if (asked.every((v) => v === undefined)) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, ask, or record a lesson."));
           }
           const behind: Binding[] = [];
@@ -15005,6 +15218,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       applyRationaleClustering(config);
       // BB-325: close any open item left on an ended binding, once.
       closeItemsOnEndedBindings(config.projectId);
+      // BB-386: an open pull request whose owning binding ended is re-homed or
+      // named in a project-steward need, never dropped.
+      await rehomeOrphanedPulls(config);
       for (const b of store.open(config.projectId)) {
         if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
         const deadline = endingDeadline(b, timing.endingTimeoutMs);

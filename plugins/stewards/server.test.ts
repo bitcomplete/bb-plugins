@@ -11,7 +11,7 @@ import { guidanceUnitId } from "./guidance.js";
 import { parseDotenvValue, refreshPrompt, secretVariable, STEWARDS_SKILLS } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, needChoices, type Binding } from "./store.js";
-import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
+import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, LOCAL_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
 import { parseTemplateStamp, templateHash } from "./template-stamp.js";
 import { STANDING_RULES } from "./wake.js";
 import { setup, SHIPPED_SKILLS } from "./test-world.js";
@@ -2463,6 +2463,9 @@ describe("terminal states and follow-through", () => {
   it("ends without a wrap-up wake when the steward's own last report already said Done", async () => {
     const t = await working();
     await t.report({ phase: "Done" });
+    // BB-386: a running worker is open work and takes the wrap-up wake; let it
+    // finish first, so this is the no-open-work case rule 4 covers.
+    await t.idle("thr_w1", "Implemented and merged.");
     const before = t.sends.length;
     await t.done();
     expect(t.sends).toHaveLength(before);
@@ -2498,6 +2501,174 @@ describe("terminal states and follow-through", () => {
     await t.ring("linear", "uuid-12");
     expect((await t.list())[0]).toMatchObject({ ended: true });
     expect(t.sends.slice(before).map((s) => s.text).some((text) => /Terminal: Done/u.test(text))).toBe(false);
+  });
+});
+
+// BB-386: a binding ends only when it holds no open work, or when every open
+// item is affirmatively finished, handed off or closed. The tracker's terminal
+// state starts the wrap-up; it does not finish it.
+describe("a binding never ends with open work (BB-386)", () => {
+  /** A ticket with a steward and a worker that opened two linked pull requests. */
+  async function twoPulls() {
+    const t = await setup();
+    const linked = [
+      { key: "acme/web#7", url: "https://github.com/acme/web/pull/7" },
+      { key: "acme/web#8", url: "https://github.com/acme/web/pull/8" },
+    ];
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }));
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }, { head: "bb/eng-12-retry-2" }));
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: linked }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.hooks.store.find("ENG-12")!.threadId!;
+    await t.created("thr_w1", steward, "ENG-12: two pull requests");
+    return { ...t, steward, linked };
+  }
+
+  it("does not end while a second opened pull request is still open", async () => {
+    const t = await twoPulls();
+    // The worker's own last message says it merged #7 and set the ticket Done.
+    await t.idle("thr_w1", "Merged acme/web#7 and opened acme/web#8; set ENG-12 to Done.");
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", state: "merged" }, { merged: true }));
+    t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed", linkedPulls: t.linked }));
+    const before = t.sends.length;
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.endedAt).toBeNull();
+    expect(b.ending).toBe("terminal");
+    expect(b.followThrough).not.toBeNull();
+    expect(b.followThrough).toMatch(/acme\/web#8/);
+    const wake = t.sends.slice(before).map((s) => s.text).join("\n");
+    expect(wake).toMatch(/acme\/web#8/);
+    expect(wake).toMatch(/Open work/);
+  });
+
+  it("still ends immediately when it holds no open work (BB-52 rule 4)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.hooks.store.find("ENG-12")!.threadId!;
+    await t.tool("steward_report", { phase: "Done", summary: "Merged.", nextAction: "Nothing", actor: "steward" }, steward);
+    t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed" }));
+    const before = t.sends.length;
+    await t.ring("linear", "uuid-12");
+    expect(t.sends).toHaveLength(before);
+    expect(t.hooks.store.find("ENG-12")!.endedAt).not.toBeNull();
+  });
+
+  /** A: ENG-12 owns acme/web#7 by its worker branch; B: ENG-13 is an open binding. */
+  async function handoffWorld() {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane" }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const a = t.hooks.store.find("ENG-12")!;
+    const b = t.hooks.store.find("ENG-13")!;
+    const url = "https://github.com/acme/web/pull/7";
+    const aMerge = t.hooks.store.fileNeed({ bindingId: a.id, kind: "merge", url, what: "Merge acme/web#7", how: null, filedBy: "plugin" });
+    const bMerge = t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url, what: "Merge acme/web#7", how: null, filedBy: "plugin" });
+    return { ...t, a, b, aMerge, bMerge, project: t.spawns[0]!.id };
+  }
+
+  it("moves a pull request from one binding to another with steward_report handOff", async () => {
+    const t = await handoffWorld();
+    const handed = await t.tool("steward_report", { phase: "In Progress", summary: "Handing off.", nextAction: "Wait", actor: "steward", handOff: { pull: "acme/web#7", to: "ENG-13" } }, t.a.threadId!);
+    expect(handed.error).toBe(false);
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toMatchObject({ toBindingId: t.b.id, fromBindingId: t.a.id });
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    // A no longer owns it: its merge need is closed as foreign.
+    expect(t.hooks.store.need(t.aMerge.id)!.resolution).toBe("The pull request belongs to another ticket.");
+    // B owns it: its merge need is not closed as foreign.
+    expect(t.hooks.store.need(t.bMerge.id)!.resolution).not.toBe("The pull request belongs to another ticket.");
+  });
+
+  it("adopts a pull request into a binding with the project steward's adoptPull", async () => {
+    const t = await handoffWorld();
+    const adopted = await t.tool("steward_update", { binding: "ENG-13", adoptPull: "acme/web#7" }, t.project);
+    expect(adopted.error).toBe(false);
+    expect(adopted.text).toMatch(/adopted acme\/web#7/);
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toMatchObject({ toBindingId: t.b.id });
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    expect(t.hooks.store.need(t.aMerge.id)!.resolution).toBe("The pull request belongs to another ticket.");
+    expect(t.hooks.store.need(t.bMerge.id)!.resolution).not.toBe("The pull request belongs to another ticket.");
+  });
+
+  it("refuses adoptPull for a pull request this server did not open", async () => {
+    const t = await handoffWorld();
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", author: "sam" }, { head: "feature/other" }));
+    const adopted = await t.tool("steward_update", { binding: "ENG-13", adoptPull: "acme/web#7" }, t.project);
+    expect(adopted.error).toBe(true);
+    expect(adopted.text).toMatch(/not opened by this server's GitHub login/u);
+  });
+
+  it("keeps follow-through on through a wrap-up report that does not settle the open pull request, and names the orphan on the overdue path", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.hooks.store.find("ENG-12")!.threadId!;
+    // The steward's own last report names Done, but the open pull request
+    // blocks the silent end: the binding takes its wrap-up turn.
+    await t.tool("steward_report", { phase: "Done", summary: "Merged the first.", nextAction: "Nothing", actor: "steward" }, steward);
+    t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed", ...linked }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.ending).toBe("terminal");
+    expect(b.followThrough).toMatch(/acme\/web#7/);
+    // A wrap-up report that says nothing about #7 keeps follow-through on.
+    await t.tool("steward_report", { phase: "Done", summary: "Wrapping up.", nextAction: "Nothing", actor: "steward" }, steward);
+    expect(t.hooks.store.find("ENG-12")!.followThrough).toMatch(/acme\/web#7/);
+    await t.idle(steward);
+    expect(t.hooks.store.find("ENG-12")!.endedAt).toBeNull();
+    // The deadline is not a quiet end: it names the orphan in a need.
+    t.advance(6 * 3_600_000 + 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "decide" && /acme\/web#7/.test(`${n.what} ${n.how ?? ""}`));
+    expect(need).toBeDefined();
+  });
+
+  it("re-homes an open pull request whose owning binding ended, to a binding whose ticket it fixes", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", description: "Fixes ENG-13." }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const a = t.hooks.store.find("ENG-12")!;
+    const b = t.hooks.store.find("ENG-13")!;
+    t.hooks.store.patch(a.id, { endedAt: t.now(), endReason: "terminal" });
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toMatchObject({ toBindingId: b.id, fromBindingId: a.id });
+  });
+
+  it("names a project-steward need for an orphan no open binding fixes", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", description: "No ticket." }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const a = t.hooks.store.find("ENG-12")!;
+    t.hooks.store.patch(a.id, { endedAt: t.now(), endReason: "terminal" });
+    await t.hooks.sweep();
+    await t.flush();
+    const need = t.hooks.store.openNeeds(a.id).find((n) => n.kind === "decide" && /has no steward/u.test(n.what));
+    expect(need).toBeDefined();
+    expect(need!.what).toMatch(/adopt it under a ticket, or close it/u);
+  });
+
+  it("states the wrap-up rule in the ticket playbook templates", () => {
+    for (const text of [LINEAR_TICKETS, LOCAL_TICKETS, GITHUB_ISSUES]) {
+      expect(text).toMatch(/Reaching a terminal state starts the wrap-up/u);
+      expect(text).toMatch(/Never leave an open pull request/u);
+    }
   });
 });
 
