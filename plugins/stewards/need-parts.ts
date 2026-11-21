@@ -136,6 +136,28 @@ export function mergeNeedParts(input: { key: string; lane: string | null; note?:
   return { what, how, why: MERGE_WHY, details: how };
 }
 
+/** The marker a project-steward merge ask carries when the lane gate is already met (BB-386 fix 4). */
+export const MERGE_WORKAROUND_MARK = "Workaround";
+
+/**
+ * BB-386 fix 4: the project steward must not invent an owner gate. When it
+ * asks the owner to merge a pull request whose lane gate is already met and
+ * whose decide list routes it to the project steward, no owner's merge is the
+ * gate, so the ask is a workaround. This returns the marker and the gate's
+ * verdict to attach to the item, or null when the ask is legitimate (the gate
+ * is not met, or the pull request is the user's to decide). The item is never
+ * refused: the owner still receives it, marked.
+ */
+export function mergeWorkaroundParts(input: { key: string; lane: string | null; gateMet: boolean; decision: "project" | "user" }): { why: string; details: string } | null {
+  if (!input.gateMet || input.decision !== "project") return null;
+  const lane = input.lane === null || input.lane === "" ? "lane unknown" : input.lane;
+  const verdict = "gate met: no binding can merge";
+  return {
+    why: `${MERGE_WORKAROUND_MARK}: ${input.key}'s lane gate is already met (${lane}), so the owner's merge is not the gate. ${verdict}.`,
+    details: `This item is a workaround: ${input.key} is gate-met (${lane}) and the decide list routes it to the project steward, so no owner approval or merge is needed. The plugin still delivers it to you. Verdict: ${verdict}.`,
+  };
+}
+
 /** The one line, context, why and details of a lesson review/retire decide item. */
 export function lessonDecideParts(input: { file: string; lessonText: string; boundary: boolean; retire: boolean; branch: string | null; prUrl: string | null }): { what: string; how: string; why: string; details: string } {
   const what = clampNeedLine(`${input.retire ? "Retire" : "Review"} the lesson for ${input.file}`);
