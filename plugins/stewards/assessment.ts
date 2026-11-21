@@ -21,6 +21,7 @@ import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Worker } from "./store.js";
 import type { Wait, WaitKind } from "./wait.js";
+import type { ComposedAssessment } from "./contribution.js";
 
 export type DecideMark = "project" | "user";
 
@@ -172,7 +173,7 @@ export type AssessmentInput = {
 const lc = (s: string | null | undefined): string => (s ?? "").toLowerCase();
 
 /** The remembered requesters for one pull request, by its lowercased key or URL (BB-327). */
-function rememberedFor(map: ReadonlyMap<string, readonly string[]> | undefined, e: EntitySnapshot): readonly string[] {
+export function rememberedFor(map: ReadonlyMap<string, readonly string[]> | undefined, e: EntitySnapshot): readonly string[] {
   if (map === undefined) return [];
   return map.get(lc(e.key)) ?? (e.url === null ? [] : map.get(lc(e.url)) ?? []);
 }
@@ -182,7 +183,7 @@ const isOwn = (e: EntitySnapshot, own: ReadonlySet<string>): boolean =>
   (e.key !== "" && own.has(lc(e.key))) || (e.url !== null && e.url !== "" && own.has(lc(e.url)));
 
 /** A pull request the plugin can see is still open (not merged or closed). */
-const pullIsOpen = (e: EntitySnapshot): boolean => e.pull !== null && e.state !== "merged" && e.state !== "closed" && e.pull.merged !== true;
+export const pullIsOpen = (e: EntitySnapshot): boolean => e.pull !== null && e.state !== "merged" && e.state !== "closed" && e.pull.merged !== true;
 
 /** Whether a pull request's review has been given: an approved review or marker at its head (BB-333). */
 function reviewGiven(e: EntitySnapshot): boolean {
@@ -205,7 +206,7 @@ function waitPullKey(ref: string): string | null {
  * wakes the binding without storing the snapshot. Null for another kind or a
  * ref the look could not read.
  */
-function waitFingerprint(wait: Wait | null, input: AssessmentInput): string | null {
+export function waitFingerprint(wait: Wait | null, input: AssessmentInput): string | null {
   if (wait === null || (wait.kind !== "pull" && wait.kind !== "review")) return null;
   const key = waitPullKey(wait.ref);
   const e = key === null ? undefined : input.waitedPulls?.get(key);
@@ -251,7 +252,7 @@ function waitReviewers(wait: Wait | null, input: AssessmentInput): readonly stri
  * workers, the other bindings, the page items and the date. The typed wait is
  * judged by its own kind, never by `hasLiveWakeSource`.
  */
-function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
+export function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
   switch (wait.kind) {
     case "pull":
     case "review": {
@@ -288,7 +289,7 @@ function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
  * the user with `resolutionKind: "approve-decline"`. A `project`-entry pull is
  * the owner's from the forward on (BB-322 blocker 1).
  */
-function forwardedToOwner(escalations: readonly Escalation[], e: EntitySnapshot): boolean {
+export function forwardedToOwner(escalations: readonly Escalation[], e: EntitySnapshot): boolean {
   const url = lc(e.url ?? e.key);
   return escalations.some((x) => x.status === "open" && x.kind === "approval" && x.route === "user" && x.resolutionKind === "approve-decline" && lc(x.url) === url);
 }
@@ -433,8 +434,15 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  * answer still matches the predicate it retired; a new `approvals.gate` row is
  * a real difference, not a fixture. It is read through `pullGate`, the same
  * single `prGate` site, so no second call site appears.
+ *
+ * BB-380 (C2) adds the shadow composer's own surfaces: `compose.gate`,
+ * `compose.waits` and `compose.holds`. The composed answer is a refactor of
+ * today's derivation, so a row on one of them is a defect, not a fixture. The
+ * comparison runs only when the caller passes the composed answer; the C1
+ * characterization tests call `compare` without one and see the seven surfaces
+ * they pin.
  */
-export function compare(input: AssessmentInput, assessment: Assessment): Divergence[] {
+export function compare(input: AssessmentInput, assessment: Assessment, composed?: ComposedAssessment): Divergence[] {
   const { binding, observed, ownPulls, projectApprovals, workers } = input;
   const out: Divergence[] = [];
   const add = (surface: string, old: string, next: string, inputs: Divergence["inputs"]): void => {
@@ -487,5 +495,35 @@ export function compare(input: AssessmentInput, assessment: Assessment): Diverge
     waitKind: binding.wait?.kind ?? null,
     waitLive: assessment.liveness.waitLive === true,
   });
+
+  // (5) BB-380 (C2): the shadow composer's gate, waits and holds against the
+  // assessment. The composed answer is computed from the same rows by the
+  // in-process contributors; a difference here is a defect in the refactor, so
+  // the row is the evidence the next slice's consumer can rely on the
+  // composed answer. Nothing reads the composed answer yet.
+  if (composed !== undefined) {
+    const pullText = (p: Assessment["gate"]["pulls"][number]): string => `${lc(p.pull)}:${p.met ? "met" : "unmet"}:${p.missing ?? ""}:${p.decision}`;
+    const composedGate = `${composed.gate.met ? "met" : "unmet"}|${composed.gate.decision}|${composed.gate.missing ?? ""}|${composed.gate.pulls.map(pullText).join(",")}`;
+    const assessedGate = `${assessment.gate.met ? "met" : "unmet"}|${assessment.gate.decision}|${assessment.gate.missing ?? ""}|${assessment.gate.pulls.map(pullText).join(",")}`;
+    if (composedGate !== assessedGate) add("compose.gate", assessedGate, composedGate, { binding: binding.id, pulls: composed.gate.pulls.length });
+
+    // The typed wait the assessment derived, against the composed item. A
+    // binding has at most one stored typed wait, so the match is by kind and ref.
+    const composedWait = composed.waits.find((w) => w.kind === (assessment.wait?.kind ?? "") && w.ref === (assessment.wait?.ref ?? "")) ?? null;
+    if (assessment.wait === null) {
+      if (composed.waits.length > 0) add("compose.waits", "none", composed.waits.map((w) => `${w.kind} ${w.ref}`).join(","), { binding: binding.id });
+    } else if (composedWait === null) {
+      add("compose.waits", `${assessment.wait.kind} ${assessment.wait.ref}`, "none", { binding: binding.id });
+    } else {
+      const composedWaitText = `${composedWait.live}|${composedWait.fingerprint ?? ""}|${composedWait.overdueMs ?? ""}`;
+      const assessedWaitText = `${assessment.liveness.waitLive}|${assessment.liveness.waited ?? ""}|${assessment.liveness.overdueMs ?? ""}`;
+      if (composedWaitText !== assessedWaitText) add("compose.waits", assessedWaitText, composedWaitText, { binding: binding.id, kind: assessment.wait.kind });
+    }
+
+    // The binding's holds: `idleInActiveStage` reads hold, ending and requeue.
+    const assessedHolds = [binding.hold !== null ? "hold" : null, binding.ending !== null ? "ending" : null, binding.requeueUntil !== null ? `requeue:${binding.requeueUntil > input.now}` : null].filter((x) => x !== null).join(",");
+    const composedHolds = composed.holds.map((h) => (h.id === "requeue" ? `requeue:${h.held}` : h.id)).join(",");
+    if (assessedHolds !== composedHolds) add("compose.holds", assessedHolds, composedHolds, { binding: binding.id });
+  }
   return out;
 }

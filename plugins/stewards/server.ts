@@ -101,6 +101,7 @@ import {
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
+import { composeAssessment } from "./contribution.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { ASK_ON_SLACK_CHOICE, NOT_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackCandidateLabel, slackNameCandidates, slackPersonKey, slackPersonLabel, slackPersonNotOnSlack, waitSlackAskOnceWhat, waitSlackInstruction, waitSlackTerminalWhat, type SlackCandidate, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
@@ -5447,7 +5448,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // written and keeps its history. The other surfaces' rows still record.
       // The derived `noWakeSource` itself rides the reconcile's existing
       // binding patch, so no extra store read is added.
-      store.recordDivergences(compare(input, assessment).filter((d) => d.surface !== "noWakeSource"));
+      // BB-380 (C2): the composed answer is computed beside the assessment and
+      // compared through the existing divergence log. No consumer reads it.
+      store.recordDivergences(compare(input, assessment, composeAssessment(input)).filter((d) => d.surface !== "noWakeSource"));
       store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
       return assessment;
     }
