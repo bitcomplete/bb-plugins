@@ -17230,12 +17230,33 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
   });
 
-  it("raises one stuck for a gate-met pull request nobody acts on after the window, and clears it when the gate moves", async () => {
+  it("does not raise the gate-met stuck for a teammate's approved pull request, and keeps the author hold (BB-382)", async () => {
     const t = await setup();
     t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#7");
     const b = t.hooks.store.find("acme/web#7")!;
     expect(b.kind).toBe("review");
+    const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "gate-met");
+    expect(stuckOf()).toHaveLength(0);
+    t.advance(2 * 60 * 60_000);
+    await t.ring("github", "acme/web#7");
+    // The author's wait is not a stall: no escalation and no gate-met note.
+    expect(stuckOf()).toHaveLength(0);
+    expect(t.sends.some((s) => /gate-met with nobody acting/u.test(s.text))).toBe(false);
+    // The teammate hold is unchanged: the plugin still declines as a foreign owner.
+    expect(t.hooks.store.binding(b.id)!.nonActions["pull-foreign-owner"]).toBeDefined();
+  });
+
+  it("still raises the gate-met stuck for an owner's own agent pull request (BB-382)", async () => {
+    const t = await setup();
+    // The owner's own agent pull request is not a foreign owner, so the check
+    // still applies. Its merge is refused, so the plugin neither merges it nor
+    // files a need: nobody is acting.
+    t.setMergePullError("Pull request is not mergeable: the merge conflict must be resolved");
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane", comments: [noReview] }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("pr");
     const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "gate-met");
     expect(stuckOf()).toHaveLength(0);
     t.advance(2 * 60 * 60_000);
@@ -17247,17 +17268,53 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     expect(stuckOf()).toHaveLength(1);
     // A new round requests changes: the gate is no longer met, so it clears.
     const changed = comment({ id: "r2", author: "jane", body: `<!-- bb-review round=2 sha=${head} verdict=changes-requested lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
-    t.entities.set("acme/web#7", pull({ comments: [noReview, changed] }, { checks: { state: "success", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane", comments: [noReview, changed] }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#7");
     expect(stuckOf()).toHaveLength(0);
   });
 
+  it("still raises the gate-met stuck for a dependency-bot pull request (BB-382)", async () => {
+    const t = await setup();
+    // A dependency bot is not a foreign owner, so the check still applies. The
+    // deps-prs playbook is given `merge` (a project choice) so the plugin
+    // attempts the merge; the refusal leaves nobody acting.
+    t.files[playbookPath("deps-prs")] = DEPS_PRS.replace("may: [comment, request-review, escalate, spawn-worker]", "may: [comment, request-review, escalate, spawn-worker, merge]");
+    t.setMergePullError("Pull request is not mergeable: the merge conflict must be resolved");
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", author: "dependabot[bot]", labels: [], comments: [noReview] }, { head: "dependabot/npm/group", headAuthor: "dependabot[bot]", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#9");
+    const b = t.hooks.store.find("acme/web#9")!;
+    expect(b).toMatchObject({ kind: "pr", playbook: "deps-prs" });
+    const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "gate-met");
+    expect(stuckOf()).toHaveLength(0);
+    t.advance(2 * 60 * 60_000);
+    await t.ring("github", "acme/web#9");
+    expect(stuckOf()).toHaveLength(1);
+  });
+
+  it("still flags a teammate's pull request under owner-merges for the owner (BB-382)", async () => {
+    const t = await setup();
+    t.files[playbookPath("github-reviews")] = GITHUB_REVIEWS.replace('skip-authors: [dependabot, "dependabot[bot]", "renovate[bot]"]', 'skip-authors: [dependabot, "dependabot[bot]", "renovate[bot]"]\nowner-merges: true');
+    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    // owner-merges turns foreignOwner off: the plugin does not decline as a
+    // foreign owner. It files the owner's Merge item instead (the current
+    // behaviour for these pull requests), so nobody is unattended and no
+    // gate-met stuck is raised.
+    expect(t.hooks.store.binding(b.id)!.nonActions["pull-foreign-owner"]).toBeUndefined();
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.filedBy === "plugin")).toBe(true);
+    t.advance(2 * 60 * 60_000);
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "gate-met")).toHaveLength(0);
+  });
+
   it("does not raise the gate-met stuck for a draft pull request, and clears an open one when it becomes a draft (BB-373)", async () => {
     const t = await setup();
-    // The review binding is made while the pull request is ready; a draft is
-    // not adopted for review, so the scenario is a ready pull request that is
-    // then marked a draft.
-    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] } }));
+    // An owner's own agent pull request (BB-382) whose merge is refused reaches
+    // the gate-met stuck; it is then marked a draft.
+    t.setMergePullError("Pull request is not mergeable: the merge conflict must be resolved");
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane", comments: [noReview] }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#7");
     const b = t.hooks.store.find("acme/web#7")!;
     const stuckOf = () => t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "stuck" && x.data.pullStuck === "gate-met");
@@ -17265,7 +17322,7 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     await t.ring("github", "acme/web#7");
     expect(stuckOf()).toHaveLength(1);
     // Marked a draft: the open episode is resolved and no new one is raised.
-    t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] }, draft: true }));
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane", comments: [noReview] }, { headAuthor: "jane", checks: { state: "success", failing: [] }, draft: true }));
     await t.ring("github", "acme/web#7");
     expect(stuckOf()).toHaveLength(0);
     t.advance(2 * 60 * 60_000);
