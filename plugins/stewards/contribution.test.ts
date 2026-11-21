@@ -213,6 +213,18 @@ describe("the composer (BB-380)", () => {
     const composed = composeAssessment(onlyGateMetAt("build"));
     expect(composed.gate).toMatchObject({ met: true, decision: "user", missing: null });
   });
+
+  it("rolls the gate up from the contribution fields, not the wrapped gate", () => {
+    const [real] = githubContributor.contribute(onlyGateMetAt("build")).gate;
+    // A contribution whose item fields disagree with the gate it wrapped: the
+    // roll-up must follow the item, or `compare` could never catch a composer
+    // that disagrees with today's gate (BB-380 review round 1).
+    const flipped: GateContribution = { ...real!, met: false, missing: "the item says unmet", lane: "project" };
+    const composed = compose([{ source: "github", gate: [flipped], waits: [], resources: [], holds: [], reasons: [] }]);
+    expect(composed.gate).toMatchObject({ met: false, decision: "project", missing: "the item says unmet" });
+    // The wrapped gate still rides along for the C3 surfaces.
+    expect(composed.gate.pulls).toEqual([real!.assessed]);
+  });
 });
 
 // ---------------------------------------------------------------------------

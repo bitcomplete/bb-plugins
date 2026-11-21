@@ -242,13 +242,14 @@ export const CONTRIBUTORS: readonly SourceContributor[] = [githubContributor, li
  */
 export function compose(contributions: readonly SourceContribution[]): ComposedAssessment {
   const gateItems = contributions.flatMap((c) => c.gate);
-  const pulls = gateItems.map((g) => g.assessed);
   return {
     gate: {
-      pulls,
-      met: pulls.every((p) => p.met),
-      decision: pulls[0]?.decision ?? "user",
-      missing: pulls.find((p) => !p.met)?.missing ?? null,
+      // The roll-up reads the contribution fields, not the wrapped gate, so a
+      // composer that disagrees with today's gate is visible to `compare`.
+      pulls: gateItems.map((g) => g.assessed),
+      met: gateItems.every((g) => g.met),
+      decision: gateItems[0]?.lane ?? "user",
+      missing: gateItems.find((g) => !g.met)?.missing ?? null,
       readyPassed: null,
     },
     waits: contributions.flatMap((c) => c.waits),
