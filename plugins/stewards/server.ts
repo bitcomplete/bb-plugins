@@ -6692,7 +6692,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function backlogChanges(before: BacklogLook | null, after: BacklogLook, isBound: (issue: BacklogIssue) => boolean): Change[] {
       if (after.error !== null) return before === null || before.error === null ? [{ text: `Cannot read the backlog of ${after.team}: ${after.error}`, actionable: false }] : [];
       const changes: Change[] = [];
-      if (before !== null && before.error !== null) changes.push({ text: `The backlog of ${after.team} is readable again`, actionable: false });
+      // After a failed read the stored look has no issues; diffing against it
+      // would call every open issue new. Report the recovery and let the next
+      // requeue catch up (BB-378).
+      if (before !== null && before.error !== null) return [{ text: `The backlog of ${after.team} is readable again`, actionable: false }];
       const was = new Map((before?.issues ?? []).map((i) => [i.id, i]));
       const current = new Set(after.issues.map((i) => i.id));
       for (const issue of after.issues) {
@@ -6740,7 +6743,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       if (look.truncated) bb.log.warn(`stewards: the backlog of ${target.team} was truncated by the source's hard cap`);
 
-      const isBound = (issue: BacklogIssue): boolean => store.find(issue.key, config.projectId) !== null || store.find(issue.id, config.projectId) !== null;
+      const isBound = (issue: BacklogIssue): boolean => store.openByEntity("linear", issue.id)?.projectId === config.projectId;
       const changes = backlogChanges(before, look, isBound);
       if (requeueCame) changes.push({ text: look.issues.length > 0 ? "Requeue time came, with tickets still in the backlog" : "Requeue time came: a scheduled look", actionable: true });
       if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
@@ -12473,12 +12476,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const target = parseOpsTargetKey(b.entityId);
         const sentry = target?.kind === "sentry-project";
         const alertmanager = target?.kind === "alertmanager";
-        // BB-341: the triage tool is offered only while the project's
-        // `backlog.triage` is true; the tool re-reads the flag itself, so
+        // BB-341/BB-378: a backlog steward gets the read-only ticket tools and,
+        // when `backlog.triage` is on, `backlog_triage`. The write tools
+        // (`ticket_file`, `ticket_comment`, `ticket_update`) would bypass the
+        // triage budget, the label vocabulary and the ledger, so they are not
+        // offered to a backlog thread. The tool re-reads the flag itself, so
         // turning it off refuses at once even before the selection refreshes.
         const backlogTriage = target?.kind === "backlog" && configs.get(b.projectId)?.value?.file.backlog?.triage === true;
+        if (target?.kind === "backlog") {
+          return {
+            tools: backlogTriage ? ["steward_report", "steward_update", "backlog_triage", "ticket_read", "ticket_search"] : ["steward_report", "steward_update", "ticket_read", "ticket_search"],
+            skills: [...STEWARDS_SKILLS],
+            instructions:
+              `You are the backlog steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
+              "The plugin reads the Linear team for you and every wake carries the whole open backlog. You never adopt a ticket, start a worker, edit a description, assign one, change its state, cancel or close it. " +
+              (backlogTriage
+                ? "`backlog_triage` is your only Linear write: it adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
+                : "The backlog is read-only on this project: `backlog.triage` is off, so no Linear write is offered. ") +
+              "`ticket_read` and `ticket_search` are reads only. End every turn you were woken for with steward_report. Read the stewards skill for the protocol.",
+          };
+        }
         return {
-          tools: backlogTriage ? ["steward_report", "steward_update", "backlog_triage", ...TICKET_TOOL_NAMES] : ["steward_report", "steward_update", ...TICKET_TOOL_NAMES],
+          tools: ["steward_report", "steward_update", ...TICKET_TOOL_NAMES],
           skills: [...STEWARDS_SKILLS],
           instructions:
             `You are the ops steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +

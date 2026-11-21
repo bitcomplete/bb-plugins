@@ -12594,6 +12594,47 @@ Watch the team's whole open backlog and triage the un-adopted tickets that need 
     expect(backlogWake(t, thread)).toContain("Requeue time came");
   });
 
+  it("offers a backlog thread only the read-only ticket tools and backlog_triage", async () => {
+    const { t, binding } = await watching();
+    const thread = binding().threadId!;
+    const tools = (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id: thread, title: null, parentThreadId: null, sourceThreadId: null } }))).tools.map((x) => x.name);
+    expect(tools).toEqual(["backlog_triage", "ticket_read", "ticket_search", "steward_report", "steward_update"]);
+    // The write tools would bypass the triage budget, the label vocabulary and
+    // the ledger, so a backlog thread is never offered them.
+    expect(tools).not.toContain("ticket_file");
+    expect(tools).not.toContain("ticket_comment");
+    expect(tools).not.toContain("ticket_update");
+  });
+
+  it("does not call the whole backlog new after a failed read recovers", async () => {
+    const { t, binding } = await watching();
+    const thread = binding().threadId!;
+    t.setBacklogError("Linear rate limited the read");
+    await t.hooks.sweep();
+    await t.flush();
+    t.setBacklogError(null);
+    // Force the wake, so the recovered look is what the steward reads.
+    t.advance(2 * 86_400_000);
+    await t.hooks.sweep();
+    await t.flush();
+    const wake = backlogWake(t, thread);
+    expect(wake).toContain("readable again");
+    expect(wake).toContain("Requeue time came");
+    expect(wake).not.toContain("New issue: BB-1");
+  });
+
+  it("wakes for a changed issue whose ticket binding has ended", async () => {
+    const { t, binding } = await watching();
+    const thread = binding().threadId!;
+    const ticket = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-1", entityKey: "BB-1", url: null, title: "Fix login", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    // The ticket binding ended, so the issue is back in the backlog, not bound.
+    t.hooks.store.patch(ticket.id, { endedAt: t.now(), endReason: "gone" });
+    t.setBacklog([backlogIssue({ title: "Fix login with SSO" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(backlogWake(t, thread)).toContain("Changed: BB-1");
+  });
+
   it("writes a wake with the look, the changes, the ledger, the limits and the playbook body", async () => {
     const { t, binding } = await watching();
     const thread = binding().threadId!;
@@ -12641,14 +12682,14 @@ describe("the backlog triage writes (BB-341)", () => {
   const tools = async (t: Awaited<ReturnType<typeof setup>>, id: string) => (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id, title: null, parentThreadId: null, sourceThreadId: null } }))).tools.map((x) => x.name);
 
   it("is offered only when backlog.triage is true, and absent writes nothing", async () => {
-    const ticketTools = ["ticket_file", "ticket_read", "ticket_search", "ticket_comment", "ticket_update", "ticket_watch"];
+    const readTools = ["ticket_read", "ticket_search", "steward_report", "steward_update"];
     const off = await triaging({ triage: false });
-    expect(await tools(off.t, "thr_backlog")).toEqual([...ticketTools, "steward_report", "steward_update"]);
+    expect(await tools(off.t, "thr_backlog")).toEqual(readTools);
     expect((await off.t.tool("backlog_triage", { key: "BB-1", addLabels: ["bug"] }, "thr_backlog")).error).toBe(true);
     expect(off.t.linearWrites).toEqual([]);
 
     const on = await triaging({ triage: true });
-    expect(await tools(on.t, "thr_backlog")).toEqual(["backlog_triage", ...ticketTools, "steward_report", "steward_update"]);
+    expect(await tools(on.t, "thr_backlog")).toEqual(["backlog_triage", ...readTools]);
   });
 
   it("writes labels, a priority and a signed comment through linear, and records each in the ledger", async () => {
