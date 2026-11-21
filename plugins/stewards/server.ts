@@ -3925,13 +3925,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function leasedPulls(b: Pick<Binding, "kind" | "lastSnapshot">): string[] {
       if (b.kind !== "ticket" || b.lastSnapshot === null) return [];
       const pulls = b.lastSnapshot.pulls;
-      return b.lastSnapshot.entity.linkedPulls
-        .map((l) => l.key)
-        .filter((k): k is string => k !== null)
-        .filter((k) => {
-          const seen = pulls.find((p) => lc(p.key) === lc(k));
-          return seen === undefined || !["closed", "merged"].includes(lc(seen.state));
-        });
+      // A pull request handed to this binding is in the stored snapshot even
+      // when the ticket's timeline does not link it, so enumerating the
+      // snapshot as well as the links keeps it leased (BB-386).
+      const keys = new Set<string>(pulls.map((p) => p.key));
+      for (const l of b.lastSnapshot.entity.linkedPulls) if (l.key !== null) keys.add(l.key);
+      return [...keys].filter((k) => {
+        const seen = pulls.find((p) => lc(p.key) === lc(k));
+        return seen === undefined || !["closed", "merged"].includes(lc(seen.state));
+      });
     }
 
     /**
@@ -5542,7 +5544,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       // An unread relation keeps the last known parent and children (BB-244).
       entity = keepRelations(b.lastSnapshot?.entity ?? null, entity);
-      const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity, b.lastSnapshot) : [], at: now() };
+      const linked = b.kind === "ticket" ? await linkedPulls(entity, b.lastSnapshot) : [];
+      // BB-386: a pull request handed to this binding is observed even when the
+      // ticket's timeline does not link it, so the binding gates and merges it.
+      if (b.kind === "ticket") {
+        for (const h of store.pullHandoffsTo(b.id)) {
+          if (linked.some((p) => lc(p.key) === lc(h.pullKey))) continue;
+          try {
+            const pull = await snapshot("github", h.pullKey);
+            if (pull !== null && pull.kind === "pull") linked.push(pull);
+          } catch (error) {
+            bb.log.warn(`stewards: could not read ${h.pullKey}, handed to ${b.entityKey}: ${errorMessage(error)}`);
+          }
+        }
+      }
+      const observed: Observed = { entity, pulls: linked, at: now() };
       const prev = b.lastSnapshot;
 
       // BB-53: a merged pull request whose playbook names a deployment target
@@ -7408,6 +7424,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const TERMINAL_WORKER_REPORT_MS = 15 * 60_000;
 
     /**
+     * BB-386: re-homing is for orphans this version can prevent. A binding
+     * that ended before the feature first ran is not scanned: its pull requests
+     * are the pre-fix backlog the ticket's out-of-scope note covers. The cutoff
+     * is kept in bb's kv, so a restart does not re-scan or forget it.
+     */
+    let rehomeSinceCache: number | null = null;
+    async function rehomeSince(): Promise<number> {
+      if (rehomeSinceCache !== null) return rehomeSinceCache;
+      const stored = await bb.storage.kv.get<number>("stewards/rehome-since");
+      if (typeof stored === "number") {
+        rehomeSinceCache = stored;
+        return stored;
+      }
+      const at = now();
+      await bb.storage.kv.set("stewards/rehome-since", at);
+      rehomeSinceCache = at;
+      return at;
+    }
+
+    /**
      * BB-386: the open work a binding still holds, by the mechanical
      * definition: pull requests it opened that are still open, running
      * workers, open escalations, open needs and a typed wait. Stacked and
@@ -7637,8 +7673,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function pullFixesKeys(pull: EntitySnapshot): string[] {
       const body = pull.description ?? "";
       const out: string[] = [];
-      for (const m of body.matchAll(/(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#(\d+)/giu)) out.push(`${pull.unit}#${m[1]}`);
-      for (const m of body.matchAll(/(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+([A-Za-z][A-Za-z0-9]*-\d+)/giu)) out.push(m[1]!);
+      for (const m of body.matchAll(/\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\b:?\s+#(\d+)/giu)) out.push(`${pull.unit}#${m[1]}`);
+      for (const m of body.matchAll(/\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\b:?\s+([A-Za-z][A-Za-z0-9]*-\d+)/giu)) out.push(m[1]!);
       return [...new Set(out)];
     }
 
@@ -7648,23 +7684,47 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * body says it fixes or closes, or to the project steward as a need naming
      * it. Only a pull request a binding on this server opened is moved: a
      * teammate's, with no ended binding of ours behind it, is left alone.
+     *
+     * An ended binding's snapshot is never refreshed, so each candidate is read
+     * fresh; a handled one (a handoff row, or a filed need, open or resolved) is
+     * not looked at again, and the scan is bounded to bindings that ended after
+     * this shipped.
      */
     async function rehomeOrphanedPulls(config: ProjectConfig): Promise<void> {
       const projectId = config.projectId;
+      const login = config.githubLogin;
+      const since = await rehomeSince();
       const seen = new Set<string>();
       for (const b of store.all(projectId)) {
-        if (b.endedAt === null || b.lastSnapshot === null) continue;
+        if (b.endedAt === null || b.endedAt < since || b.lastSnapshot === null) continue;
         const observed = b.lastSnapshot;
+        let ownPulls: ReadonlySet<string> | null = null;
         for (const p of observedPulls(b, observed)) {
           if (p.pull === null || p.pull.merged === true || lc(p.state) === "closed" || lc(p.state) === "merged") continue;
           const key = lc(p.key);
           if (seen.has(key)) continue;
-          const ownPulls = await ownPullKeys(b, store.workers(b.id), observed);
-          if (!pullBelongsToTicket(b, p, ownPulls)) continue;
-          seen.add(key);
+          // A pull request already moved away from this binding is not this
+          // binding's orphan any more.
           const handoff = store.pullHandoff(p.key);
-          if (handoff !== null && handoff.toBindingId !== b.id) continue;
-          const target = pullFixesKeys(p)
+          if (handoff !== null && handoff.toBindingId !== b.id) {
+            seen.add(key);
+            continue;
+          }
+          const what = `${p.key} has no steward: adopt it under a ticket, or close it`;
+          // A need already filed, or one the owner has resolved, is the record;
+          // do not re-file or re-wake on every sweep.
+          if (store.needs(b.id, true).some((n) => n.kind === "decide" && n.url === (p.url ?? "") && n.what === what)) {
+            seen.add(key);
+            continue;
+          }
+          // Re-read fresh: a merge or close after the binding ended would
+          // otherwise read as open in the frozen snapshot.
+          const fresh = await snapshot("github", p.key).catch(() => null);
+          if (fresh === null || fresh.pull === null || fresh.pull.merged === true || lc(fresh.state) === "closed" || lc(fresh.state) === "merged") continue;
+          ownPulls ??= await ownPullKeys(b, store.workers(b.id), observed);
+          if (!serverOpenedPull(fresh, ownPulls, login)) continue;
+          seen.add(key);
+          const target = pullFixesKeys(fresh)
             .map((k) => store.find(k, projectId))
             .find((t): t is Binding => t !== null && t.endedAt === null && t.id !== b.id) ?? null;
           if (target !== null) {
@@ -7673,18 +7733,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             bb.log.info(`stewards: re-homed ${p.key} from ended ${b.entityKey} to ${target.entityKey}`);
             continue;
           }
-          const what = `${p.key} has no steward: adopt it under a ticket, or close it`;
-          const already = store.openNeeds(b.id).some((n) => n.kind === "decide" && n.what === what);
           store.fileNeed({
             bindingId: b.id,
             kind: "decide",
-            url: p.url ?? "",
+            url: fresh.url ?? "",
             what,
             how: `The binding that opened it (${b.entityKey}) ended while it was still open.`,
             why: "Re-homing found no open binding whose ticket this pull request fixes or closes.",
             filedBy: "plugin",
           });
-          if (!already) await wakeProject(projectId, `${p.key} has no steward`, { digestDue: false, notes: [what] });
+          await wakeProject(projectId, `${p.key} has no steward`, { digestDue: false, notes: [what] });
         }
       }
     }
@@ -9280,6 +9338,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const repo = key.includes("#") ? key.slice(0, key.indexOf("#")) : "";
       if (b.source === "github") return title.includes(`(#${number})`) && lc(pull.unit) === lc(repo);
       return new RegExp(`(?:^|[^a-z0-9])${escape(lc(key))}(?:[^a-z0-9]|$)`, "u").test(lc(title));
+    }
+
+    /**
+     * BB-386: whether a pull request was opened by this server, so a handoff,
+     * adoption or re-homing may move it. A worker of the binding opened or
+     * reported it (`ownPulls`), or its author is this server's GitHub login. A
+     * teammate's pull request that merely names a ticket in its title or head
+     * branch is never moved; a login that cannot be read does not open the door
+     * either.
+     */
+    function serverOpenedPull(pull: EntitySnapshot, ownPulls: ReadonlySet<string>, login: string | null): boolean {
+      if (ownPulls.has(lc(pull.key)) || (pull.url !== null && ownPulls.has(lc(pull.url)))) return true;
+      return login !== null && pull.author !== null && lc(pull.author) === lc(login);
     }
 
     /**
@@ -13299,7 +13370,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             to: z.string().trim().min(1).max(200).describe("The binding that takes it: another open binding's entity key (or id) in this project."),
           })
           .optional()
-          .describe("BB-386: transfer one of this binding's open pull requests to another binding, so that binding merges it. The store records the move and the target files the Merge item; it changes which binding merges, never the lane, gate or an approval. Use it in the wrap-up turn instead of leaving a pull request behind."),
+          .describe("BB-386: transfer one of this binding's open pull requests to another binding, so that binding merges it. The store records the move and the target files the Merge item; it changes which binding merges, never the lane or the gate. A project-steward approval is bound to the binding and head, so it does not move: the target asks for one again. Use it in the wrap-up turn instead of leaving a pull request behind."),
         needs: z
           .array(
             z.object({
@@ -13461,10 +13532,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const observed = b.lastSnapshot;
             const ownPulls = observed === null ? new Set<string>() : await ownPullKeys(b, store.workers(b.id), observed);
             const pull = observed === null ? null : (observedPulls(b, observed).find((p) => lc(p.key) === lc(pullKey)) ?? null);
-            if (pull === null || !pullBelongsToTicket(b, pull, ownPulls)) return toolError(new Error(`${pullKey} is not an open pull request this binding opened, so it cannot be handed off. A pull request opened by another binding is that binding's to move.`));
+            const login = (await loadConfig(b.projectId))?.githubLogin ?? null;
+            if (pull === null || !serverOpenedPull(pull, ownPulls, login)) return toolError(new Error(`${pullKey} is not an open pull request this server opened, so it cannot be handed off. A teammate's pull request, or one opened by another binding, is not this binding's to move.`));
             store.handOffPull(pullKey, target.id, b.id);
             scheduleReconcile(target.id);
-            handOffNote = ` ${pullKey} is now ${target.entityKey}'s to merge; it files the Merge item on its next look.`;
+            handOffNote = ` ${pullKey} is now ${target.entityKey}'s to merge; it files the Merge item on its next look, and a project-steward approval does not move with it.`;
           }
           // BB-231: a free-form escalation must say how it differs from every
           // open user-facing item on the binding, or it can duplicate the
@@ -14135,7 +14207,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .min(1)
           .max(500)
           .optional()
-          .describe("Project steward only, with binding: take a pull request this server opened (its key owner/repo#N or URL) into that binding, so it merges it. It moves which binding merges, never the lane, gate or an approval. Refused for a pull request this server did not open (a teammate's)."),
+          .describe("Project steward only, with binding: take a pull request this server opened (its key owner/repo#N or URL) into that binding, so it merges it. It moves which binding merges, never the lane or the gate; a project-steward approval does not move, so the target asks for one again. Refused for a pull request this server did not open (a teammate's)."),
         stewardModel: modelSpecSchema.optional().describe("The steward thread's model, provider/model/level."),
         workerModel: modelSpecSchema.optional().describe("The model for workers it starts from now."),
         reviewerModel: modelSpecSchema.optional().describe("The model for reviewers its workers start from now."),
@@ -14347,8 +14419,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (pull === null || pull.kind !== "pull") return toolError(new Error(`No pull request ${pullKey} to adopt.`));
             const config = await loadConfig(target.projectId);
             const login = config?.githubLogin ?? null;
-            if (login !== null && pull.author !== null && lc(pull.author) !== lc(login)) {
-              return toolError(new Error(`${pullKey} was not opened by this server's GitHub login, so it is not this server's to adopt.`));
+            // BB-386 limit 2: a teammate's pull request is never adopted, and a
+            // login that cannot be read refuses rather than failing open.
+            if (login === null || pull.author === null || lc(pull.author) !== lc(login)) {
+              return toolError(new Error(login === null ? `This server's GitHub login could not be read, so ${pullKey} cannot be confirmed as this server's to adopt.` : `${pullKey} was not opened by this server's GitHub login, so it is not this server's to adopt.`));
             }
             const handoff = store.pullHandoff(pullKey);
             const current = handoff === null ? null : store.binding(handoff.toBindingId);
@@ -14358,7 +14432,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               store.handOffPull(pullKey, target.id, current?.id ?? handoff?.fromBindingId ?? null);
               scheduleReconcile(target.id);
               done.push(`adopted ${pullKey}; ${target.entityKey} files the Merge item on its next look`);
-              notes.push(`${pullKey} adopted by ${target.entityKey}; it files the Merge item on its next look.`);
+              notes.push(`${pullKey} adopted by ${target.entityKey}; it files the Merge item on its next look. A project-steward approval does not move with it, so the target asks again.`);
             }
           }
 

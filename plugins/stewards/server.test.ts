@@ -2559,17 +2559,20 @@ describe("a binding never ends with open work (BB-386)", () => {
   async function handoffWorld() {
     const t = await setup();
     const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    // Only ENG-12 links #7: the target binding must find the handed-off pull
+    // request through the handoff, not the ticket's timeline.
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
-    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Progress", stateType: "started", ...linked }));
-    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane" }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Progress", stateType: "started" }));
+    // A non-default base keeps the plugin from auto-merging, so the Merge item
+    // it files is visible.
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane", comments: [comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" })] }, { head: "bb/eng-12-retry", base: "release", checks: { state: "success", failing: [] } }));
     await t.ring("linear", "uuid-12");
     await t.ring("linear", "uuid-13");
     const a = t.hooks.store.find("ENG-12")!;
     const b = t.hooks.store.find("ENG-13")!;
     const url = "https://github.com/acme/web/pull/7";
-    const aMerge = t.hooks.store.fileNeed({ bindingId: a.id, kind: "merge", url, what: "Merge acme/web#7", how: null, filedBy: "plugin" });
-    const bMerge = t.hooks.store.fileNeed({ bindingId: b.id, kind: "merge", url, what: "Merge acme/web#7", how: null, filedBy: "plugin" });
-    return { ...t, a, b, aMerge, bMerge, project: t.spawns[0]!.id };
+    const aMerge = t.hooks.store.openNeeds(a.id).find((n) => n.kind === "merge" && n.url === url)!;
+    return { ...t, a, b, aMerge, url, project: t.spawns[0]!.id };
   }
 
   it("moves a pull request from one binding to another with steward_report handOff", async () => {
@@ -2581,8 +2584,9 @@ describe("a binding never ends with open work (BB-386)", () => {
     await t.ring("linear", "uuid-13");
     // A no longer owns it: its merge need is closed as foreign.
     expect(t.hooks.store.need(t.aMerge.id)!.resolution).toBe("The pull request belongs to another ticket.");
-    // B owns it: its merge need is not closed as foreign.
-    expect(t.hooks.store.need(t.bMerge.id)!.resolution).not.toBe("The pull request belongs to another ticket.");
+    // B owns it: it observes the handed-off pull request and files its own
+    // Merge item, not a foreign close.
+    expect(t.hooks.store.openNeeds(t.b.id).some((n) => n.kind === "merge" && n.url === t.url)).toBe(true);
   });
 
   it("adopts a pull request into a binding with the project steward's adoptPull", async () => {
@@ -2594,7 +2598,20 @@ describe("a binding never ends with open work (BB-386)", () => {
     await t.ring("linear", "uuid-12");
     await t.ring("linear", "uuid-13");
     expect(t.hooks.store.need(t.aMerge.id)!.resolution).toBe("The pull request belongs to another ticket.");
-    expect(t.hooks.store.need(t.bMerge.id)!.resolution).not.toBe("The pull request belongs to another ticket.");
+    expect(t.hooks.store.openNeeds(t.b.id).some((n) => n.kind === "merge" && n.url === t.url)).toBe(true);
+  });
+
+  it("does not move a project-steward approval with the pull request, so the target asks again", async () => {
+    const t = await handoffWorld();
+    const sha = "aaaaaaa1";
+    t.hooks.store.recordProjectApproval({ bindingId: t.a.id, headSha: sha, entry: null, byThread: t.project });
+    const handed = await t.tool("steward_report", { phase: "In Progress", summary: "Handing off.", nextAction: "Wait", actor: "steward", handOff: { pull: "acme/web#7", to: "ENG-13" } }, t.a.threadId!);
+    expect(handed.error).toBe(false);
+    expect(handed.text).toMatch(/approval does not move/);
+    // The record stays with the binding that held it; the target has none, so
+    // its gate is unmet until the project steward approves it there.
+    expect(t.hooks.store.projectApproval(t.a.id, sha)).not.toBeNull();
+    expect(t.hooks.store.projectApproval(t.b.id, sha)).toBeNull();
   });
 
   it("refuses adoptPull for a pull request this server did not open", async () => {
@@ -2603,6 +2620,24 @@ describe("a binding never ends with open work (BB-386)", () => {
     const adopted = await t.tool("steward_update", { binding: "ENG-13", adoptPull: "acme/web#7" }, t.project);
     expect(adopted.error).toBe(true);
     expect(adopted.text).toMatch(/not opened by this server's GitHub login/u);
+  });
+
+  it("does not re-home a teammate's pull request that merely names the ticket", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Progress", stateType: "started" }));
+    // A teammate opened it; its title names ENG-12 and its body fixes ENG-13.
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login (ENG-12)", author: "sam", description: "Fixes ENG-13." }, { head: "feature/other", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const a = t.hooks.store.find("ENG-12")!;
+    const b = t.hooks.store.find("ENG-13")!;
+    t.hooks.store.patch(a.id, { endedAt: t.now(), endReason: "terminal" });
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toBeNull();
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge" && n.url === "https://github.com/acme/web/pull/7")).toBe(false);
   });
 
   it("keeps follow-through on through a wrap-up report that does not settle the open pull request, and names the orphan on the overdue path", async () => {
@@ -2638,7 +2673,7 @@ describe("a binding never ends with open work (BB-386)", () => {
     const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
     t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Progress", stateType: "started", ...linked }));
-    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", description: "Fixes ENG-13." }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane", description: "Fixes ENG-13." }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
     await t.ring("linear", "uuid-12");
     await t.ring("linear", "uuid-13");
     const a = t.hooks.store.find("ENG-12")!;
@@ -2653,7 +2688,7 @@ describe("a binding never ends with open work (BB-386)", () => {
     const t = await setup();
     const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
-    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", description: "No ticket." }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane", description: "No ticket." }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
     await t.ring("linear", "uuid-12");
     const a = t.hooks.store.find("ENG-12")!;
     t.hooks.store.patch(a.id, { endedAt: t.now(), endReason: "terminal" });

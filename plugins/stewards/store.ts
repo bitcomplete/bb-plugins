@@ -2952,6 +2952,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
           "INSERT INTO pull_handoffs (pull_key, from_binding_id, to_binding_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(pull_key) DO UPDATE SET from_binding_id = excluded.from_binding_id, to_binding_id = excluded.to_binding_id, created_at = excluded.created_at",
         ),
         get: db.prepare<[string], Record<string, unknown>>("SELECT * FROM pull_handoffs WHERE pull_key = ?"),
+        all: db.prepare<[], Record<string, unknown>>("SELECT * FROM pull_handoffs"),
       }
     : null;
   const toHandoff = (r: Record<string, unknown>): PullHandoff => ({
@@ -2965,6 +2966,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // two writers. One plugin process owns the table, so a cache entry cannot go
   // stale behind it.
   const handoffCache = new Map<string, PullHandoff | null>();
+  // The whole table, read once and kept in step by `handOffPull`, so a binding
+  // can ask for the pull requests handed to it on every reconcile without a
+  // query each time.
+  let handoffToList: Map<string, PullHandoff[]> | null = null;
 
   // BB-358: the learned Slack mappings and the DM log. The mapping is keyed by
   // the GitHub login or Linear user id; the value is a Slack user id or the
@@ -2991,6 +2996,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const key = pullKey.toLowerCase();
       handoffStmts.upsert.run(key, fromBindingId, toBindingId, now());
       handoffCache.set(key, { pullKey: key, fromBindingId, toBindingId, createdAt: now() });
+      handoffToList = null;
       projectChanged(projectIdForBinding(toBindingId));
       if (fromBindingId !== null) projectChanged(projectIdForBinding(fromBindingId));
     },
@@ -3004,6 +3010,21 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const result = r === undefined ? null : toHandoff(r);
       handoffCache.set(key, result);
       return result;
+    },
+
+    /** BB-386: the pull requests handed to a binding. */
+    pullHandoffsTo(bindingId: string): PullHandoff[] {
+      if (handoffStmts === null) return [];
+      if (handoffToList === null) {
+        handoffToList = new Map();
+        for (const r of handoffStmts.all.all()) {
+          const h = toHandoff(r);
+          const list = handoffToList.get(h.toBindingId);
+          if (list === undefined) handoffToList.set(h.toBindingId, [h]);
+          else list.push(h);
+        }
+      }
+      return handoffToList.get(bindingId) ?? [];
     },
 
     /** Run a synchronous handler as one operation, publishing at most one signal per project (BB-90). */

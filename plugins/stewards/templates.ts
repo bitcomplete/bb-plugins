@@ -418,11 +418,11 @@ budget passes it files the owner's **Review it yourself / Reassign / Keep
 waiting** decide item, and Keep waiting resets the budget once. ${WAIT_SLACK_GUIDANCE} When every
 linked pull request is merged and the project's
 deployment source confirms the merge is live, close the issue with
-
-Reaching a terminal state starts the wrap-up; it does not finish it. A binding never ends while it holds open work: finish every item (merge or close each pull request you opened, let each worker end, settle every escalation, need and wait), hand it off with \`steward_report { handOff: { pull, to } }\` (or ask the project steward to adopt it), or close it with a comment. Never leave an open pull request for someone else to find.
 \`ticket_update { key, state }\` and a \`ticket_comment\` saying what shipped
 and where it is live, and end with steward_report. Until the deployment confirms it, the work is merged, not
 done: do not close the issue early.
+
+Reaching a terminal state starts the wrap-up; it does not finish it. A binding never ends while it holds open work: finish every item (merge or close each pull request you opened, let each worker end, settle every escalation, need and wait), hand it off with \`steward_report { handOff: { pull, to } }\` (or ask the project steward to adopt it), or close it with a comment. Never leave an open pull request for someone else to find.
 
 ${buildBlocker("the issue")}
 `;

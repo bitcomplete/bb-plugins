@@ -180,10 +180,11 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     // BB-329 lowered them 194 → 193: the merge gate's `parkedWorkerOwnsAnother`
     // now reads the parked state from the one assessment the reconcile already
     // built, instead of calling `store.workers(b.id)` a second time.
-    // BB-386 raised them 193 → 196: `pullBelongsToTicket` reads the pull
+    // BB-386 raised them 193 → 197: `pullBelongsToTicket` reads the pull
     // request's handoff row (cached after the first read) so a moved pull
-    // request belongs to its new binding; the pass has three own pull requests.
-    expect(reconcile).toEqual({ storeReads: 196, sourceCalls: 12, reconciles: 4, bindings: 4 });
+    // request belongs to its new binding — three own pull requests — and
+    // `reconcileOnce` reads the handed-off pull list once for the pass.
+    expect(reconcile).toEqual({ storeReads: 197, sourceCalls: 12, reconciles: 4, bindings: 4 });
     expect(wake).toEqual({ storeReads: 15, sourceCalls: 0, wakes: 1 });
   });
 
