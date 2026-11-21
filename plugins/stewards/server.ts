@@ -9675,8 +9675,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // BB-285: a gate-met pull request nobody acts on. No worker is
           // running and no item is open, so the plugin is neither merging it
           // nor waiting on a person; after the window it is stuck. A retarget
-          // episode is criterion 4's, not this one.
-          if (mergedBase === null && !mergeHeld && !mergedThisLook && !isDraft && !draftRefused && gateMetStuckMs > 0) {
+          // episode is criterion 4's, not this one. BB-382: a teammate's pull
+          // request (`foreignOwner`) is the author's to merge, so "waiting on
+          // the author" is the intended state, not a stall.
+          if (mergedBase === null && !mergeHeld && !mergedThisLook && !isDraft && !draftRefused && !foreignOwner && gateMetStuckMs > 0) {
             const unattended = assessWorker(store.workers(b.id)).reason === null && store.openNeeds(b.id).length === 0;
             if (unattended) {
               pullStuckState.set(lc(pull.key), "gate-met");
