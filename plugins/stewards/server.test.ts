@@ -9918,6 +9918,23 @@ describe("ops stewards", () => {
     return { t, c, steward, wakes };
   }
 
+  // BB-375: an ops binding does not run `assessBinding`, so the report keeps
+  // writing its `noWakeSource` (the one remaining report-time write); a
+  // ticket or pull-request report leaves the column to the reconcile.
+  it("writes the no-wake-source mark at report time for an ops binding (BB-375)", async () => {
+    const { t, steward } = await watched();
+    const ops = steward()!;
+    const report = await t.tool("steward_report", { phase: "watching", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's reply" }, ops.id);
+    expect(report.error).toBe(false);
+    expect(report.text).toContain("Nothing the plugin tracks will deliver this wait");
+    // The ops carve-out: the report writes the column, since no ops reconcile does.
+    expect(t.hooks.store.find(TARGET)!.noWakeSource).toBe(true);
+    // Clearing the wait clears the mark on the next report.
+    const cleared = await t.tool("steward_report", { phase: "watching", summary: "Nothing waiting.", nextAction: "Watch", actor: "steward", waitingOn: "" }, ops.id);
+    expect(cleared.error).toBe(false);
+    expect(t.hooks.store.find(TARGET)!.noWakeSource).toBe(false);
+  });
+
   it("watches a configured target, files one ticket for a crash loop, and comments on it while it keeps crashing", async () => {
     const { t, c, steward, wakes } = await watched();
     const [project] = t.spawns;

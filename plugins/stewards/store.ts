@@ -1869,7 +1869,8 @@ export type DivergenceRow = {
  * BB-333: one binding's typed-wait shadow state, the reader's row for
  * `bb stewards wait-divergences`. `derived` is the stall the typed wait derives
  * on each reconcile; `reported` is the stored `noWakeSource` flag (a reconcile
- * is its only writer since BB-375). The `kind`, `firstSeenAt`, `lastSeenAt`
+ * is its only writer for a ticket or pull request since BB-375; an ops
+ * binding's report still writes it). The `kind`, `firstSeenAt`, `lastSeenAt`
  * and `count` come from the `noWakeSource`
  * divergence row the state last wrote, so a divergence that has stopped still
  * reads back with its history. `at` is when the derived/reported pair last
@@ -4204,7 +4205,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     /**
      * Record a typed-wait divergence from the stored `noWakeSource` flag
-     * (BB-333; the reconcile is its only writer since BB-375). A `noWakeSource`
+     * (BB-333; the reconcile is its only writer for a ticket or pull request
+     * since BB-375, an ops binding's report still writes it). A `noWakeSource`
      * row is written only when the disagreement
      * starts; while it stands the open row's `last_seen_at` is refreshed so the
      * age prune cannot drop it, and when it stops the row is noted and the

@@ -5401,9 +5401,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /**
      * BB-293/BB-322/BB-333/BB-375: the binding's one assessment, from the rows
      * the look already holds. BB-333 made the typed-wait derivation
-     * authoritative; BB-375 made the reconcile its only writer: the stored
-     * `noWakeSource` is written from the assessment here, and `steward_report`
-     * derives the same answer for its reply without storing it. The shadow's
+     * authoritative; BB-375 made the reconcile its only writer for a ticket or
+     * pull request: the stored `noWakeSource` is written from the assessment
+     * here, and `steward_report` derives the same answer for its reply without
+     * storing it (an ops binding's report still writes it). The shadow's
      * `noWakeSource` divergence is retired because the flag and the derivation
      * now agree by construction. The column and every surface that reads it are
      * unchanged.
@@ -13430,10 +13431,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const liveSource = liveWakeSourceFor(current, currentOwnPulls);
           // BB-333/BB-375: liveness and stall come from the typed wait, derived
           // by the one assessment on every reconcile. The report derives the
-          // same answer here for its reply only, so the reply is current in the
-          // turn the wait is set, and stores nothing: the reconcile's own patch
-          // is the column's sole writer. A no-kind report falls to
-          // `observedStall`, the derivation `assess` itself uses for it.
+          // same answer here for its reply, so the reply is current in the turn
+          // the wait is set. A no-kind report falls to `observedStall`, the
+          // derivation `assess` itself uses for it. For a ticket or a pull
+          // request the report stores nothing: the reconcile's own patch is the
+          // column's sole writer. An ops binding is the one carve-out (BB-375):
+          // it does not run `assessBinding`, so the report keeps writing the
+          // column for it. This is the last report-time `noWakeSource` write; a
+          // follow-up ticket removes it once the ops read cost is settled.
           let derivedStalled: boolean | null = null;
           if (current.wait !== null && current.lastSnapshot !== null && playbook !== null && config !== null) {
             try {
@@ -13463,7 +13468,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             { count: current.requeueWakeCount, waitText: current.requeueWaitText, firstAt: current.requeueFirstAt },
             { reason: wakeReason, waitingOn, liveSource: derivedStalled !== null ? !derivedStalled : liveSource, now: now(), until: current.requeueUntil },
           );
-          b = store.patch(b.id, { requeueWakeCount: stall.state.count, requeueWaitText: stall.state.waitText, requeueFirstAt: stall.state.firstAt });
+          b = store.patch(b.id, {
+            // BB-375: the ops carve-out, the one remaining report-time write of
+            // the flag; a ticket or pull-request report leaves it to the
+            // reconcile (see the comment above).
+            ...(b.source === "ops" ? { noWakeSource } : {}),
+            requeueWakeCount: stall.state.count,
+            requeueWaitText: stall.state.waitText,
+            requeueFirstAt: stall.state.firstAt,
+          });
           const requests = [requested === null ? null : "approval", scheduling === null ? null : "scheduling"].filter((r) => r !== null);
           // BB-154: at the threshold, raise one `stall` to the project steward.
           // An open `stall` is itself a live source, so the next report resets
@@ -15780,7 +15793,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           "wait-divergences": cliCommand({
             summary: "The typed wait's shadow state, derived vs noWakeSource (BB-333), read-only",
-            description: "One row per binding that has reported a typed wait: the stall derived from the wait kind on the last reconcile, the stored noWakeSource flag (a reconcile is its only writer since BB-375), and the wait kind, first/last seen time and count from the noWakeSource divergence row behind that state. --binding filters by binding id or entity key. --json emits the rows. Read-only: nothing reads the state to decide or render.",
+            description: "One row per binding that has reported a typed wait: the stall derived from the wait kind on the last reconcile, the stored noWakeSource flag (a reconcile is its only writer for a ticket or pull request since BB-375; an ops binding's report still writes it), and the wait kind, first/last seen time and count from the noWakeSource divergence row behind that state. --binding filters by binding id or entity key. --json emits the rows. Read-only: nothing reads the state to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's wait divergences (binding id or entity key)" },
               project: PROJECT_OPTION,

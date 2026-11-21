@@ -3,7 +3,8 @@
 // project approvals the approvals.ts path omits), the worker state (an
 // explicit `parked`, distinct from `running`) and the wait liveness (wake
 // source, idle and stall derived from what the plugin observes, not the
-// stored `noWakeSource` flag, which only a reconcile writes).
+// stored `noWakeSource` flag, which only a reconcile writes for a ticket or
+// pull request).
 //
 // It is pure: it reads only the rows a reconcile already has in hand and
 // decides nothing. `compare` runs the predicates the assessment will replace
@@ -77,7 +78,7 @@ export type AssessedLiveness = {
   stuck: boolean;
   /** A free-text wait with no tracked source and no dated wait ahead, recomputed from the rows. */
   stalled: boolean;
-  /** The stored flag the assessment replaces; a reconcile is its only writer (BB-375). */
+  /** The stored flag the assessment replaces; a reconcile is its only writer for a ticket or pull request (BB-375; an ops binding's report still writes it). */
   reportedNoWakeSource: boolean;
   /** BB-351: the stored wait is live and past its kind's budget. */
   overdue: boolean;
