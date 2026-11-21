@@ -431,6 +431,14 @@ export const backlogSchema = z
      * it, so turning it off refuses at once.
      */
     triage: z.boolean().default(false),
+    /**
+     * Stage 3 (BB-385): whether the backlog steward may promote one
+     * ready-looking un-adopted Backlog ticket to Todo under the WIP limit.
+     * Off by default, so a merged plugin changes nothing until the owner
+     * enables it. The tool is offered only when it is true, and every call
+     * re-reads it, so turning it off refuses at once.
+     */
+    promote: z.boolean().default(false),
   })
   .strict();
 export type BacklogConfig = z.infer<typeof backlogSchema>;

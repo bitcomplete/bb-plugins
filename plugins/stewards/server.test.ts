@@ -12655,7 +12655,8 @@ Watch the team's whole open backlog and triage the un-adopted tickets that need 
     expect(wake).toContain("Comments: 1 per ticket per rolling seven days");
     expect(wake).toContain("Stale window: 14 days");
     expect(wake).toContain("Watch the team's whole open backlog");
-    expect(wake).toContain("`backlog_triage` is the only Linear write available to you");
+    expect(wake).toContain("`backlog_triage` adds labels");
+    expect(wake).toContain("`backlog.promote` is off; no promotion is offered");
     expect(wake).toContain("`steward_report` ends the turn");
   });
 });
@@ -12801,7 +12802,145 @@ describe("the backlog triage writes (BB-341)", () => {
     const project = t.spawns.find((s) => s.title === "Acme project steward")!.id;
     const digest = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
     expect(digest).toContain("- Writes: BB-1 label");
-    expect(digest).toContain("- Refused: 1");
+    expect(digest).toMatch(/- Refused: size:XL .*\(1\)/u);
+  });
+});
+
+describe("the backlog promotion write (BB-385)", () => {
+  const backlogIssue = (over: Record<string, unknown> = {}) => ({ id: "uuid-1", key: "BB-1", title: "Fix login", state: "Backlog", stateType: "backlog", unit: "BB", labels: [], assignees: [], priority: null, estimate: null, createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z", ...over });
+
+  /** A project with a backlog role and its steward thread, and the tickets the tool reads. */
+  async function promoting(options: { promote?: boolean; block?: Record<string, unknown>; backlog?: Array<Record<string, unknown>>; tickets?: Array<{ key: string; over?: Partial<EntitySnapshot> }> } = {}) {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: true, promote: options.promote ?? true, ...(options.block ?? {}) } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.setBacklog(options.backlog ?? [backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/BB")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_backlog" });
+    t.threads.set("thr_backlog", { status: "idle", archivedAt: null });
+    for (const ticket of options.tickets ?? [{ key: "BB-1" }]) {
+      t.entities.set(ticket.key, issue({ id: ticket.key === "BB-1" ? "uuid-1" : `uuid-${ticket.key}`, key: ticket.key, unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null, ...(ticket.over ?? {}) }));
+    }
+    return { t, binding };
+  }
+
+  const tools = async (t: Awaited<ReturnType<typeof setup>>, id: string) => (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id, title: null, parentThreadId: null, sourceThreadId: null } }))).tools.map((x) => x.name);
+
+  it("is offered only when backlog.promote is true, and absent writes nothing", async () => {
+    const readTools = ["backlog_triage", "ticket_read", "ticket_search", "steward_report", "steward_update"];
+    const off = await promoting({ promote: false });
+    expect(await tools(off.t, "thr_backlog")).toEqual(readTools);
+    const refused = await off.t.tool("backlog_promote", { key: "BB-1" }, "thr_backlog");
+    expect(refused.error).toBe(true);
+    expect(off.t.linearWrites).toEqual([]);
+
+    const on = await promoting({ promote: true });
+    expect(await tools(on.t, "thr_backlog")).toEqual(["backlog_triage", "backlog_promote", "ticket_read", "ticket_search", "steward_report", "steward_update"]);
+  });
+
+  it("promotes the top-ordered eligible ticket to Todo with the adoption label and this server's login", async () => {
+    const { t } = await promoting({ backlog: [backlogIssue({ key: "BB-1" }), backlogIssue({ id: "uuid-2", key: "BB-2", priority: "Urgent" })], tickets: [{ key: "BB-1" }, { key: "BB-2", over: { priority: "Urgent", description: "Add SSO." } }] });
+    const result = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(result.error).toBe(false);
+    expect(result.text).toMatch(/Promoted BB-2/u);
+    const write = t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!;
+    expect(write.input).toMatchObject({ key: "BB-2", state: "Todo", addLabels: ["bb-managed"], assignee: "me" });
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ outcome: "accepted", kind: "promote", issueKey: "BB-2" });
+  });
+
+  it("ignores a key that is not the top-ordered eligible ticket", async () => {
+    const { t } = await promoting({ backlog: [backlogIssue({ key: "BB-1", priority: "Urgent" }), backlogIssue({ id: "uuid-2", key: "BB-2", priority: "Low" })], tickets: [{ key: "BB-1", over: { priority: "Urgent" } }, { key: "BB-2", over: { priority: "Low" } }] });
+    const result = await t.tool("backlog_promote", { key: "BB-2" }, "thr_backlog");
+    expect(result.error).toBe(false);
+    expect(t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!.input.key).toBe("BB-1");
+  });
+
+  it("refuses when Todo plus In Progress is at the WIP limit, records the refusal and writes nothing", async () => {
+    const { t } = await promoting({ block: { wipLimit: 1 }, backlog: [backlogIssue({ id: "uuid-1", key: "BB-1", state: "Todo", stateType: "unstarted" }), backlogIssue({ id: "uuid-2", key: "BB-2" })], tickets: [{ key: "BB-2" }] });
+    const result = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/WIP full/u);
+    expect(t.linearWrites).toEqual([]);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "BB" });
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ outcome: "refused", kind: "promote", reason: "WIP full" });
+  });
+
+  it("never promotes an adopted, blocked or not-ready-looking ticket", async () => {
+    // Adopted: the adoption label, or any assignee.
+    const labelled = await promoting({ backlog: [backlogIssue({ labels: ["bb-managed"] })] });
+    expect((await labelled.t.tool("backlog_promote", {}, "thr_backlog")).error).toBe(true);
+    expect(labelled.t.linearWrites).toEqual([]);
+    const assigned = await promoting({ backlog: [backlogIssue({ assignees: ["jane"] })] });
+    expect((await assigned.t.tool("backlog_promote", {}, "thr_backlog")).error).toBe(true);
+
+    // Blocked: an open blocker from the issue read.
+    const blocked = await promoting({ tickets: [{ key: "BB-1", over: { blockedBy: ["BB-9"] } }] });
+    const blockedResult = await blocked.t.tool("backlog_promote", {}, "thr_backlog");
+    expect(blockedResult.error).toBe(true);
+    expect(blockedResult.text).toMatch(/no eligible candidate/u);
+    expect(blocked.t.linearWrites).toEqual([]);
+
+    // Not ready-looking: an empty description.
+    const empty = await promoting({ tickets: [{ key: "BB-1", over: { description: "  " } }] });
+    expect((await empty.t.tool("backlog_promote", {}, "thr_backlog")).error).toBe(true);
+    expect(empty.t.linearWrites).toEqual([]);
+  });
+
+  it("skips a blocked top ticket for the next ready-looking one", async () => {
+    const { t } = await promoting({ backlog: [backlogIssue({ key: "BB-1", priority: "Urgent" }), backlogIssue({ id: "uuid-2", key: "BB-2" })], tickets: [{ key: "BB-1", over: { priority: "Urgent", blockedBy: ["BB-9"] } }, { key: "BB-2" }] });
+    const result = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(result.error).toBe(false);
+    expect(t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!.input.key).toBe("BB-2");
+  });
+
+  it("re-reads backlog.promote on every call, so turning it off refuses at once", async () => {
+    const { t } = await promoting({ promote: true });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: true, promote: false } });
+    t.hooks.forgetConfigs();
+    const result = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/promote is off/u);
+    expect(t.linearWrites).toEqual([]);
+  });
+
+  it("fails closed when the backlog or a candidate cannot be read", async () => {
+    const backlog = await promoting({ promote: true });
+    backlog.t.setBacklogError("Linear rate limited the read");
+    const failed = await backlog.t.tool("backlog_promote", {}, "thr_backlog");
+    expect(failed.error).toBe(true);
+    expect(backlog.t.linearWrites).toEqual([]);
+
+    const candidate = await promoting({ promote: true });
+    candidate.t.setSnapshotError("BB-1", true);
+    const unreadable = await candidate.t.tool("backlog_promote", {}, "thr_backlog");
+    expect(unreadable.error).toBe(true);
+    expect(candidate.t.linearWrites).toEqual([]);
+  });
+
+  it("shows each promotion as its own digest line", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { triage: true, promote: true } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } } }, holders: { jane: ["backlog", "projectSteward"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.setBacklog([backlogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/BB")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_backlog" });
+    t.threads.set("thr_backlog", { status: "idle", archivedAt: null });
+    t.entities.set("BB-1", issue({ id: "uuid-1", key: "BB-1", unit: "BB", labels: [], assignees: [], state: "Backlog", stateType: "backlog", priority: null }));
+    await t.tool("backlog_promote", {}, "thr_backlog");
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const project = t.spawns.find((s) => s.title === "Acme project steward")!.id;
+    const digest = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(digest).toContain("- Promoted: BB-1");
   });
 });
 

@@ -586,8 +586,28 @@ list a Linear team (`linear.teams`); the role's `backlog.team` names which
 one is read. A project with no `linear.teams` cannot run it, and
 `bb stewards check` reports "backlog needs a Linear team; the backlog role
 is Linear-only" even when the role names a team. The read is read-only
-unless `backlog.triage` is on, in which case `backlog_triage` is your one
-gated write.
+unless `backlog.triage` is on, in which case `backlog_triage` adds labels,
+relations, a priority or one signed comment, and unless `backlog.promote` is
+on, in which case `backlog_promote { key }` moves one ticket forward. Both
+are gated, both are re-read on every call, and the plugin — not the
+playbook and not the model — enforces the limits.
+
+**Promotion (Stage 3, `backlog.promote`).** While Todo plus In Progress is
+under `backlog.wipLimit`, `backlog_promote` moves at most one ticket per
+pass to Todo, adds the adoption label and assigns it to this server's login,
+so the ordinary ticket steward adopts and specifies it with no hand step.
+The plugin picks the ticket: the top-ordered ready-looking un-adopted Backlog
+ticket, ordered by the owner's priority (urgent, high, medium, low, then
+none) and then Linear's own order, so it never ranks a ticket above what the
+owner set by hand. It ignores a `key` that is not that ticket. It never
+promotes a ticket that already carries an adoption label, has any assignee or
+is an initiative; one in a non-Backlog state; one with an open `blockedBy`;
+or one whose title or description is empty. It never edits a description,
+cancels or closes, and never changes a priority. Each accepted promotion and
+each refusal is written to the ledger and shown in the digest's Backlog
+section; a WIP-full or no-candidate refusal repeated for an unchanged reason
+collapses to one line. Once promoted, the ticket is adopted, so triage and
+promotion both refuse it: the backlog steward touches it no more.
 
 ## If you are an initiative steward
 
