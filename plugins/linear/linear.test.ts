@@ -342,11 +342,32 @@ describe("what stewards reads", () => {
       ],
       parent: { id: "uuid-100", key: "ENG-100" },
       children: [{ id: "uuid-124", key: "ENG-124", title: "Add test", state: "Todo", stateType: "unstarted", labels: ["bb-managed"] }],
+      blockedBy: [],
       linkedPulls: [{ url: "https://github.com/Acme/web/pull/42", key: "Acme/web#42" }],
       pull: null,
       viewer: "jane",
     });
     expect(parseSnapshotIssue({ data: { issue: null } })).toBeNull();
+  });
+
+  it("carries the open blockers from the inverse blocks relations (BB-385)", () => {
+    const blockers = {
+      ...raw,
+      inverseRelations: {
+        nodes: [
+          { id: "r1", type: "blocks", issue: { identifier: "ENG-70", state: { name: "In Progress", type: "started" } } },
+          // A completed or canceled blocker no longer blocks.
+          { id: "r2", type: "blocks", issue: { identifier: "ENG-69", state: { name: "Done", type: "completed" } } },
+          { id: "r3", type: "blocks", issue: { identifier: "ENG-68", state: { name: "Canceled", type: "canceled" } } },
+          // An unknown state counts as open, so nothing rides on an unread blocker.
+          { id: "r4", type: "blocks", issue: { identifier: "ENG-67", state: null } },
+          // A non-blocks relation is not a blocker, and a duplicate is listed once.
+          { id: "r5", type: "related", issue: { identifier: "ENG-66", state: { name: "Todo", type: "unstarted" } } },
+          { id: "r6", type: "blocks", issue: { identifier: "ENG-70", state: { name: "In Progress", type: "started" } } },
+        ],
+      },
+    };
+    expect(snapshotOfIssue(parseSnapshotIssue({ data: { issue: blockers } })!, null).blockedBy).toEqual(["ENG-70", "ENG-67"]);
   });
 
   it("orders linked pulls by attachment createdAt descending, regardless of the API's order (BB-316)", () => {

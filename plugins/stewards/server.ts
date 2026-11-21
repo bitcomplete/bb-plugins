@@ -142,6 +142,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, isFinalDeploymentState, matchesTarget, matchesWorkflow, mergedPulls, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
 import { backlogTriageParamsSchema, BACKLOG_COMMENT_WINDOW_MS, decideTriage, planIsEmpty, type BacklogWrite, type TriageConfig, type TriageTicket } from "./backlog-triage.js";
+import { backlogPromoteParamsSchema, candidateEligible, decidePromote, orderedCandidates, promoteAcceptedDetail, promoteRefusedDetail, wipCount, PROMOTE_WIP_FULL, type BacklogPromoteIssue, type PromoteConfig, type PromoteDetail } from "./backlog-promote.js";
 import { TICKET_TOOL_NAMES, createTicketWatches, formatTicket, registerTicketTools, ticketUnits } from "./ticket-tools.js";
 import { createLocalSource, isLocalState, LOCAL_PARKED, LOCAL_STATES, localStateType, type LocalSource, type LocalTicket } from "./local-source.js";
 import { evaluateCarries, liveAtMergeVerdict, matchCarriesRule, noRuleNoted, type CarriesReader } from "./carries.js";
@@ -6781,6 +6782,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         playbook,
         look,
         triage: block?.triage ?? false,
+        promote: block?.promote ?? false,
+        wipLimit: block?.wipLimit ?? 5,
         commentsPerWeek: block?.commentsPerWeek ?? 1,
         staleDays: block?.staleDays ?? 14,
         escalations: store.openEscalations(b.id),
@@ -12488,17 +12491,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // triage budget, the label vocabulary and the ledger, so they are not
         // offered to a backlog thread. The tool re-reads the flag itself, so
         // turning it off refuses at once even before the selection refreshes.
-        const backlogTriage = target?.kind === "backlog" && configs.get(b.projectId)?.value?.file.backlog?.triage === true;
+        const backlogBlock = configs.get(b.projectId)?.value?.file.backlog;
+        const backlogTriage = target?.kind === "backlog" && backlogBlock?.triage === true;
+        const backlogPromote = target?.kind === "backlog" && backlogBlock?.promote === true;
         if (target?.kind === "backlog") {
+          const backlogWrites = ["steward_report", "steward_update", ...(backlogTriage ? ["backlog_triage"] : []), ...(backlogPromote ? ["backlog_promote"] : []), "ticket_read", "ticket_search"];
           return {
-            tools: backlogTriage ? ["steward_report", "steward_update", "backlog_triage", "ticket_read", "ticket_search"] : ["steward_report", "steward_update", "ticket_read", "ticket_search"],
+            tools: backlogWrites,
             skills: [...STEWARDS_SKILLS],
             instructions:
               `You are the backlog steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
-              "The plugin reads the Linear team for you and every wake carries the whole open backlog. You never adopt a ticket, start a worker, edit a description, assign one, change its state, cancel or close it. " +
+              "The plugin reads the Linear team for you and every wake carries the whole open backlog. You never edit a description, start a worker, cancel or close a ticket. " +
               (backlogTriage
-                ? "`backlog_triage` is your only Linear write: it adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
-                : "The backlog is read-only on this project: `backlog.triage` is off, so no Linear write is offered. ") +
+                ? "`backlog_triage` adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
+                : "The backlog is read-only for triage on this project: `backlog.triage` is off. ") +
+              (backlogPromote
+                ? "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit; the plugin picks the ticket, so a key that is not the top-ordered eligible one is ignored. "
+                : "No promotion is offered: `backlog.promote` is off. ") +
               "`ticket_read` and `ticket_search` are reads only. End every turn you were woken for with steward_report. Read the stewards skill for the protocol.",
           };
         }
@@ -12877,6 +12886,138 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             plan.comment !== null ? (plan.comment.kind === "stale" ? "a stale-cancel proposal" : "a question") : null,
           ].filter((p): p is string => p !== null);
           return `Triaged ${entity.key}: ${parts.join("; ")}.`;
+          } catch (error) {
+            return toolError(error);
+          }
+        });
+      }),
+    });
+
+    /**
+     * BB-385: the backlog steward's one promotion write. It is offered only
+     * when `backlog.promote` is true, and the flag is re-read on every call,
+     * so turning it off refuses at once. The plugin picks the ticket: it reads
+     * the team's fresh backlog, counts Todo plus In Progress against the WIP
+     * limit, orders the un-adopted Backlog tickets by the owner's priority and
+     * takes the first ready-looking unblocked one. Every accepted promotion
+     * and every refusal is appended to the ledger the digest reports from.
+     */
+    bb.agents.registerTool({
+      name: "backlog_promote",
+      description:
+        "Promote one ticket from the backlog to Todo under the WIP limit: the plugin picks the top-ordered ready-looking un-adopted Backlog ticket, adds the adoption label and assigns it to this server. It promotes at most one per pass and ignores a `key` that is not the top-ordered eligible ticket. It refuses when Todo plus In Progress is at or over backlog.wipLimit, and it never edits a description, cancels, closes or changes priority.",
+      presentation: { label: { pending: "Promoting a backlog ticket", completed: "Promoted a backlog ticket" } },
+      parameters: backlogPromoteParamsSchema,
+      execute: store.coalescingTool(async (input, { threadId }) => {
+        const binding = store.byThread(threadId);
+        const target = binding === null || binding.kind !== "ops" ? null : parseOpsTargetKey(binding.entityId);
+        if (binding === null || target === null || target.kind !== "backlog") {
+          return toolError(new Error("backlog_promote is for a backlog steward's thread; this thread is not one."));
+        }
+        const projectId = binding.projectId;
+        const team = target.team;
+        const record = (outcome: "accepted" | "refused", detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
+          store.addBacklogWrite({ id: newId("btw"), projectId, team, issueId, issueKey, at: now(), outcome, kind: "promote", detail, reason });
+        // Serialise promotion passes per project, so two calls cannot both read
+        // an under-limit WIP and both promote.
+        return withTriageLock(`${projectId}:promote`, async () => {
+          try {
+            const config = await loadConfig(projectId, true);
+            if (config === null) return toolError(new Error(`no ${PROJECT_FILE} for project ${projectId}`));
+            const block = config.file.backlog;
+            const promoteConfig: PromoteConfig = {
+              promote: block?.promote === true,
+              team,
+              wipLimit: block?.wipLimit ?? 5,
+              label: config.file.label,
+              adoptedLabels: [config.file.label, INITIATIVE_LABEL, ...config.file.tickets.flatMap((t) => t.match.labels ?? [])],
+            };
+            // The opt-in is read on every call, never only at registration.
+            if (!promoteConfig.promote) return toolError(new Error("backlog.promote is off; the backlog steward promotes nothing."));
+
+            // At most one promotion per pass: an accepted promotion recorded
+            // since this wake began refuses a second one, even when the WIP
+            // count still has room. A pass is one wake, and `wokeAt` is when
+            // the current one was delivered.
+            const passStart = binding.wokeAt ?? 0;
+            if (store.backlogWrites(projectId, { team }).some((w) => w.outcome === "accepted" && w.kind === "promote" && w.at >= passStart)) {
+              const reason = "already promoted one ticket this pass";
+              record("refused", promoteRefusedDetail(input), reason, "", "");
+              return toolError(new Error(reason));
+            }
+
+            // Fail closed: a backlog that cannot be read is refused, and no
+            // Linear write happens.
+            let out: z.infer<typeof sourceContract.sourceBacklog.output>;
+            try {
+              out = await sourceRpc("linear", "sourceBacklog", { team }, sourceContract.sourceBacklog.output);
+            } catch (error) {
+              const reason = `the backlog could not be read: ${errorMessage(error)}`;
+              record("refused", promoteRefusedDetail(input), reason, "", "");
+              return toolError(new Error(reason));
+            }
+            if (out.unsupported || out.errors.length > 0) {
+              const reason = `the backlog could not be read: ${out.unsupported ? "the linear source does not support sourceBacklog" : out.errors.join("; ")}`;
+              record("refused", promoteRefusedDetail(input), reason, "", "");
+              return toolError(new Error(reason));
+            }
+            // A truncated read is only part of the backlog, so the WIP count
+            // and the ordering would be wrong; refuse rather than promote on it.
+            if (out.truncated) {
+              const reason = "the backlog read was truncated; no promotion";
+              record("refused", promoteRefusedDetail(input), reason, "", "");
+              return toolError(new Error(reason));
+            }
+            const issues: BacklogPromoteIssue[] = out.issues.map((i) => ({ id: i.id, key: i.key, unit: i.unit, title: i.title, state: i.state, stateType: i.stateType, labels: i.labels, assignees: i.assignees, priority: i.priority, createdAt: i.createdAt }));
+
+            // The WIP ceiling and the ordering are pure; only a candidate needs
+            // the issue read that carries its description and open blockers.
+            if (wipCount(issues, promoteConfig) >= promoteConfig.wipLimit) {
+              record("refused", promoteRefusedDetail(input), PROMOTE_WIP_FULL, "", "");
+              return toolError(new Error(`WIP full: Todo plus In Progress is at the limit of ${promoteConfig.wipLimit}; no promotion.`));
+            }
+            const details = new Map<string, PromoteDetail>();
+            for (const candidate of orderedCandidates(issues, promoteConfig)) {
+              let snap;
+              try {
+                snap = await snapshot("linear", candidate.key);
+              } catch (error) {
+                const reason = `${candidate.key} could not be read: ${errorMessage(error)}`;
+                record("refused", promoteRefusedDetail(input), reason, "", candidate.key);
+                return toolError(new Error(reason));
+              }
+              if (snap === null) {
+                const reason = `${candidate.key} could not be read: no such issue`;
+                record("refused", promoteRefusedDetail(input), reason, "", candidate.key);
+                return toolError(new Error(reason));
+              }
+              // Fail closed on a source that did not read relations: absent
+              // `blockedBy` means the fact is unknown, not that there is none.
+              if (snap.blockedBy === undefined) {
+                const reason = `${candidate.key} did not report its blockers; no promotion`;
+                record("refused", promoteRefusedDetail(input), reason, "", candidate.key);
+                return toolError(new Error(reason));
+              }
+              const detail: PromoteDetail = { description: snap.description, blockedBy: snap.blockedBy };
+              details.set(candidate.key, detail);
+              // Read no further than the first ticket that could be promoted.
+              if (candidateEligible(candidate, detail)) break;
+            }
+            const decision = decidePromote({ params: input, issues, details, config: promoteConfig });
+            if (!decision.ok) {
+              record("refused", promoteRefusedDetail(input), decision.reason, "", "");
+              return toolError(new Error(decision.reason));
+            }
+            const plan = decision.plan;
+            try {
+              await sourceRpc("linear", "sourceUpdateIssue", { key: plan.key, state: plan.state, addLabels: plan.addLabels, assignee: plan.assignee }, sourceContract.sourceUpdateIssue.output);
+            } catch (error) {
+              const reason = `the write was refused: ${errorMessage(error)}`;
+              record("refused", promoteRefusedDetail(input), reason, decision.candidate.key, decision.candidate.key);
+              return toolError(new Error(reason));
+            }
+            record("accepted", promoteAcceptedDetail(decision.candidate, input, promoteConfig), null, decision.candidate.id, decision.candidate.key);
+            return `Promoted ${plan.key} to ${plan.state}, labelled ${plan.addLabels.join(", ")} and assigned to ${plan.assignee}.`;
           } catch (error) {
             return toolError(error);
           }

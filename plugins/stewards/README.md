@@ -116,7 +116,20 @@ install on a stock bb: one repository, no Linear, no hooks service.
   [store.ts](store.ts)); the digest lists each write and counts the refusals.
   The flag is re-read on every call, so turning it off refuses at once, and
   a ticket, ledger or configuration that cannot be read refuses and writes
-  nothing. The `.bb` keys land in a later, owner-reviewed pull request.
+  nothing. Stage 3 adds a second opt-in, `backlog.promote: true`, and with it
+  the gated `backlog_promote { key }` tool ([backlog-promote.ts](backlog-promote.ts)):
+  it moves one ticket to Todo, adds the adoption label and assigns it to this
+  server, then the ordinary ticket steward adopts it. The plugin, not the
+  model, picks the ticket — the top-ordered ready-looking un-adopted Backlog
+  ticket, by the owner's priority and then oldest `createdAt` first, with the
+  key as a final tiebreak (Linear returns newest first, so the tiebreak is
+  explicit) — and ignores a `key` that is not that ticket. It refuses when Todo plus In Progress is at
+  or over `backlog.wipLimit`, never edits a description, cancels, closes or
+  changes a priority, and never promotes an adopted ticket, one in a
+  non-Backlog state, or one with an open `blockedBy` (the linear snapshot now
+  carries the open blocker keys). Each promotion is its own digest line; a
+  WIP-full or no-candidate refusal repeated for an unchanged reason collapses
+  to one. The `.bb` keys land in a later, owner-reviewed pull request.
 - **The reconcile loop.** linear and github-watcher hold leases on the hooks
   service for the project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with

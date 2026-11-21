@@ -5,6 +5,7 @@ import { MIGRATIONS, createStore } from "./store.js";
 import { formatRecords, type DigestRecords } from "./wake.js";
 import type { BacklogLook } from "./ops.js";
 import type { BacklogIssue } from "./source-contract.js";
+import type { BacklogWrite } from "./backlog-triage.js";
 
 const NY = { at: "01:00", until: "02:45", timezone: "America/New_York" };
 // 2026-10-14 05:30Z is 01:30 in New York (EDT, UTC-4).
@@ -300,6 +301,31 @@ describe("the backlog report (BB-334)", () => {
     expect(withBacklog).toContain("- Proposed next: BB-1 (no priority, 13d old)");
     expect(formatRecords(emptyRecords([]), []).join("\n")).not.toContain("### Backlog");
     expect(formatRecords(emptyRecords(undefined), []).join("\n")).not.toContain("### Backlog");
+  });
+
+  it("lists each promotion and collapses repeated refusals by their unchanged reason (BB-385)", () => {
+    const writes: BacklogWrite[] = [
+      { id: "w1", projectId: "p1", team: "BB", issueId: "uuid-1", issueKey: "BB-1", at: NOW, outcome: "accepted", kind: "promote", detail: {}, reason: null },
+      { id: "w2", projectId: "p1", team: "BB", issueId: "", issueKey: "", at: NOW, outcome: "refused", kind: "promote", detail: {}, reason: "WIP full" },
+      { id: "w3", projectId: "p1", team: "BB", issueId: "", issueKey: "", at: NOW, outcome: "refused", kind: "promote", detail: {}, reason: "WIP full" },
+      { id: "w4", projectId: "p1", team: "BB", issueId: "", issueKey: "", at: NOW, outcome: "refused", kind: "promote", detail: {}, reason: "no eligible candidate" },
+      { id: "w5", projectId: "p1", team: "BB", issueId: "uuid-2", issueKey: "BB-2", at: NOW, outcome: "accepted", kind: "promote", detail: {}, reason: null },
+      // A triage write is still one Writes line, and is not a promotion.
+      { id: "w6", projectId: "p1", team: "BB", issueId: "uuid-3", issueKey: "BB-3", at: NOW, outcome: "accepted", kind: "label", detail: {}, reason: null },
+    ];
+    const report = backlogDigest(look([issue({ title: "Fix login" })]), null, { staleDays: 14, writes }, NOW);
+    expect(report.promotions.map((p) => p.issueKey)).toEqual(["BB-1", "BB-2"]);
+    expect(report.writes.map((w) => `${w.issueKey} ${w.kind}`)).toEqual(["BB-3 label"]);
+    expect(report.refusals).toBe(3);
+    expect(report.refusalReasons).toEqual([
+      { reason: "WIP full", count: 2 },
+      { reason: "no eligible candidate", count: 1 },
+    ]);
+    const text = formatRecords(emptyRecords([report]), []).join("\n");
+    expect(text).toContain("  - Writes: BB-3 label");
+    expect(text).toContain("  - Promoted: BB-1");
+    expect(text).toContain("  - Promoted: BB-2");
+    expect(text).toContain("  - Refused: WIP full (2); no eligible candidate (1)");
   });
 
   it("shows a failed read as one problem line, never an empty backlog", () => {

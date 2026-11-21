@@ -893,6 +893,8 @@ Watch the team's whole open backlog and triage the un-adopted tickets that need 
       playbook: parsed.value,
       look: { at, target: "backlog/BB", team: "BB", error: null, issues: [backlogIssue()], unsupported: false, truncated: false, ...over },
       triage: true,
+      promote: false,
+      wipLimit: 5,
       commentsPerWeek: 1,
       staleDays: 14,
       escalations: [],
@@ -921,8 +923,16 @@ Watch the team's whole open backlog and triage the un-adopted tickets that need 
     expect(text).toMatch(/Comments: 1 per ticket per rolling seven days/u);
     expect(text).toMatch(/Stale window: 14 days/u);
     expect(text).toMatch(/Watch the team's whole open backlog/u);
-    expect(text).toMatch(/`backlog_triage` is the only Linear write available to you/u);
+    expect(text).toMatch(/`backlog_triage` adds labels/u);
+    expect(text).toMatch(/`backlog\.promote` is off; no promotion is offered/u);
     expect(text).toMatch(/`steward_report` ends the turn/u);
+  });
+
+  it("offers backlog_promote and names the WIP limit when promotion is on (BB-385)", () => {
+    const text = backlogWake({}, { promote: true, wipLimit: 3 });
+    expect(text).toMatch(/`backlog_promote` is the one other Linear write/u);
+    expect(text).toMatch(/`backlog\.promote` is on; the plugin offers `backlog_promote`, one promotion per pass while Todo plus In Progress is under 3/u);
+    expect(text).toMatch(/Promote one with `backlog_promote` before the report/u);
   });
 
   it("says the backlog could not be read rather than reporting an empty one", () => {

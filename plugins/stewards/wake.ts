@@ -1107,8 +1107,12 @@ export type BacklogWakeInput = {
   binding: Binding;
   playbook: Playbook;
   look: BacklogLook;
-  /** Whether `backlog.triage` is on, so the one gated write tool is offered. */
+  /** Whether `backlog.triage` is on, so the triage write tool is offered. */
   triage: boolean;
+  /** Whether `backlog.promote` is on, so the promotion tool is offered (BB-385). */
+  promote: boolean;
+  /** Stage 3's Todo + In Progress ceiling, `backlog.wipLimit` (BB-385). */
+  wipLimit: number;
   /** The comment budget, `backlog.commentsPerWeek`. */
   commentsPerWeek: number;
   /** The stale window, `backlog.staleDays`. */
@@ -1158,7 +1162,11 @@ export function formatBacklogWake(input: BacklogWakeInput): string {
   out.push("", `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`);
   out.push(
     "",
-    "`backlog_triage` is the only Linear write available to you: it adds labels, relations and a priority, or posts one comment, and it never edits a description, assigns, cancels, closes or changes state. Every write it accepts is appended to the ledger below and reported in the digest. `steward_report` ends the turn.",
+    "`backlog_triage` adds labels, relations and a priority, or posts one comment; it never edits a description, assigns, cancels, closes or changes state." +
+      (input.promote
+        ? " `backlog_promote` is the one other Linear write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit. It never edits a description, cancels or closes."
+        : "") +
+      " Every write it accepts is appended to the ledger below and reported in the digest. `steward_report` ends the turn.",
   );
 
   out.push("", "## 2. Guidance, priority and holds", "");
@@ -1184,9 +1192,10 @@ export function formatBacklogWake(input: BacklogWakeInput): string {
   }
   out.push("", "### The triage ledger (rolling seven days)", "");
   if (input.ledger.length === 0) out.push("No writes in the window.");
-  for (const w of input.ledger) out.push(`- ${w.outcome === "accepted" ? "Accepted" : "Refused"} ${w.issueKey}: ${w.outcome === "accepted" ? w.kind : `${w.kind} — ${w.reason ?? "refused"}`}`);
+  for (const w of input.ledger) out.push(`- ${w.outcome === "accepted" ? "Accepted" : "Refused"}${w.issueKey === "" ? "" : ` ${w.issueKey}`}: ${w.outcome === "accepted" ? w.kind : `${w.kind} — ${w.reason ?? "refused"}`}`);
   out.push("", "### Limits", "");
   out.push(`- \`backlog.triage\` is ${input.triage ? "on; the plugin offers `backlog_triage`" : "off; the backlog steward is read-only"}.`);
+  out.push(`- \`backlog.promote\` is ${input.promote ? `on; the plugin offers \`backlog_promote\`, one promotion per pass while Todo plus In Progress is under ${input.wipLimit}` : "off; no promotion is offered"}.`);
   out.push(`- Comments: ${input.commentsPerWeek} per ticket per rolling seven days, the stale-cancel proposal included.`);
   out.push(`- Stale window: ${input.staleDays} days.`);
 
@@ -1194,7 +1203,11 @@ export function formatBacklogWake(input: BacklogWakeInput): string {
   out.push("", "## 4. What changed since your last look", "");
   if (input.changes.length === 0) out.push("Nothing new; this is a scheduled look.");
   for (const c of input.changes) out.push(`- ${c}`);
-  out.push("", "---", "Report the look with `steward_report` and end the turn. Triage a qualifying ticket with `backlog_triage` before the report, so the ledger lists it.");
+  out.push(
+    "",
+    "---",
+    "Report the look with `steward_report` and end the turn. Triage a qualifying ticket with `backlog_triage` before the report, so the ledger lists it." + (input.promote ? " Promote one with `backlog_promote` before the report when Todo plus In Progress is under the limit." : ""),
+  );
   return fit(head, snapshot, out);
 }
 
@@ -1976,9 +1989,11 @@ function backlogLines(b: BacklogDigest): string[] {
   if (b.stale.length > 0) out.push(`  - Stale: ${b.stale.map((s) => `${s.key} (${s.days}d)`).join(", ")}`);
   if (b.next.length > 0) out.push(`  - Proposed next: ${b.next.map((n) => `${n.key} (${n.reason})`).join("; ")}`);
   // BB-341: what the steward wrote, so the owner can review it against the
-  // budget, and how many attempts it refused.
+  // budget. BB-385: each promotion is its own line, and the refusals collapse
+  // to one line per unchanged reason.
   if (b.writes.length > 0) out.push(`  - Writes: ${b.writes.map((w) => `${w.issueKey} ${w.kind}`).join(", ")}`);
-  if (b.refusals > 0) out.push(`  - Refused: ${b.refusals}`);
+  for (const p of b.promotions) out.push(`  - Promoted: ${p.issueKey}`);
+  if (b.refusals > 0) out.push(`  - Refused: ${b.refusalReasons.map((r) => `${r.reason} (${r.count})`).join("; ")}`);
   return out;
 }
 

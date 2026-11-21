@@ -87,7 +87,7 @@ export const backlogWriteSchema = z.object({
   issueKey: z.string(),
   at: z.number(),
   outcome: z.enum(["accepted", "refused"]),
-  kind: z.enum(["label", "relation", "priority", "comment", "triage"]),
+  kind: z.enum(["label", "relation", "priority", "comment", "triage", "promote"]),
   detail: z.record(z.string(), z.unknown()).default({}),
   reason: z.string().nullable().default(null),
 });

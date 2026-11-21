@@ -262,8 +262,15 @@ export type BacklogDigest = {
   next: BacklogNext[];
   /** BB-341: the accepted triage writes since the previous digest, each a ticket and a kind. */
   writes: Array<{ issueKey: string; kind: string; at: number }>;
-  /** BB-341: how many triage calls were refused in the window. */
+  /** BB-385: the accepted promotions, each its own digest line. */
+  promotions: Array<{ issueKey: string; at: number }>;
+  /** BB-341: how many backlog calls were refused in the window. */
   refusals: number;
+  /**
+   * BB-385: the refusals grouped by their unchanged reason, one line each, so
+   * a WIP-full or no-candidate refusal repeated every pass collapses to one.
+   */
+  refusalReasons: Array<{ reason: string; count: number }>;
 };
 
 const daysSince = (from: string | null, now: number): number | null => {
@@ -388,7 +395,9 @@ export function backlogDigest(look: BacklogLook, previous: BacklogSnapshot | nul
     duplicates: duplicateBacklog(issues),
     stale: staleBacklog(issues, opts.staleDays, now),
     next: nextBacklog(issues, now),
-    writes: ledger.filter((w) => w.outcome === "accepted").map((w) => ({ issueKey: w.issueKey, kind: w.kind, at: w.at })),
+    writes: ledger.filter((w) => w.outcome === "accepted" && w.kind !== "promote").map((w) => ({ issueKey: w.issueKey, kind: w.kind, at: w.at })),
+    promotions: ledger.filter((w) => w.outcome === "accepted" && w.kind === "promote").map((w) => ({ issueKey: w.issueKey, at: w.at })),
     refusals: ledger.filter((w) => w.outcome === "refused").length,
+    refusalReasons: [...ledger.filter((w) => w.outcome === "refused").reduce((by, w) => by.set(w.reason ?? "refused", (by.get(w.reason ?? "refused") ?? 0) + 1), new Map<string, number>())].map(([reason, count]) => ({ reason, count })),
   };
 }
