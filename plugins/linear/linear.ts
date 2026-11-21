@@ -157,7 +157,7 @@ const commentSchema = z.object({
   user: person,
 });
 
-const relationIssueSchema = z.object({ identifier: z.string(), state: z.object({ name: z.string() }).nullish() });
+const relationIssueSchema = z.object({ identifier: z.string(), state: z.object({ name: z.string(), type: z.string().nullish() }).nullish() });
 const relationSchema = z.object({ id: z.string(), type: z.string(), issue: relationIssueSchema.nullish(), relatedIssue: relationIssueSchema.nullish() });
 export type IssueRelation = z.infer<typeof relationSchema>;
 
@@ -460,6 +460,7 @@ const SNAPSHOT_FIELDS =
   "state { name type } team { id key } assignee { name displayName email } creator { name displayName email } " +
   "labels { nodes { name } } parent { id identifier } " +
   "children { nodes { id identifier title state { name type } labels { nodes { name } } } } " +
+  "inverseRelations { nodes { id type issue { identifier state { name type } } } } " +
   `comments(last: ${SNAPSHOT_COMMENTS_MAX}) { nodes { id body createdAt url user { name displayName email } } } ` +
   "attachments { nodes { url sourceType createdAt } }";
 
@@ -516,6 +517,10 @@ const snapshotIssueSchema = z.object({
       ),
     })
     .nullish(),
+  // BB-385: the inverse `blocks` relations, so a snapshot can name the open
+  // issues that block this one. The `Issue` query already reads them for the
+  // `linear_issue` tool; the snapshot query now reads them too.
+  inverseRelations: z.object({ nodes: z.array(relationSchema) }).nullish(),
   comments: z.object({ nodes: z.array(commentSchema.extend({ id: z.string() })) }).nullish(),
   attachments: z.object({ nodes: z.array(z.object({ url: z.string().nullish(), sourceType: z.string().nullish(), createdAt: z.string().nullish() })) }).nullish(),
 });
@@ -533,6 +538,27 @@ const PULL_URL = /^https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z
 export function pullKey(url: string): string | null {
   const m = PULL_URL.exec(url.trim());
   return m === null ? null : `${m[1]}/${m[2]}#${m[3]}`;
+}
+
+/**
+ * BB-385: the open blockers of an issue, from its inverse relations. A
+ * `blocks` inverse relation names an issue that blocks this one; a blocker
+ * whose state type is completed or canceled no longer blocks. An unknown
+ * state counts as open, so a promotion never rides on a blocker it could not
+ * read.
+ */
+export function openBlockers(issue: SnapshotIssue): string[] {
+  const closed = new Set(["completed", "canceled"]);
+  const out: string[] = [];
+  for (const relation of issue.inverseRelations?.nodes ?? []) {
+    if (relation.type !== "blocks") continue;
+    const blocker = relation.issue;
+    if (blocker === null || blocker === undefined || blocker.identifier === "") continue;
+    const type = (blocker.state?.type ?? "").trim().toLowerCase();
+    if (closed.has(type)) continue;
+    if (!out.includes(blocker.identifier)) out.push(blocker.identifier);
+  }
+  return out;
 }
 
 /**
@@ -593,6 +619,7 @@ export function snapshotOfIssue(issue: SnapshotIssue, viewer: string | null): En
       stateType: c.state?.type ?? null,
       labels: (c.labels?.nodes ?? []).map((l) => l.name),
     })),
+    blockedBy: openBlockers(issue),
     linkedPulls,
     pull: null,
     viewer,

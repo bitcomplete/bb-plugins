@@ -52,6 +52,37 @@ describe("source-contract.ts", () => {
     expect(entitySnapshotSchema.safeParse({ ...snapshot, playbook: 3 }).success).toBe(false);
   });
 
+  it("carries an optional, additive blockedBy on the issue snapshot (BB-385)", () => {
+    const base = {
+      source: "linear" as const,
+      kind: "issue" as const,
+      id: "ENG-1",
+      key: "ENG-1",
+      url: null,
+      title: "Fix login",
+      state: "Backlog",
+      stateType: "backlog",
+      unit: "ENG",
+      labels: [],
+      author: null,
+      assignees: [],
+      priority: null,
+      estimate: null,
+      description: "Users cannot log in.",
+      createdAt: null,
+      updatedAt: null,
+      comments: [],
+      parent: null,
+      children: [],
+      linkedPulls: [],
+      pull: null,
+      viewer: null,
+    };
+    expect(entitySnapshotSchema.parse({ ...base, blockedBy: ["ENG-2"] }).blockedBy).toEqual(["ENG-2"]);
+    // Absent by default: a source that did not read relations omits it.
+    expect(entitySnapshotSchema.parse(base).blockedBy).toBeUndefined();
+  });
+
   it("reads the last signature in a body", () => {
     expect(signedBy(`hello\n\n${signatureLine("thr_abc")}`)).toBe("thr_abc");
     expect(signedBy(`> ${signatureLine("thr_old")}\n\nreply\n\n${signatureLine("thr_new")}`)).toBe("thr_new");

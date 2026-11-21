@@ -274,6 +274,15 @@ export const entitySnapshotSchema = z.object({
   children: z.array(snapshotChildSchema),
   childrenTotal: z.number().int().nonnegative().optional(),
   /**
+   * BB-385: the keys of the issues that block this one (this issue is
+   * `blockedBy` them), keeping only blockers still open. Optional and
+   * additive: the linear source reads relations and sends it, an empty array
+   * when nothing blocks the issue; github, which has no dependency relation,
+   * omits it. Absent means the source did not read relations, never that none
+   * block it, so a caller that needs the fact refuses rather than assumes.
+   */
+  blockedBy: z.array(z.string()).optional(),
+  /**
    * True when the source could not read the entity's parent and sub-issues
    * (GitHub rejected the fields, or the relation read errored or was
    * rate-limited) while the rest of the snapshot was read. Adoption,
