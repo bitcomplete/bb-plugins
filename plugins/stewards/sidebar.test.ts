@@ -601,6 +601,9 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     // A wait on a running worker, or on someone else, is not a lost hand-off.
     expect(effortPhrase(effort({ key: "c", waitingOn: "worker thr_w1", workers: [{ ...finished, status: "running" }], pending: [finish] }), now)).toBe("worker finished");
     expect(effortPhrase(effort({ key: "d", waitingOn: "the reviewer", workers: [finished], pending: [finish] }), now)).toBe("worker finished");
+    // A typed `worker` wait (BB-333) with no free-text waitingOn is the same lost hand-off.
+    expect(effortPhrase(effort({ key: "e", wait: { kind: "worker", ref: "thr_w1" }, workers: [finished], pending: [finish] }), now)).toBe("hand-off lost: worker finished");
+    expect(effortPhrase(effort({ key: "f", wait: { kind: "worker", ref: "thr_w1" }, workers: [{ ...finished, status: "running" }], pending: [finish] }), now)).toBe("worker finished");
   });
 
   it("phrases a deployment watch's state", () => {

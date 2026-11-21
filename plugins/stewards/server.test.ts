@@ -14142,6 +14142,30 @@ describe("a steward idle in an active stage (BB-83)", () => {
     expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
   });
 
+  it("wakes at once when the worker named by a typed `worker` wait finishes, with no free-text waitingOn", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    // The steward reports only the typed wait (BB-333); `waitingOn` is empty.
+    await t.tool("steward_report", { phase: "In Progress", summary: "Worker released to open a draft PR.", nextAction: "checks passed", actor: "steward", wait: { kind: "worker", ref: "thr_w1" } }, steward);
+    expect(t.hooks.store.open("p1")[0]!.wait).toEqual({ kind: "worker", ref: "thr_w1" });
+    const before = t.sends.length;
+    // The worker ends with its own pull request open, so the idle rule stays
+    // off (BB-285). The typed wait makes the finish the lost hand-off wake.
+    await t.idle("thr_w1", "Draft PR is up and checks are green on acme/web#7. Stopping as instructed.");
+    expect(t.sends).toHaveLength(before + 1);
+    const wake = t.sends.at(-1)!.text;
+    expect(wake).toMatch(/finished its turn while you were waiting on it/u);
+    expect(wake).toMatch(/Do not re-wait on this worker/u);
+    expect(wake).toMatch(/checks are green/u);
+    expect(t.hooks.store.open("p1")[0]!.pending).toEqual([]);
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
+  });
+
   it("wakes once after the grace, and not again after the steward reports", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));

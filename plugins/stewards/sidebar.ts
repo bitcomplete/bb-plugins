@@ -321,7 +321,7 @@ export function effortState(e: EffortStatus): SidebarEffortState {
  */
 function isWaitingEffort(e: EffortStatus, now: number): boolean {
   if (e.pending.some(isLostHandoffNote) || e.pending.some(isQuietWorkerFinish)) return false;
-  if (waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? [])) return false;
+  if (waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? [], e.wait)) return false;
   if (e.hold !== null) return true;
   if (e.delegateWait !== null && e.delegateWait !== undefined && e.delegateWait !== "") return true;
   if (e.wait !== null && e.wait !== undefined && e.noWakeSource !== true) return true;
@@ -396,6 +396,19 @@ export function waitingOnNamesWorker(waitingOn: string | null, worker: { threadI
 }
 
 /**
+ * Whether the steward's report waits on this worker: the free-text
+ * `waitingOn` names it (BB-152), or the typed wait (BB-333) is a `worker`
+ * wait whose ref is its thread id. A steward that reports only the typed
+ * wait leaves `waitingOn` empty, and its worker's finish is the same lost
+ * hand-off; before this both the finish wake and the sidebar read only the
+ * free text, so such a steward slept until its requeue.
+ */
+export function reportWaitsOnWorker(waitingOn: string | null, wait: Wait | null | undefined, worker: { threadId: string; title: string }): boolean {
+  if (wait !== null && wait !== undefined && wait.kind === "worker" && wait.ref.trim().toLowerCase() === worker.threadId.trim().toLowerCase()) return true;
+  return waitingOnNamesWorker(waitingOn, worker);
+}
+
+/**
  * Whether a `waitingOn` names a worker that is no longer running (BB-152):
  * the steward is waiting on a finished worker, a lost hand-off. `running` is
  * the only live status; `finished`, `failed` and `stopped` are all over.
@@ -403,8 +416,9 @@ export function waitingOnNamesWorker(waitingOn: string | null, worker: { threadI
 export function waitingOnNamesFinishedWorker(
   waitingOn: string | null,
   workers: readonly { threadId: string; title: string; status: string }[],
+  wait: Wait | null | undefined = null,
 ): boolean {
-  return waitingOn !== null && workers.some((w) => w.status !== "running" && waitingOnNamesWorker(waitingOn, w));
+  return workers.some((w) => w.status !== "running" && reportWaitsOnWorker(waitingOn, wait, w));
 }
 
 /**
@@ -474,7 +488,7 @@ function baseEffortPhrase(e: EffortStatus, now: number): string {
   }
   // A wait on a worker that is no longer running is a lost hand-off, not a
   // plain finish (BB-152): the steward is waiting on a worker that is over.
-  const lostHandoff = waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? []) || e.pending.some(isLostHandoffNote);
+  const lostHandoff = waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? [], e.wait) || e.pending.some(isLostHandoffNote);
   if (lostHandoff) return e.requeueAt === null ? "hand-off lost: worker finished" : `hand-off lost: worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
   if (e.pending.some(isQuietWorkerFinish)) return e.requeueAt === null ? "worker finished" : `worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
   // BB-247: a dated wait reads its date, so the row says when the plugin will
