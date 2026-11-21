@@ -245,9 +245,9 @@ describe("the shadow assessment: the page refusal text (BB-292 #3)", () => {
 });
 
 describe("the shadow assessment: the liveness (bb-plugins#294 and noWakeSource)", () => {
-  it("derives the stall from the rows on the bb-plugins#294 shape, agreeing with the report-time flag", () => {
+  it("derives the stall from the rows on the bb-plugins#294 shape, agreeing with the stored flag", () => {
     // #294: a `pr` binding's own open pull request with a free-text wait and no
-    // other source; the report path marks it noWakeSource, and the rows say the
+    // other source; the derivation marks it noWakeSource, and the rows say the
     // same thing.
     const entity = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" });
     const i = input({
@@ -264,7 +264,7 @@ describe("the shadow assessment: the liveness (bb-plugins#294 and noWakeSource)"
     expect(compare(i, a).find((x) => x.surface === "noWakeSource")).toBeUndefined();
   });
 
-  it("records a noWakeSource divergence when the report-time flag and the rows disagree", () => {
+  it("records a noWakeSource divergence when the stored flag and the rows disagree", () => {
     const i = input({ binding: binding({ noWakeSource: true, status: null }) });
     const a = assess(i);
     expect(a.liveness.stalled).toBe(false);
@@ -339,8 +339,8 @@ describe("the divergence store", () => {
 });
 
 // BB-333 (criterion 4 of BB-291): the typed-wait shadow derivation. `waitLive`
-// is resolved from the stored kind on every reconcile, never from the
-// report-time flag; a typed wait is judged by its own kind, a no-kind report
+// is resolved from the stored kind on every reconcile, never from the stored
+// flag; a typed wait is judged by its own kind, a no-kind report
 // keeps the free-text rule exactly.
 describe("the shadow assessment: the typed wait (BB-333)", () => {
   const openPull = (key: string, pullOver: Partial<NonNullable<EntitySnapshot["pull"]>> = {}) => {
@@ -542,7 +542,7 @@ describe("the typed-wait divergence store (BB-333)", () => {
   it("keeps a stopped row's own wait kind and liveness, only flipping its transition", () => {
     const { s } = store();
     // A worker disagreement: the worker was between turns, so the typed
-    // derivation stalled while the report-time flag said live.
+    // derivation stalled while the stored flag said live.
     s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "worker", waitLive: false, inputs: { hasWait: false } }, 1_000);
     // It stops disagreeing while the current fields say the worker is running
     // (waitLive true). The stopped row must keep the disagreement's own

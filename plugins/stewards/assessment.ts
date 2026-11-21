@@ -3,7 +3,7 @@
 // project approvals the approvals.ts path omits), the worker state (an
 // explicit `parked`, distinct from `running`) and the wait liveness (wake
 // source, idle and stall derived from what the plugin observes, not the
-// report-time `noWakeSource` flag).
+// stored `noWakeSource` flag, which only a reconcile writes).
 //
 // It is pure: it reads only the rows a reconcile already has in hand and
 // decides nothing. `compare` runs the predicates the assessment will replace
@@ -77,7 +77,7 @@ export type AssessedLiveness = {
   stuck: boolean;
   /** A free-text wait with no tracked source and no dated wait ahead, recomputed from the rows. */
   stalled: boolean;
-  /** The report-time flag the assessment replaces. */
+  /** The stored flag the assessment replaces; a reconcile is its only writer (BB-375). */
   reportedNoWakeSource: boolean;
   /** BB-351: the stored wait is live and past its kind's budget. */
   overdue: boolean;
@@ -425,8 +425,8 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  * - `approvals.gate`: the old surface gate, built without the decide mark or
  *   the recorded project approvals, against the assessment (BB-292 #2).
  * - `approvals.pageRefusal`: the page action's refusal on a met gate (BB-292 #3).
- * - `noWakeSource`: the report-time flag against the stall recomputed from
- *   the observable rows.
+ * - `noWakeSource`: the stored flag against the stall recomputed from the
+ *   observable rows.
  *
  * BB-322 keeps the gate comparison as the soak's evidence that the consumer's
  * answer still matches the predicate it retired; a new `approvals.gate` row is
@@ -469,8 +469,8 @@ export function compare(input: AssessmentInput, assessment: Assessment): Diverge
     if (pageRefusal !== null && assessed.met) add("approvals.pageRefusal", pageRefusal, "met", gateInputs);
   }
 
-  // (4) The report-time no-wake-source flag against the stall recomputed from
-  // the rows. `hasLiveWakeSource`, `idleInActiveStage` and `stuckDue` are the
+  // (4) The stored no-wake-source flag against the stall recomputed from the
+  // rows. `hasLiveWakeSource`, `idleInActiveStage` and `stuckDue` are the
   // assessment's own derivation, so they are compared by construction; only
   // the flag and the observed stall can disagree.
   add("noWakeSource", binding.noWakeSource ? "no-wake-source" : "source-or-no-wait", assessment.liveness.stalled ? "no-wake-source" : "source-or-no-wait", {
