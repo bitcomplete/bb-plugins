@@ -191,6 +191,9 @@ export const GITHUB_TODO_LABEL = "status:todo";
 export const DEPS_ALERTS_PLAYBOOK = "deps-alerts";
 export const DEPS_PRS_PLAYBOOK = "deps-prs";
 
+/** The backlog watch's playbook (BB-378): its own file, so the Stage 2 triage rules load separately from the ops watch. */
+export const BACKLOG_PLAYBOOK = "backlog";
+
 export const playbookName = z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/u, "a playbook name: lowercase letters, digits and dashes");
 
 /** Whether a string is an IANA time zone the runtime accepts (BB-364: `init` validates the interview's answer before writing it). */
@@ -487,6 +490,7 @@ export const projectFileSchema = z
         ops: playbookName.optional(),
         [DEPS_ALERTS_PLAYBOOK]: playbookName.optional(),
         [DEPS_PRS_PLAYBOOK]: playbookName.optional(),
+        [BACKLOG_PLAYBOOK]: playbookName.optional(),
       })
       .strict()
       .default({}),
@@ -698,6 +702,9 @@ export function depsTargets(project: ProjectFile, repos: readonly string[]): Dep
 
 /** The playbook a binding runs under: the deps-alerts one for a Dependabot target, else its kind's. */
 export const depsAlertsPlaybookName = (project: ProjectFile): string => project.playbooks[DEPS_ALERTS_PLAYBOOK] ?? DEPS_ALERTS_PLAYBOOK;
+
+/** The playbook a backlog target runs: `backlog.md` (BB-378), which the project may rename. */
+export const backlogPlaybookName = (project: ProjectFile): string => project.playbooks[BACKLOG_PLAYBOOK] ?? BACKLOG_PLAYBOOK;
 export const depsPrsPlaybookName = (project: ProjectFile): string => project.playbooks[DEPS_PRS_PLAYBOOK] ?? DEPS_PRS_PLAYBOOK;
 
 /** The Linear team or GitHub repo an ops steward files in, with its source. */
