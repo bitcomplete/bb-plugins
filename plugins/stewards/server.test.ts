@@ -5408,6 +5408,131 @@ describe("questions to the user", () => {
     expect(answered.match(/Include SSO\?/gu)).toHaveLength(1);
   });
 
+  // BB-386 fix 4: the project steward must not invent an owner gate. When it
+  // asks the owner to merge a pull request whose lane gate is already met and
+  // whose decide list routes it to the project steward, the item still reaches
+  // the owner, marked as a workaround with the gate's verdict.
+  describe("BB-386 fix 4: a project steward's merge ask is marked a workaround", () => {
+    const head = "aaaaaaa1";
+    const marker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    const projectEntry = { text: "A cross-repo contract other repos implement", decide: "project", paths: ["web/openapi.yaml"] };
+    const userEntry = { text: "Identity and access", decide: "user", paths: ["web/openapi.yaml"] };
+
+    /** A bound ticket whose linked pull request is observed; the decide list is the test's. */
+    async function withDecide(entries: unknown[], comments: ReturnType<typeof comment>[] = [marker]) {
+      const t = await setup();
+      t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries });
+      t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+      t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", unit: "acme/web", comments }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+      t.githubFiles.set("acme/web#7", ["web/openapi.yaml"]);
+      await t.ring("linear", "uuid-12");
+      const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+      const qid = (text: string) => /(qst_[\w-]+)/u.exec(text)![1]!;
+      const binding = () => t.hooks.store.find("ENG-12")!;
+      return { ...t, project, steward, qid, binding };
+    }
+
+    /** The project steward forwards a gate-met `stuck` escalation about the pull request. */
+    async function forwardStuck(t: Awaited<ReturnType<typeof withDecide>>) {
+      const b = t.binding();
+      const esc = t.hooks.store.escalate({
+        bindingId: b.id,
+        kind: "stuck",
+        question: "acme/web#7 is gate-met with nobody acting.",
+        meanwhile: "Wait.",
+        route: "project",
+        recommendation: null,
+        projectId: "p1",
+        url: "https://github.com/acme/web/pull/7",
+        headSha: head,
+        data: { pullStuck: "gate-met", pull: "acme/web#7" },
+      });
+      return { esc, result: await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "text" }, t.project) };
+    }
+
+    /** The project steward forwards a decision escalation the test wrote about the pull request. */
+    async function forwardDecision(t: Awaited<ReturnType<typeof withDecide>>, question: string, entry?: string) {
+      const b = t.binding();
+      const esc = t.hooks.store.escalate({
+        bindingId: b.id,
+        kind: "decision",
+        question,
+        meanwhile: "Wait.",
+        route: "project",
+        recommendation: null,
+        projectId: "p1",
+        url: "https://github.com/acme/web/pull/7",
+      });
+      return { esc, result: await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "text", ...(entry === undefined ? {} : { entry }) }, t.project) };
+    }
+
+    it("marks the forwarded item and still delivers it to the owner", async () => {
+      const t = await withDecide([projectEntry]);
+      const { result } = await forwardStuck(t);
+      expect(result.error, result.text).toBe(false);
+      const q = t.hooks.store.question(t.qid(result.text))!;
+      // The item reaches the owner (open, never refused).
+      expect(q.status).toBe("open");
+      // The marker and the gate's verdict are attached, and it names the real merge path.
+      expect(q.why).toContain("Workaround");
+      expect(q.why).toContain("bb stewards merge acme/web#7");
+      expect(q.details).toContain("gate met at aaaaaaa (no-review), decide: project");
+      expect(q.data.workaround).toBe(true);
+      expect(q.data.gateMet).toBe(true);
+    });
+
+    it("does not mark it when the gate is not met", async () => {
+      const t = await withDecide([projectEntry], [comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=changes-requested lane=no-review -->`, signedBy: "thr_reviewer" })]);
+      const { result } = await forwardStuck(t);
+      expect(result.error, result.text).toBe(false);
+      const q = t.hooks.store.question(t.qid(result.text))!;
+      expect(q.status).toBe("open");
+      expect(q.why).not.toContain("Workaround");
+      expect(q.data.workaround).toBeUndefined();
+    });
+
+    it("does not mark it when the decide list routes the pull request to the user", async () => {
+      const t = await withDecide([userEntry]);
+      const { result } = await forwardStuck(t);
+      expect(result.error, result.text).toBe(false);
+      const q = t.hooks.store.question(t.qid(result.text))!;
+      expect(q.status).toBe("open");
+      expect(q.why).not.toContain("Workaround");
+      expect(q.data.workaround).toBeUndefined();
+    });
+
+    it("leaves an unrelated question about the same gate-met pull request unmarked and keeps its why", async () => {
+      const t = await withDecide([projectEntry]);
+      const { result } = await forwardDecision(t, "Add the repo secret before this deploys?", "A cross-repo contract other repos implement");
+      expect(result.error, result.text).toBe(false);
+      const q = t.hooks.store.question(t.qid(result.text))!;
+      expect(q.status).toBe("open");
+      expect(q.why).not.toContain("Workaround");
+      expect(q.why).toContain("A cross-repo contract other repos implement");
+      expect(q.data.workaround).toBeUndefined();
+    });
+
+    it("marks the project steward's own ask about a gate-met project-lane pull request", async () => {
+      const t = await withDecide([projectEntry]);
+      const asked = await t.tool("steward_update", { binding: "ENG-12", ask: { question: "Merge acme/web#7?", url: "https://github.com/acme/web/pull/7", resolution: "choice", choices: ["Merge", "Close"] } }, t.project);
+      expect(asked.error, asked.text).toBe(false);
+      const q = t.hooks.store.question(t.qid(asked.text))!;
+      expect(q.status).toBe("open");
+      expect(q.why).toContain("Workaround");
+      expect(q.data.workaround).toBe(true);
+    });
+
+    it("finds the pull request by a key in the question when the ask has no url", async () => {
+      const t = await withDecide([projectEntry]);
+      const asked = await t.tool("steward_update", { binding: "ENG-12", ask: { question: "Merge acme/web#7?", resolution: "text" } }, t.project);
+      expect(asked.error, asked.text).toBe(false);
+      const q = t.hooks.store.question(t.qid(asked.text))!;
+      expect(q.status).toBe("open");
+      expect(q.why).toContain("Workaround");
+      expect(q.data.workaround).toBe(true);
+    });
+  });
+
   it("closing a forwarded question with resolve decides its escalation and tells the steward", async () => {
     const t = await adopted();
     await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);

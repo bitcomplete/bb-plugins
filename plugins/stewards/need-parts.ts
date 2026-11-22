@@ -136,6 +136,29 @@ export function mergeNeedParts(input: { key: string; lane: string | null; note?:
   return { what, how, why: MERGE_WHY, details: how };
 }
 
+/** The marker a project-steward merge ask carries when the lane gate is already met (BB-386 fix 4). */
+export const MERGE_WORKAROUND_MARK = "Workaround";
+
+/**
+ * BB-386 fix 4: the project steward must not invent an owner gate. When it
+ * asks the owner to merge a pull request whose lane gate is already met and
+ * whose decide list routes it to the project steward, no owner's merge is the
+ * gate, so the ask is a workaround. This returns the marker and the gate's
+ * verdict to attach to the item, or null when the ask is legitimate (the gate
+ * is not met, or the pull request is the user's to decide). The item is never
+ * refused: the owner still receives it, marked.
+ */
+export function mergeWorkaroundParts(input: { key: string; lane: string | null; headSha: string | null; gateMet: boolean; decision: "project" | "user" }): { why: string; details: string } | null {
+  if (!input.gateMet || input.decision !== "project") return null;
+  const lane = input.lane === null || input.lane === "" ? "lane unknown" : input.lane;
+  const sha = input.headSha === null || input.headSha === "" ? "the current head" : input.headSha.slice(0, 7);
+  const verdict = `gate met at ${sha} (${lane}), decide: ${input.decision}`;
+  return {
+    why: `${MERGE_WORKAROUND_MARK}: ${input.key}'s lane gate is already met (${lane}) at ${sha}, so the owner's merge is not the gate. The plugin still delivers it to you; merge it with bb stewards merge ${input.key}.`,
+    details: `This item is a workaround: ${input.key} is gate-met (${lane}) at ${sha} and the decide list routes it to the project steward, so the owner's approval or merge is not the gate. Merge it with bb stewards merge ${input.key}. Verdict: ${verdict}.`,
+  };
+}
+
 /** The one line, context, why and details of a lesson review/retire decide item. */
 export function lessonDecideParts(input: { file: string; lessonText: string; boundary: boolean; retire: boolean; branch: string | null; prUrl: string | null }): { what: string; how: string; why: string; details: string } {
   const what = clampNeedLine(`${input.retire ? "Retire" : "Review"} the lesson for ${input.file}`);

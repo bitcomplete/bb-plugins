@@ -13,6 +13,7 @@ import {
   forwardWhy,
   lessonDecideParts,
   mergeNeedParts,
+  mergeWorkaroundParts,
   mixedEvidenceDecideParts,
   needLineProblem,
   playbookRefreshQuestionParts,
@@ -95,6 +96,17 @@ describe("every plugin-composed item reads in three plain parts", () => {
   it("a merge item states the gate rule", () => {
     const parts = mergeNeedParts({ key: "acme/web#74", lane: "no-review" });
     expect(readabilityProblems({ need: parts.what, context: parts.how, why: parts.why })).toEqual([]);
+  });
+
+  it("a merge workaround states the marker and the gate verdict, and only for a met project lane", () => {
+    const parts = mergeWorkaroundParts({ key: "acme/web#74", lane: "no-review", headSha: "aaaaaaa1", gateMet: true, decision: "project" })!;
+    expect(parts.why).toContain("Workaround");
+    expect(parts.why).toContain("aaaaaaa");
+    expect(parts.details).toContain("gate met at aaaaaaa (no-review), decide: project");
+    expect(readabilityProblems({ need: "Merge acme/web#74", context: parts.details, why: parts.why })).toEqual([]);
+    // No marker when the gate is not met, or when the lane is the user's.
+    expect(mergeWorkaroundParts({ key: "acme/web#74", lane: "no-review", headSha: "aaaaaaa1", gateMet: false, decision: "project" })).toBeNull();
+    expect(mergeWorkaroundParts({ key: "acme/web#74", lane: "owner-reviewed", headSha: "aaaaaaa1", gateMet: true, decision: "user" })).toBeNull();
   });
 
   it("a deps adoption decide item is short and readable", () => {

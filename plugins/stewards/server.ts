@@ -99,7 +99,7 @@ import {
   type RolesFile,
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
-import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
+import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mergeWorkaroundParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
 import { composeAssessment } from "./contribution.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
@@ -14140,6 +14140,58 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }),
     });
 
+    /**
+     * BB-386 fix 4: whether an escalation or question is an ask to merge a
+     * pull request. A gate-met `stuck` escalation is one; otherwise the ask
+     * must name a merge in its question or its choices, so an unrelated
+     * question about the same gate-met pull request is left alone.
+     */
+    function asksToMerge(input: { kind: string | null; data: Record<string, unknown>; question: string; choices: readonly string[] }): boolean {
+      if (input.kind === "stuck" && input.data.pullStuck === "gate-met") return true;
+      return /\bmerge\b/iu.test([input.question, ...input.choices].join(" "));
+    }
+
+    /** The observed pull request an ask names by its url or by a key in its text (BB-386 fix 4). */
+    function referencedPull(target: Binding, observed: Observed, url: string | null | undefined, text: string): EntitySnapshot | null {
+      const pulls = observedPulls(target, observed);
+      const wanted = lc(url ?? "");
+      if (wanted !== "") {
+        const byUrl = pulls.find((p) => [p.url, p.key].some((v) => v !== null && lc(v) === wanted));
+        if (byUrl !== undefined) return byUrl;
+      }
+      const hay = lc(text);
+      const byKey = pulls.find((p) => hay.includes(lc(p.key)) || (p.url !== null && hay.includes(lc(p.url))));
+      if (byKey !== undefined) return byKey;
+      // A bare "#N" with no repo, when exactly one observed pull has that number.
+      const number = /#(\d+)/u.exec(text)?.[1];
+      if (number !== undefined) {
+        const matches = pulls.filter((p) => /#(\d+)$/u.exec(p.key)?.[1] === number);
+        if (matches.length === 1) return matches[0]!;
+      }
+      return null;
+    }
+
+    /**
+     * BB-386 fix 4: the workaround marker and gate verdict for a project
+     * steward's ask to merge a pull request whose lane gate is already met and
+     * whose decide list routes it to the project steward. The item still
+     * reaches the owner; the marker and the gate's verdict are attached to it,
+     * so the owner sees the real state instead of a made-up reason. Returns
+     * null when no pull request is named, the gate is not met, or the pull
+     * request is the user's to decide. The caller passes only a merge ask.
+     */
+    async function mergeWorkaroundFor(target: Binding, url: string | null | undefined, text: string): Promise<{ why: string; details: string; data: Record<string, unknown> } | null> {
+      const observed = target.lastSnapshot;
+      if (observed === null) return null;
+      const pull = referencedPull(target, observed, url, text);
+      if (pull === null) return null;
+      const decisions = (await loadConfig(target.projectId))?.file.bigDecisions ?? [];
+      const gate = assessedGate(store, target, pull, now(), decisions);
+      const parts = mergeWorkaroundParts({ key: pull.key, lane: gate.lane, headSha: gate.headSha, gateMet: gate.gateMet, decision: gate.decision });
+      if (parts === null) return null;
+      return { ...parts, data: { workaround: true, gateMet: true, gateLane: gate.lane, gateDecision: gate.decision } };
+    }
+
     bb.agents.registerTool({
       name: "steward_update",
       description:
@@ -14266,7 +14318,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const done: string[] = [];
           const notes: string[] = [];
           /** Close the question and record the one asked, once every check has passed. */
-          const questionWrites = (closing: { question: Question; answer: string; guidanceDropped: boolean } | null, target: Binding | null): string[] => {
+          const questionWrites = async (closing: { question: Question; answer: string; guidanceDropped: boolean } | null, target: Binding | null): Promise<string[]> => {
             const out: string[] = [];
             if (closing !== null) {
               const closed = store.answer(closing.question.id, closing.answer, threadId);
@@ -14284,6 +14336,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (askResolution === "secret" && input.ask.variable === undefined && input.ask.setting === undefined) {
                 throw new Error("A secret question needs the variable name (variable), or a stewards secret setting (setting).");
               }
+              // BB-386 fix 4: the project steward's own ask to merge a
+              // gate-met pull request on a `project`-routed lane is a
+              // workaround too. Only a merge ask is marked, and the pull
+              // request is found by the url or by a key in the question.
+              const mergeAsk = target !== null && asksToMerge({ kind: null, data: {}, question: input.ask.question, choices: input.ask.choices ?? [] });
+              const workaround = target === null || !mergeAsk ? null : await mergeWorkaroundFor(target, input.ask.url, input.ask.question);
               const q = store.ask({
                 projectId: projectOf!,
                 bindingId: target?.id ?? null,
@@ -14293,12 +14351,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 resolutionKind: askResolution,
                 choices: input.ask.choices,
                 url: input.ask.url ?? null,
+                ...(workaround === null ? {} : { why: workaround.why, details: workaround.details }),
                 data: {
                   ...(input.ask.variable === undefined ? {} : { variable: input.ask.variable }),
                   ...(input.ask.purpose === undefined ? {} : { purpose: input.ask.purpose }),
                   ...(input.ask.setting === undefined ? {} : { setting: input.ask.setting }),
                   ...(input.ask.writeEnv === undefined ? {} : { writeEnv: input.ask.writeEnv }),
                   ...(input.ask.worker === undefined ? {} : { workerThreadId: input.ask.worker }),
+                  ...(workaround === null ? {} : workaround.data),
                 },
               });
               out.push(`question ${q.id} recorded${target === null ? "" : ` about ${target.entityKey}`}: ask the user in your reply, and close it with steward_update { resolve: "${q.id}", answer } once they answer`);
@@ -14401,7 +14461,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.behind, input.stack, input.stewardModel, input.workerModel, input.reviewerModel, input.approve, input.quote];
             if (forBinding.some((v) => v !== undefined)) return toolError(new Error("Name the binding (binding: ENG-12 or owner/repo#3) for that."));
             if (closing === null && input.ask === undefined && input.lesson === undefined) return toolError(new Error("Nothing to update: name a binding, ask a question, record a lesson, or close one."));
-            const written = questionWrites(closing, null);
+            const written = await questionWrites(closing, null);
             if (input.lesson !== undefined) {
               if (input.lesson.scope === "boundary") return toolError(new Error("A boundary lesson must name the binding it came from: pass binding (and resolve) so the owner's Review PR/Drop item has somewhere to live."));
               written.push(recordLesson(null, closing?.question.escalationId ?? null));
@@ -14625,7 +14685,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
           }
 
-          done.push(...questionWrites(closing, target));
+          done.push(...(await questionWrites(closing, target)));
           if (input.lesson !== undefined) done.push(recordLesson(target.id, resolving?.id ?? closing?.question.escalationId ?? null));
           if (input.cites !== undefined) {
             // BB-35 steps 2 and 6: count the citation, and keep the lessons on
@@ -14686,6 +14746,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (resolutionKind === "secret" && input.variable === undefined && input.setting === undefined) {
               return toolError(new Error("A secret question needs the variable name (variable), or a stewards secret setting (setting)."));
             }
+            // BB-386 fix 4: a project steward asking the owner to merge a
+            // pull request whose lane gate is already met and whose decide
+            // list routes it to the project steward is asking a workaround.
+            // The item still reaches the owner; it carries the marker and the
+            // gate's verdict so the owner sees the real state, never a made-up
+            // reason. Only a merge ask is marked; an unrelated question about
+            // the same pull request keeps its own why.
+            const mergeAsk = route === "user" && !approvalToUser && !prToUser && asksToMerge({ kind: forwarding.kind, data: forwarding.data, question: forwarding.question, choices: forwarding.choices });
+            const workaround = mergeAsk ? await mergeWorkaroundFor(target, forwarding.url ?? input.url, forwarding.question) : null;
             const q =
               approvalToUser || prToUser || route !== "user"
                 ? null
@@ -14693,7 +14762,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     projectId: target.projectId,
                     bindingId: target.id,
                     escalationId: forwarding.id,
-                    ...forwardedQuestionParts({ question: forwarding.question, context: forwarding.context, why: forwardWhy(input.entry ?? null) }),
+                    ...forwardedQuestionParts({ question: forwarding.question, context: forwarding.context, why: workaround?.why ?? forwardWhy(input.entry ?? null) }),
+                    ...(workaround === null ? {} : { details: workaround.details }),
                     ...(forwarding.choices.length === 0 ? {} : { choices: forwarding.choices }),
                     resolutionKind,
                     ...(input.url === undefined ? {} : { url: input.url }),
@@ -14703,6 +14773,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                       ...(input.setting === undefined ? {} : { setting: input.setting }),
                       ...(input.writeEnv === undefined ? {} : { writeEnv: input.writeEnv }),
                       ...(input.worker === undefined ? {} : { workerThreadId: input.worker }),
+                      ...(workaround === null ? {} : workaround.data),
                     },
                   });
             // BB-35 step 4: a routine decision the guidance did not settle asks
