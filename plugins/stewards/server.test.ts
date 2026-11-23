@@ -10651,6 +10651,55 @@ describe("ops stewards", () => {
     const r = await t.tool("steward_report", { phase: "Todo", summary: "x", nextAction: "y", actor: "steward", opsTickets: [{ fingerprint: FP, ticket: "ENG-50", did: "filed" }] }, ticketSteward);
     expect(r).toMatchObject({ error: true, text: expect.stringMatching(/opsTickets is for an ops steward's report/u) });
   });
+
+  // BB-367: the local source is a filing target, so an ops steward on a
+  // project with no Linear files locally and `check` names no Linear.
+  const localOnly = async () => {
+    const c = cluster();
+    const t = await setup({ kubectl: c.kubectl });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    delete t.files[playbookPath("linear-tickets")];
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { ops: { team: "LOCAL", k8sNamespaces: ["web-production"] } }, holders: { "github-jane": ["projectSteward", "ops"] } });
+    t.viewers.github = "github-jane";
+    t.viewers.linear = null;
+    t.repos.splice(0);
+    c.state.pods = [crashingPod()];
+    c.state.events = [warningEvent("web-router-6d4f9c7b8-x2k4q")];
+    return { t, c };
+  };
+
+  it("passes check with no problem line and no Linear on a local-only project, and the ops wake files locally (BB-367)", async () => {
+    const { t } = await localOnly();
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout.split("\n").filter((l) => l.startsWith("problem:"))).toEqual([]);
+    expect(check.stdout).not.toMatch(/linear/i);
+    expect(check.stdout).toMatch(/ops: tickets filed in LOCAL \(local\)/u);
+
+    await t.hooks.sweep();
+    await t.flush();
+    const ops = t.spawns.find((x) => String(x.title).startsWith("Ops watch"))!;
+    const first = String(ops.prompt);
+    // The filing target and owner the wake carries: the local unit, and the
+    // server's GitHub login, never a Linear login.
+    expect(first).toMatch(/File tickets in this project's local source with ticket_file \{ unit: "local"/u);
+    expect(first).toMatch(/this server's owner, github-jane/u);
+    expect(first).not.toMatch(/Assignee: unassigned/u);
+  });
+
+  it("dedups an ops look through the local source (BB-367)", async () => {
+    const { t } = await localOnly();
+    // A local ticket already carries the fingerprint line, so the look adopts it.
+    t.hooks.localSource.create({ unit: "p1", title: "Router crash-loop", description: `Crash-looping.\nFingerprint: \`${FP}\`\n\n_— from bb thread thr_prior_` }, null);
+    await t.hooks.sweep();
+    await t.flush();
+    const ops = t.spawns.find((x) => String(x.title).startsWith("Ops watch"))!;
+    const first = String(ops.prompt);
+    expect(first).toMatch(/### Recurring: its ticket is open/u);
+    expect(first).toMatch(/Recurring on LOCAL-1/u);
+    expect(first).not.toMatch(/### New: no ticket yet/u);
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: "LOCAL-1" });
+  });
 });
 
 describe("dependency stewards", () => {

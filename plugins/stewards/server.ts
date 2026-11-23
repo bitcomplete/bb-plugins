@@ -6238,18 +6238,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * or was partial (an older source, a read error), so the caller marks the
      * new findings "dedup unavailable" and the wake tells the steward to
      * search itself rather than risk a duplicate. It only reads; it never
-     * files, comments or reassigns.
+     * files, comments or reassigns. The local source (BB-367) searches by this
+     * project's id, which is its unit.
      */
-    async function dedupFingerprints(target: FilingTarget | null, fingerprints: string[]): Promise<Map<string, string> | null> {
+    async function dedupFingerprints(target: FilingTarget | null, fingerprints: string[], config: ProjectConfig): Promise<Map<string, string> | null> {
       const adopted = new Map<string, string>();
       if (fingerprints.length === 0) return adopted;
       // No target to search is not "nothing found": dedup did not run, so the
       // caller marks the new findings unavailable rather than risk a duplicate.
       if (target === null) return null;
+      const units = [target.source === "local" ? config.projectId : target.target];
       for (const fingerprint of fingerprints) {
         let out: z.infer<typeof sourceContract.sourceSearchIssues.output>;
         try {
-          out = await sourceRpc(target.source, "sourceSearchIssues", { units: [target.target], query: fingerprint, limit: DEDUP_LIMIT }, sourceContract.sourceSearchIssues.output);
+          out = await sourceRpc(target.source, "sourceSearchIssues", { units, query: fingerprint, limit: DEDUP_LIMIT }, sourceContract.sourceSearchIssues.output);
         } catch (error) {
           if (!sourceRpcMissing(error)) bb.log.warn(`stewards: the dedup search for ${fingerprint} failed: ${errorMessage(error)}`);
           return null;
@@ -6279,8 +6281,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** Where a project's ops and dependency watches file: the role's target, or the first Linear team (BB-235). */
     const filingTargetFor = (config: ProjectConfig): FilingTarget | null => roleOpsTeam(config.role, config.file);
 
-    /** The login a filing target files under: this server's GitHub login for a repo, its Linear login for a team. */
-    const filingLogin = (target: FilingTarget | null, config: ProjectConfig): string | null => (target?.source === "github" ? config.githubLogin : config.linearLogin);
+    /**
+     * The login a filing target files under: this server's GitHub login for a
+     * repo or the local source (BB-367), its Linear login for a team.
+     */
+    const filingLogin = (target: FilingTarget | null, config: ProjectConfig): string | null => (target?.source === "github" || target?.source === "local" ? config.githubLogin : config.linearLogin);
 
     /** Every ops target a project watches: the k8s namespaces, the Sentry projects, the Alertmanager namespaces, the Dependabot repositories and the role's backlog teams. */
     const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...roleK8sTargets(config.role), ...roleSentryTargets(config.role), ...roleAlertmanagerTargets(config.role), ...roleDepsTargets(config.role, config.repos), ...roleBacklogTargets(config.role)];
@@ -6293,7 +6298,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         const { sightings, ...rest } = await opsReaderFor(config).look(target, { now: at, since });
         const rows = store.sight(b.projectId, b.id, sightings.map((s) => ({ fingerprint: s.fingerprint, summary: s.summary })));
-        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows));
+        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows), config);
         if (adopted !== null) adoptTickets(b, rows, adopted);
         const tickets = await ticketStates(filing, [...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
         const findings = classify(sightings, rows, tickets, at, filingLogin(filing, config)).map((f) => (adopted === null && f.class === "new" ? { ...f, dedupUnavailable: true } : f));
@@ -6355,7 +6360,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // adopted here, exactly as in the ops look, before the batch plan reads
         // the map: an adopted medium or low alert then joins its ticket like
         // any mapped one.
-        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows));
+        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows), config);
         if (adopted !== null) adoptTickets(b, rows, adopted);
         // Every fingerprint row, not just this look's: a batched ticket that
         // is no longer in the open alerts still has rows, and whether it is

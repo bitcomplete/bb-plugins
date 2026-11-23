@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_LOCAL_PREFIX,
   DEFAULT_WAIT_BUDGETS,
   DEPENDENCY_BOTS,
   depsTargets,
+  filingTargetOf,
   githubStateLabels,
   isTerminal,
   k8sTargets,
@@ -325,6 +327,61 @@ describe("ops in the project file", () => {
     const roleTeam = parseRolesFile(JSON.stringify({ version: 2, roles: { ops: { team: "OPS" } }, holders: { jane: ["ops"] } }));
     if (!roleTeam.ok) throw new Error(roleTeam.error);
     expect(filingTargetProblems(r.value, roleTeam.value, ["acme/web"])).toEqual([expect.stringMatching(/roles\.json jane's ops\.team: OPS is not one of linear\.teams/u)]);
+  });
+});
+
+describe("the local filing target (BB-367)", () => {
+  const file = (over: Record<string, unknown>) => parseProjectFile(JSON.stringify({ version: 1, ...over }));
+
+  it("resolves a target by its shape and the project's local prefix", () => {
+    // The regression: a Linear team key and a GitHub repo resolve as before.
+    expect(filingTargetOf("ENG")).toEqual({ target: "ENG", source: "linear" });
+    expect(filingTargetOf("acme/web")).toEqual({ target: "acme/web", source: "github" });
+    // The local prefix, matched case-insensitively; the default is LOCAL.
+    expect(DEFAULT_LOCAL_PREFIX).toBe("LOCAL");
+    expect(filingTargetOf("LOCAL")).toEqual({ target: "LOCAL", source: "local" });
+    expect(filingTargetOf("local")).toEqual({ target: "local", source: "local" });
+    expect(filingTargetOf("TICKET", "TICKET")).toEqual({ target: "TICKET", source: "local" });
+    // A team key that is not the prefix is still Linear.
+    expect(filingTargetOf("LOCAL", "TICKET")).toEqual({ target: "LOCAL", source: "linear" });
+  });
+
+  it("accepts the local prefix as ops.team with no linear.teams, and still checks a non-local key", () => {
+    const local = file({ linear: { teams: [] }, ops: { targets: [{ kind: "k8s-namespace", name: "prod" }], team: "LOCAL" } });
+    if (!local.ok) throw new Error(local.error);
+    expect(local.value.ops.team).toBe("LOCAL");
+    expect(opsTeam(local.value)).toEqual({ target: "LOCAL", source: "local" });
+    // A custom prefix is accepted, and `opsTeam` reads it.
+    const custom = file({ linear: { teams: [] }, localPrefix: "ticket", ops: { targets: [{ kind: "k8s-namespace", name: "prod" }], team: "TICKET" } });
+    if (!custom.ok) throw new Error(custom.error);
+    expect(opsTeam(custom.value)).toEqual({ target: "TICKET", source: "local" });
+    // A non-local key still must be in linear.teams.
+    expect(file({ linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "prod" }], team: "SALES" } })).toMatchObject({ ok: false });
+    // With no linear.teams and no ops.team, the "needs a filing target" error stands.
+    expect(file({ linear: { teams: [] }, ops: { targets: [{ kind: "k8s-namespace", name: "prod" }] } })).toMatchObject({ ok: false });
+  });
+
+  it("accepts the local prefix for a project and a role, and still checks a non-local role key", () => {
+    const project = file({ linear: { teams: [] }, ops: { targets: [{ kind: "k8s-namespace", name: "prod" }], team: "LOCAL" } });
+    if (!project.ok) throw new Error(project.error);
+    const roleLocal = parseRolesFile(JSON.stringify({ version: 2, roles: { ops: { team: "LOCAL" } }, holders: { jane: ["ops"] } }));
+    if (!roleLocal.ok) throw new Error(roleLocal.error);
+    expect(roleOpsTeam(roleLocal.value.roles["jane"]!, project.value)).toEqual({ target: "LOCAL", source: "local" });
+    expect(filingTargetProblems(project.value, roleLocal.value, [])).toEqual([]);
+    const roleLinear = parseRolesFile(JSON.stringify({ version: 2, roles: { ops: { team: "OPS" } }, holders: { jane: ["ops"] } }));
+    if (!roleLinear.ok) throw new Error(roleLinear.error);
+    expect(filingTargetProblems(project.value, roleLinear.value, [])).toEqual([expect.stringMatching(/roles\.json jane's ops\.team: OPS is not one of linear\.teams/u)]);
+  });
+
+  it("keeps a Linear team key and a GitHub repo resolving as before", () => {
+    const linear = file({ linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "prod" }], team: "ENG" } });
+    if (!linear.ok) throw new Error(linear.error);
+    expect(opsTeam(linear.value)).toEqual({ target: "ENG", source: "linear" });
+    const github = file({ linear: { teams: [] }, ops: { targets: [{ kind: "k8s-namespace", name: "prod" }], team: "acme/web" } });
+    if (!github.ok) throw new Error(github.error);
+    expect(opsTeam(github.value)).toEqual({ target: "acme/web", source: "github" });
+    expect(filingTargetProblems(github.value, null, ["acme/web"])).toEqual([]);
+    expect(filingTargetProblems(github.value, null, ["acme/other"])).toEqual([expect.stringMatching(/ops\.team: acme\/web is not in repos\.json/u)]);
   });
 });
 

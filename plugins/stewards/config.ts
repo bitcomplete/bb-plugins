@@ -209,12 +209,14 @@ export function validTimezone(tz: string): boolean {
 export const teamKey = z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*$/u, "a team key such as ENG").transform((s) => s.toUpperCase());
 
 /**
- * A filing target (BB-235): where an ops or dependency watch files its
- * tickets, either a Linear team key or a GitHub `owner/repo`. A repo is kept
- * as GitHub spells it; a team key is folded to upper case. The source is read
- * from the shape; membership in `linear.teams` (checked here) or in the repo
- * set (`filingTargetProblems`, where the repo set is known) is a separate
- * question. This is what `ops.team` and a role's `ops.team` accept.
+ * A filing target (BB-235, BB-367): where an ops or dependency watch files
+ * its tickets — a Linear team key, a GitHub `owner/repo`, or the project's
+ * local prefix. A repo is kept as GitHub spells it; a team key is folded to
+ * upper case. The source is read from the shape and the project's
+ * `localPrefix`; membership in `linear.teams` (checked here, except for the
+ * local prefix) or in the repo set (`filingTargetProblems`, where the repo
+ * set is known) is a separate question. This is what `ops.team` and a role's
+ * `ops.team` accept.
  */
 export const filingTargetSchema = z
   .string()
@@ -228,12 +230,16 @@ export const filingTargetSchema = z
     return z.NEVER;
   });
 
-/** Where a filing target lives: a Linear team or a GitHub repo. */
-export type FilingTargetSource = "linear" | "github";
+/** Where a filing target lives: a Linear team, a GitHub repo, or this project's local source. */
+export type FilingTargetSource = "linear" | "github" | "local";
 export type FilingTarget = { target: string; source: FilingTargetSource };
 
-/** The source of a filing target from its shape: a repo has a slash, a team key does not. */
-export const filingTargetOf = (target: string): FilingTarget => ({ target, source: REPO_NAME.test(target) ? "github" : "linear" });
+/**
+ * The source of a filing target from its shape and the project's local prefix
+ * (BB-367): the prefix is the local source, a repo has a slash, anything else
+ * is a Linear team key.
+ */
+export const filingTargetOf = (target: string, prefix: string = DEFAULT_LOCAL_PREFIX): FilingTarget => ({ target, source: REPO_NAME.test(target) ? "github" : target.toUpperCase() === prefix.toUpperCase() ? "local" : "linear" });
 
 /** Linear's priorities, as `ops.autoAdopt` names them. */
 export const LINEAR_PRIORITIES = ["urgent", "high", "medium", "low"] as const;
@@ -534,9 +540,10 @@ export const projectFileSchema = z
      */
     standingRules: z.array(z.string().trim().min(1).max(400)).max(40).default([]),
     /**
-     * Production to watch: one ops binding per target, which files a Linear
-     * ticket for each problem it finds and escalates it to the project
-     * steward. `team` is where tickets are filed (the first of linear.teams
+     * Production to watch: one ops binding per target, which files a ticket
+     * for each problem it finds and escalates it to the project steward.
+     * `team` is where tickets are filed — a Linear team key, a GitHub
+     * `owner/repo`, or the project's local prefix (the first of linear.teams
      * when left out); `context` is the kubeconfig context kubectl reads it
      * with; `autoAdopt` names the priorities whose tickets are labelled for
      * a steward when filed, without asking.
@@ -586,8 +593,9 @@ export const projectFileSchema = z
     if (file.ops.team === undefined && file.linear.teams.length === 0) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: "ops needs a filing target to file tickets in: set ops.team to a Linear team key, a GitHub owner/repo, or a local unit" });
     // A repo target (BB-235) is checked against the repo set by
     // `filingTargetProblems`, which the caller runs where repos are known; a
-    // team key is checked here against the project's own teams.
-    if (file.ops.team !== undefined && !REPO_NAME.test(file.ops.team) && !file.linear.teams.includes(file.ops.team)) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: `${file.ops.team} is not one of linear.teams, so a ticket filed there would never be stewarded` });
+    // team key is checked here against the project's own teams. The project's
+    // local prefix is accepted as the local filing target (BB-367).
+    if (file.ops.team !== undefined && !REPO_NAME.test(file.ops.team) && file.ops.team.toUpperCase() !== prefix.toUpperCase() && !file.linear.teams.includes(file.ops.team)) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: `${file.ops.team} is not one of linear.teams, so a ticket filed there would never be stewarded` });
   });
 export type ProjectFile = z.infer<typeof projectFileSchema>;
 
@@ -715,10 +723,10 @@ export const depsAlertsPlaybookName = (project: ProjectFile): string => project.
 export const backlogPlaybookName = (project: ProjectFile): string => project.playbooks[BACKLOG_PLAYBOOK] ?? BACKLOG_PLAYBOOK;
 export const depsPrsPlaybookName = (project: ProjectFile): string => project.playbooks[DEPS_PRS_PLAYBOOK] ?? DEPS_PRS_PLAYBOOK;
 
-/** The Linear team or GitHub repo an ops steward files in, with its source. */
+/** The Linear team, GitHub repo or local source an ops steward files in, with its source. */
 export const opsTeam = (project: ProjectFile): FilingTarget | null => {
   const target = project.ops.team ?? project.linear.teams[0] ?? null;
-  return target === null ? null : filingTargetOf(target);
+  return target === null ? null : filingTargetOf(target, project.localPrefix ?? DEFAULT_LOCAL_PREFIX);
 };
 
 // ---- migration ---------------------------------------------------------------------

@@ -833,6 +833,7 @@ function assignInstruction(owner: string | null): string {
 function filingInstruction(target: FilingTarget | null, due: boolean): string {
   if (target === null) return "No filing target is configured: escalate a blocked question instead of filing.";
   if (target.source === "github") return `File issues in the GitHub repo ${target.target} with ticket_file { unit: "${target.target}", ... }, and put the fingerprint${due ? " and a `Due: YYYY-MM-DD` line" : ""} in the body.`;
+  if (target.source === "local") return `File tickets in this project's local source with ticket_file { unit: "local", ... }, and put the fingerprint${due ? " and a `Due: YYYY-MM-DD` line" : ""} in the body.`;
   if (!due) return `File tickets in the Linear team ${target.target} with ticket_file { unit: "${target.target}", ... }.`;
   return `File tickets in the Linear team ${target.target} with ticket_file { unit: "${target.target}", ... }, then set each ticket's due date to the deadline the alert names with linear_update_issue (ticket_file carries no due date).`;
 }
@@ -851,6 +852,7 @@ function ticketExample(target: FilingTarget | null): string {
  * (BB-235).
  */
 function autoAdoptInstruction(target: FilingTarget | null, autoAdopt: string[], label: string, kind: "ops" | "deps"): string {
+  if (target?.source === "local") return `${kind}.autoAdopt: a local ticket has no labels or priority and only the owner may move it out of Backlog, so file it in Backlog and raise no escalation for it.`;
   const what = kind === "deps" ? `a ticket you file for a ${autoAdopt.join(" or ")} alert` : `a ticket you file at ${autoAdopt.join(" or ")} priority`;
   const adopt =
     target?.source === "github"
@@ -1032,11 +1034,14 @@ export function formatDepsWake(input: DepsWakeInput): string {
   if (input.autoAdopt.length > 0) out.push(autoAdoptInstruction(input.target, input.autoAdopt, input.label, "deps"));
   const allowDismiss = playbook.may.includes("dismiss-alert");
   const githubTarget = input.target?.source === "github";
-  const adoptAction = githubTarget ? `add the labels \`${input.label}\` and \`${GITHUB_TODO_LABEL}\`` : `add the label \`${input.label}\` and move the ticket to Todo`;
-  const dismissAction = githubTarget ? "close the issue with a comment saying why" : "move the ticket to Done with a comment saying why";
+  const localTarget = input.target?.source === "local";
+  const adoptAction = githubTarget ? `add the labels \`${input.label}\` and \`${GITHUB_TODO_LABEL}\`` : localTarget ? "the owner moves it out of Backlog on the Stewards page (a local ticket has no labels or priority)" : `add the label \`${input.label}\` and move the ticket to Todo`;
+  const dismissAction = githubTarget ? "close the issue with a comment saying why" : localTarget ? "the owner moves it to Canceled on the Stewards page (a steward's own update cannot leave Backlog)" : "move the ticket to Done with a comment saying why";
   const keepAction = githubTarget
     ? "keep the issue open and unadopted and update the due date in the body to the one the note gives, or by one SLA window from today when it gives none"
-    : "keep the ticket open and unadopted and move its due date to the one the note gives, or by one SLA window from today when it gives none, with a comment on the ticket saying so";
+    : localTarget
+      ? "keep the ticket in Backlog and unadopted; a local ticket has no due date, so record the one the note gives in a comment"
+      : "keep the ticket open and unadopted and move its due date to the one the note gives, or by one SLA window from today when it gives none, with a comment on the ticket saying so";
   out.push(
     `Adoption of any other ticket is the owner's decision, and the plugin asks it: once your report lists the ticket as filed, a decide item appears on the Stewards page and in \`bb stewards needs\`, kept by ticket until the owner answers, the ticket is labelled \`${input.label}\`, or it closes. Do not raise a decision escalation for it yourself, and do not ask the owner in prose. ` +
       `The answer arrives under "What changed" as "The user chose <choice> for …". ${ADOPTION_CHOICES.adopt}: ${adoptAction}. ` +
