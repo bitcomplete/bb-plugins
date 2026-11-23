@@ -399,12 +399,13 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  * a real difference, not a fixture. It is read through `pullGate`, the same
  * single `prGate` site, so no second call site appears.
  *
- * BB-380 (C2) adds the shadow composer's own surfaces: `compose.gate`,
- * `compose.waits` and `compose.holds`. The composed answer is a refactor of
- * today's derivation, so a row on one of them is a defect, not a fixture. The
- * comparison runs only when the caller passes the composed answer; the C1
- * characterization tests call `compare` without one and see the seven surfaces
- * they pin.
+ * BB-380 (C2) adds the shadow composer's own surfaces: `compose.waits` and
+ * `compose.holds` (BB-387/C3 retired `compose.gate`, since the gate now comes
+ * from the composed answer and cannot diverge from it). The composed answer is
+ * a refactor of today's derivation, so a row on one of them is a defect, not a
+ * fixture. The comparison runs only when the caller passes the composed answer;
+ * the C1 characterization tests call `compare` without one and see the seven
+ * surfaces they pin.
  */
 export function compare(input: AssessmentInput, assessment: Assessment, composed?: ComposedAssessment): Divergence[] {
   const { binding, observed, ownPulls, projectApprovals, workers } = input;

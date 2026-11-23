@@ -305,8 +305,9 @@ export function compose(contributions: readonly SourceContribution[]): ComposedA
   const gateItems = contributions.flatMap((c) => c.gate);
   return {
     gate: {
-      // The roll-up reads the contribution fields, not the wrapped gate, so a
-      // composer that disagrees with today's gate is visible to `compare`.
+      // The roll-up reads the contribution fields, not the wrapped gate, so
+      // `assess()` returns the contributor's `met`, `lane` and `missing`
+      // rather than re-deriving them from the wrapped gate.
       pulls: gateItems.map((g) => g.assessed),
       met: gateItems.every((g) => g.met),
       decision: gateItems[0]?.lane ?? "user",

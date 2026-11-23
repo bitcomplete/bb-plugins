@@ -414,7 +414,7 @@ describe("the composed gate is the github contributor's (BB-387)", () => {
 
   it("calls prGate from exactly one site in the plugin source, pullGate (BB-322 criterion 1)", () => {
     const dir = fileURLToPath(new URL(".", import.meta.url));
-    const files = readdirSync(dir).filter((f) => (f.endsWith(".ts") || f.endsWith(".tsx")) && !f.endsWith(".test.ts") && !f.endsWith(".test.tsx"));
+    const files = readdirSync(dir, { recursive: true, encoding: "utf8" }).filter((f) => (f.endsWith(".ts") || f.endsWith(".tsx")) && !f.endsWith(".test.ts") && !f.endsWith(".test.tsx") && !f.includes("node_modules"));
     const calls: Array<{ file: string; line: string }> = [];
     for (const file of files) {
       const text = readFileSync(`${dir}${file}`, "utf8");
