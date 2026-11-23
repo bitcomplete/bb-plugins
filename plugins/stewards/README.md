@@ -514,13 +514,11 @@ install on a stock bb: one repository, no Linear, no hooks service.
   row reads `waiting, no wake source`, `bb stewards list`/`show` say so, and
   the next wake carries one paragraph telling the steward to name what will
   deliver the wait (a binding to hold behind, a pull request, a deployment
-  target, a worker) or re-examine it. For a ticket or a pull request the
-  reconcile is the column's only writer (BB-375): a `steward_report` derives
-  the same sentence for its reply in the turn the wait is set, so the steward
-  can act then, but stores nothing. An ops binding is the one carve-out: it
-  does not run the assessment, so the report still writes the column for it
-  (the last report-time write; BB-379 removes it once the ops read cost is
-  settled). The mark clears when a source appears or the wait is cleared.
+  target, a worker) or re-examine it. The reconcile is the column's only
+  writer (BB-375), for every binding kind including ops: a `steward_report`
+  derives the same sentence for its reply in the turn the wait is set, so the
+  steward can act then, but stores nothing. The mark clears when a source
+  appears or the wait is cleared.
   Separately, the plugin counts consecutive wakes
   whose reason was `requeue` and whose report ended with the same trimmed
   `waitingOn`; at two (one plugin constant, not a `project.json` key) it

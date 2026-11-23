@@ -10327,20 +10327,23 @@ describe("ops stewards", () => {
     return { t, c, steward, wakes };
   }
 
-  // BB-375: an ops binding does not run `assessBinding`, so the report keeps
-  // writing its `noWakeSource` (the one remaining report-time write); a
-  // ticket or pull-request report leaves the column to the reconcile.
-  it("writes the no-wake-source mark at report time for an ops binding (BB-375)", async () => {
+  // The ops reconcile derives the `noWakeSource` column for an ops binding,
+  // like every other kind; the report derives the sentence for its reply and
+  // stores nothing.
+  it("derives the no-wake-source mark on the ops reconcile, not the report", async () => {
     const { t, steward } = await watched();
     const ops = steward()!;
     const report = await t.tool("steward_report", { phase: "watching", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the vendor's reply" }, ops.id);
     expect(report.error).toBe(false);
     expect(report.text).toContain("Nothing the plugin tracks will deliver this wait");
-    // The ops carve-out: the report writes the column, since no ops reconcile does.
+    // The report stores nothing; the ops reconcile is the column's writer.
+    expect(t.hooks.store.find(TARGET)!.noWakeSource).toBe(false);
+    await t.hooks.reconcilePass("p1");
     expect(t.hooks.store.find(TARGET)!.noWakeSource).toBe(true);
-    // Clearing the wait clears the mark on the next report.
+    // Clearing the wait clears the mark on the next reconcile.
     const cleared = await t.tool("steward_report", { phase: "watching", summary: "Nothing waiting.", nextAction: "Watch", actor: "steward", waitingOn: "" }, ops.id);
     expect(cleared.error).toBe(false);
+    await t.hooks.reconcilePass("p1");
     expect(t.hooks.store.find(TARGET)!.noWakeSource).toBe(false);
   });
 

@@ -4328,8 +4328,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     /**
      * Record a typed-wait divergence from the stored `noWakeSource` flag
-     * (BB-333; the reconcile is its only writer for a ticket or pull request
-     * since BB-375, an ops binding's report still writes it). A `noWakeSource`
+     * (BB-333; the reconcile is its only writer since BB-375). A `noWakeSource`
      * row is written only when the disagreement
      * starts; while it stands the open row's `last_seen_at` is refreshed so the
      * age prune cannot drop it, and when it stops the row is noted and the
