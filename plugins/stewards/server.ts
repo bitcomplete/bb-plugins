@@ -6238,18 +6238,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * or was partial (an older source, a read error), so the caller marks the
      * new findings "dedup unavailable" and the wake tells the steward to
      * search itself rather than risk a duplicate. It only reads; it never
-     * files, comments or reassigns.
+     * files, comments or reassigns. The local source (BB-367) searches by this
+     * project's id, which is its unit.
      */
-    async function dedupFingerprints(target: FilingTarget | null, fingerprints: string[]): Promise<Map<string, string> | null> {
+    async function dedupFingerprints(target: FilingTarget | null, fingerprints: string[], config: ProjectConfig): Promise<Map<string, string> | null> {
       const adopted = new Map<string, string>();
       if (fingerprints.length === 0) return adopted;
       // No target to search is not "nothing found": dedup did not run, so the
       // caller marks the new findings unavailable rather than risk a duplicate.
       if (target === null) return null;
+      const units = [target.source === "local" ? config.projectId : target.target];
       for (const fingerprint of fingerprints) {
         let out: z.infer<typeof sourceContract.sourceSearchIssues.output>;
         try {
-          out = await sourceRpc(target.source, "sourceSearchIssues", { units: [target.target], query: fingerprint, limit: DEDUP_LIMIT }, sourceContract.sourceSearchIssues.output);
+          out = await sourceRpc(target.source, "sourceSearchIssues", { units, query: fingerprint, limit: DEDUP_LIMIT }, sourceContract.sourceSearchIssues.output);
         } catch (error) {
           if (!sourceRpcMissing(error)) bb.log.warn(`stewards: the dedup search for ${fingerprint} failed: ${errorMessage(error)}`);
           return null;
@@ -6279,8 +6281,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** Where a project's ops and dependency watches file: the role's target, or the first Linear team (BB-235). */
     const filingTargetFor = (config: ProjectConfig): FilingTarget | null => roleOpsTeam(config.role, config.file);
 
-    /** The login a filing target files under: this server's GitHub login for a repo, its Linear login for a team. */
-    const filingLogin = (target: FilingTarget | null, config: ProjectConfig): string | null => (target?.source === "github" ? config.githubLogin : config.linearLogin);
+    /**
+     * The login a filing target files under: this server's GitHub login for a
+     * repo or the local source (BB-367), its Linear login for a team.
+     */
+    const filingLogin = (target: FilingTarget | null, config: ProjectConfig): string | null => (target?.source === "github" || target?.source === "local" ? config.githubLogin : config.linearLogin);
 
     /** Every ops target a project watches: the k8s namespaces, the Sentry projects, the Alertmanager namespaces, the Dependabot repositories and the role's backlog teams. */
     const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...roleK8sTargets(config.role), ...roleSentryTargets(config.role), ...roleAlertmanagerTargets(config.role), ...roleDepsTargets(config.role, config.repos), ...roleBacklogTargets(config.role)];
@@ -6293,7 +6298,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         const { sightings, ...rest } = await opsReaderFor(config).look(target, { now: at, since });
         const rows = store.sight(b.projectId, b.id, sightings.map((s) => ({ fingerprint: s.fingerprint, summary: s.summary })));
-        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows));
+        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows), config);
         if (adopted !== null) adoptTickets(b, rows, adopted);
         const tickets = await ticketStates(filing, [...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
         const findings = classify(sightings, rows, tickets, at, filingLogin(filing, config)).map((f) => (adopted === null && f.class === "new" ? { ...f, dedupUnavailable: true } : f));
@@ -6355,7 +6360,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // adopted here, exactly as in the ops look, before the batch plan reads
         // the map: an adopted medium or low alert then joins its ticket like
         // any mapped one.
-        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows));
+        const adopted = await dedupFingerprints(filing, unmappedFingerprints(rows), config);
         if (adopted !== null) adoptTickets(b, rows, adopted);
         // Every fingerprint row, not just this look's: a batched ticket that
         // is no longer in the open alerts still has rows, and whether it is
@@ -6427,8 +6432,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // owner once the deadline (or a snooze) has passed, and resolves it when
     // the owner answers, the ticket is labelled, or the ticket closes.
 
-    /** Whether a ticket's severity is one deps.autoAdopt names: such a ticket is adopted when filed and needs no decision. */
-    const autoAdopted = (severity: string | null, config: ProjectConfig): boolean => severity !== null && (config.file.deps.autoAdopt as string[]).includes(severity);
+    /**
+     * Whether a ticket's severity is one deps.autoAdopt names: such a ticket
+     * is adopted when filed and needs no decision. The local source (BB-367)
+     * has no labels or priority, so a local ticket is never auto-adopted: the
+     * owner's decision is always raised, and the plugin moves the ticket when
+     * the owner answers.
+     */
+    const autoAdopted = (severity: string | null, config: ProjectConfig): boolean => filingTargetFor(config)?.source !== "local" && severity !== null && (config.file.deps.autoAdopt as string[]).includes(severity);
 
     /** Whether the deps-alerts playbook's `may` list lets a steward dismiss an alert on GitHub. */
     const dismissAllowed = (config: ProjectConfig): boolean => config.depsAlerts?.may.includes("dismiss-alert") === true;
@@ -6465,7 +6476,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         kind: "decide",
         url: ticket?.url ?? ticketKey,
         what: adoptionNeedLine(ticketKey, repo, severities),
-        how: adoptionHow(allowDismiss),
+        how: adoptionHow(allowDismiss, filingTargetFor(config)?.source === "local"),
         why: ADOPTION_WHY,
         details: adoptionQuestion(ticketKey, repo, alerts, due, overdueBy),
         data: { adoption: true, ticket: ticketKey, fingerprints, choices: adoptionChoices(hasFix, allowDismiss), dueDate: due },
@@ -6550,7 +6561,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           // The owner answered on the Stewards page or with `bb stewards done`.
           // Only that answer snoozes a decision; the plugin never snoozes or
-          // dismisses on a steward's word.
+          // dismisses on a steward's word. For a local target (BB-367) the
+          // owner's answer is the act: the local source has no label to adopt
+          // with, so the plugin moves the ticket itself (Ready, or Canceled),
+          // exactly as the page's own owner-turn RPC does.
           if (need !== null && need.status === "done") {
             const resolution = need.resolution ?? "Answered.";
             if (resolution.startsWith(`Chose: ${ADOPTION_CHOICES.keep}`)) {
@@ -6560,6 +6574,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 store.note(b.id, `${ticketKey} is snoozed until ${dueDate(until, config.file.nightly.timezone)}; the plugin asks again then.`, true);
               }
             } else {
+              if (filingTargetFor(config)?.source === "local") {
+                if (resolution.startsWith(`Chose: ${ADOPTION_CHOICES.adopt}`)) localSource?.update({ key: ticketKey, state: "Ready", ownerTurn: true });
+                else if (resolution.startsWith(`Chose: ${ADOPTION_CHOICES.dismiss}`)) localSource?.update({ key: ticketKey, state: "Canceled", ownerTurn: true });
+              }
               settleAdoption(b, decision, resolution);
               continue;
             }
@@ -8427,7 +8445,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
       const assumptions = store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) }));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), refreshes: store.playbookRefreshes(projectId), guidance: await wakeGuidance(projectId, null), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), refreshes: store.playbookRefreshes(projectId), guidance: await wakeGuidance(projectId, null), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, localFiling: filingTargetFor(config)?.source === "local", ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.
@@ -9512,6 +9530,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           ...followUps,
         ],
       });
+    }
+
+    /**
+     * BB-367: move the local tickets an ops escalation filed when the owner's
+     * answer is Adopt or Dismiss. The local source has no label to adopt with,
+     * so the plugin moves the ticket itself (Ready, or Canceled), as the page's
+     * own owner-turn RPC does. Called from both forwarded-answer paths, the
+     * page and `bb stewards done`.
+     */
+    function moveLocalTickets(x: Escalation, label: string): void {
+      const keys = x.data.localTickets;
+      if (!Array.isArray(keys)) return;
+      const state = label === ADOPTION_CHOICES.adopt ? "Ready" : label === ADOPTION_CHOICES.dismiss ? "Canceled" : null;
+      if (state === null) return;
+      for (const key of keys) if (typeof key === "string") localSource?.update({ key, state, ownerTurn: true });
     }
 
     /**
@@ -12330,6 +12363,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             store.addGuidance(b.id, guidance, "user");
             countCorrections(x, guidance);
             store.note(b.id, `The user chose ${chosen} for ${q.question}${text === null ? "" : `: ${text}`}.`);
+            // BB-367: the owner's answer to a local ops escalation is the act.
+            moveLocalTickets(x, chosen);
             scheduleReconcile(b.id);
             await wakeProjectOnForwardedAnswer(b, closure, [x]);
             return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.` };
@@ -13796,7 +13831,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Delivered after the status is written, together with any approval
           // request this report makes due, so the project steward reads the
           // new status and is woken once.
-          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, context: input.escalate.context ?? null, meanwhile: input.escalate.meanwhile, why: input.escalate.why ?? null, route: nextRoute(escalationsCtx, b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
+          // BB-367: a local ticket has no labels or priority, so the owner's
+          // answer is the act. The escalation carries the filed local ticket
+          // keys and the Adopt/Keep/Dismiss choices, and the plugin moves the
+          // ticket when the owner answers the forwarded question.
+          const localFiling = config !== null && filingTargetFor(config)?.source === "local" && input.escalate?.kind === "decision";
+          const localTickets = localFiling ? [...new Set(opsTickets.filter((t) => t.did === "filed" || t.did === "reopened").map((t) => t.ticket))] : [];
+          const localChoices = localTickets.length > 0 ? [ADOPTION_CHOICES.adopt, ADOPTION_CHOICES.keep, ADOPTION_CHOICES.dismiss] : [];
+          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, context: input.escalate.context ?? null, meanwhile: input.escalate.meanwhile, why: input.escalate.why ?? null, route: nextRoute(escalationsCtx, b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices !== undefined ? { choices: input.escalate.choices } : localChoices.length > 0 ? { choices: localChoices } : {}), ...(localTickets.length === 0 ? {} : { data: { localTickets } }) });
           const open = store.openEscalations(b.id);
           const status = {
             phase: input.phase,
@@ -16809,6 +16851,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                       store.addGuidance(b.id, guidance, "user");
                       countCorrections(x, guidance);
                       store.note(b.id, `The user chose ${choice} for ${q.question}${note === null ? "" : `: ${note}`}.`);
+                      // BB-367: the owner's answer to a local ops escalation is the act.
+                      moveLocalTickets(x, choice);
                       scheduleReconcile(b.id);
                       await wakeProjectOnForwardedAnswer(b, closure, [x]);
                     }

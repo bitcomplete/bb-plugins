@@ -247,13 +247,22 @@ export function adoptionQuestion(ticketKey: string, repo: string, alerts: Readon
   return `Adopt ${ticketKey}? ${severities.join("/")} Dependabot alert${alerts.length === 1 ? "" : `s (${alerts.length})`} on ${repo}: ${packages.join(", ")} (${ecosystems.join(", ")}), ${fix}${dueDate === null ? "" : `, due ${dueDate}`}.${overdue}`;
 }
 
-/** What each choice means, for the item's `how` and the steward's wake. */
-export function adoptionHow(dismissAllowed: boolean): string {
+/** What each choice means, for the item's `how` and the steward's wake. `local` is a project whose filing target is the local source (BB-367), where the plugin moves the ticket itself because it has no labels. */
+export function adoptionHow(dismissAllowed: boolean, local = false): string {
   const parts = [
-    `${ADOPTION_CHOICES.adopt}: the ticket is labelled and moved to Todo, and a ticket steward builds the upgrade.`,
-    `${ADOPTION_CHOICES.keep}: the ticket stays open and unadopted; the steward moves its due date out, and the plugin asks again when that date arrives.`,
+    local
+      ? `${ADOPTION_CHOICES.adopt}: the plugin moves the ticket out of Backlog to Ready, and a ticket steward builds the upgrade.`
+      : `${ADOPTION_CHOICES.adopt}: the ticket is labelled and moved to Todo, and a ticket steward builds the upgrade.`,
+    local
+      ? `${ADOPTION_CHOICES.keep}: the ticket stays open and unadopted in Backlog; the plugin asks again when the deadline arrives.`
+      : `${ADOPTION_CHOICES.keep}: the ticket stays open and unadopted; the steward moves its due date out, and the plugin asks again when that date arrives.`,
   ];
-  if (dismissAllowed) parts.push(`${ADOPTION_CHOICES.dismiss}: the ticket's alerts are dismissed on GitHub as "vulnerable code is not actually used" and the ticket is closed with the reason.`);
+  if (dismissAllowed)
+    parts.push(
+      local
+        ? `${ADOPTION_CHOICES.dismiss}: the ticket's alerts are dismissed on GitHub as "vulnerable code is not actually used" and the plugin moves the ticket to Canceled.`
+        : `${ADOPTION_CHOICES.dismiss}: the ticket's alerts are dismissed on GitHub as "vulnerable code is not actually used" and the ticket is closed with the reason.`,
+    );
   return parts.join(" ");
 }
 

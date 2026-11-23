@@ -10651,6 +10651,98 @@ describe("ops stewards", () => {
     const r = await t.tool("steward_report", { phase: "Todo", summary: "x", nextAction: "y", actor: "steward", opsTickets: [{ fingerprint: FP, ticket: "ENG-50", did: "filed" }] }, ticketSteward);
     expect(r).toMatchObject({ error: true, text: expect.stringMatching(/opsTickets is for an ops steward's report/u) });
   });
+
+  // BB-367: the local source is a filing target, so an ops steward on a
+  // project with no Linear files locally and `check` names no Linear.
+  const localOnly = async () => {
+    const c = cluster();
+    const t = await setup({ kubectl: c.kubectl });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
+    delete t.files[playbookPath("linear-tickets")];
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { ops: { team: "LOCAL", k8sNamespaces: ["web-production"] } }, holders: { "github-jane": ["projectSteward", "ops"] } });
+    t.viewers.github = "github-jane";
+    t.viewers.linear = null;
+    t.repos.splice(0);
+    c.state.pods = [crashingPod()];
+    c.state.events = [warningEvent("web-router-6d4f9c7b8-x2k4q")];
+    return { t, c };
+  };
+
+  it("passes check with no problem line and no Linear on a local-only project, and the ops wake files locally (BB-367)", async () => {
+    const { t } = await localOnly();
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout.split("\n").filter((l) => l.startsWith("problem:"))).toEqual([]);
+    expect(check.stdout).not.toMatch(/linear/i);
+    expect(check.stdout).toMatch(/ops: tickets filed in LOCAL \(local\)/u);
+
+    await t.hooks.sweep();
+    await t.flush();
+    const ops = t.spawns.find((x) => String(x.title).startsWith("Ops watch"))!;
+    const first = String(ops.prompt);
+    // The filing target and owner the wake carries: the local unit, and the
+    // server's GitHub login, never a Linear login.
+    expect(first).toMatch(/File tickets in this project's local source with ticket_file \{ unit: "local"/u);
+    expect(first).toMatch(/this server's owner, github-jane/u);
+    expect(first).not.toMatch(/Assignee: unassigned/u);
+  });
+
+  it("dedups an ops look through the local source (BB-367)", async () => {
+    const { t } = await localOnly();
+    // A local ticket already carries the fingerprint line, so the look adopts it.
+    t.hooks.localSource.create({ unit: "p1", title: "Router crash-loop", description: `Crash-looping.\nFingerprint: \`${FP}\`\n\n_— from bb thread thr_prior_` }, null);
+    await t.hooks.sweep();
+    await t.flush();
+    const ops = t.spawns.find((x) => String(x.title).startsWith("Ops watch"))!;
+    const first = String(ops.prompt);
+    expect(first).toMatch(/### Recurring: its ticket is open/u);
+    expect(first).toMatch(/Recurring on LOCAL-1/u);
+    expect(first).not.toMatch(/### New: no ticket yet/u);
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: "LOCAL-1" });
+  });
+
+  it("moves the local ticket when the owner answers a forwarded local ops escalation (BB-367)", async () => {
+    const { t } = await localOnly();
+    await t.hooks.sweep();
+    await t.flush();
+    const ops = t.spawns.find((x) => String(x.title).startsWith("Ops watch"))!;
+    t.hooks.localSource.create({ unit: "p1", title: "Router crash-loop", description: `Fingerprint: \`${FP}\`\n\n_— from bb thread ${ops.id}_` }, null);
+    const report = await t.tool("steward_report", { phase: "watching", summary: "Filed LOCAL-1.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: FP, ticket: "LOCAL-1", did: "filed" }], escalate: { kind: "decision", question: "Filed LOCAL-1 (high): adopt it?", meanwhile: "Keep watching." } }, ops.id);
+    expect(report.error).toBe(false);
+    // The project steward's wake names the local filing and tells it to forward, not label.
+    const project = t.hooks.store.project("p1").threadId!;
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(wake).toMatch(/This project files in its local source/u);
+    expect(wake).toMatch(/Forward the decision to the owner with steward_update \{ binding, forward, resolution: "choice"/u);
+    expect(wake).not.toMatch(/add the label `bb-managed` and move it to Todo/u);
+    // The project steward forwards with the escalation's Adopt/Keep/Dismiss choices.
+    const esc = /(esc_[\w-]+)/u.exec(wake)![1]!;
+    const forwarded = await t.tool("steward_update", { binding: TARGET, forward: esc, resolution: "choice" }, project);
+    expect(forwarded.error).toBe(false);
+    const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
+    // The owner answers Adopt; the plugin moves the local ticket to Ready.
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, choice: "Adopt", answer: null }, { experimental_caller: { kind: "client" } })).toMatchObject({ ok: true });
+    expect(t.hooks.localSource.get("LOCAL-1")).toMatchObject({ state: "Ready" });
+  });
+
+  it("moves the local ticket when the owner answers a forwarded local ops escalation with bb stewards done (BB-367)", async () => {
+    const { t } = await localOnly();
+    await t.hooks.sweep();
+    await t.flush();
+    const ops = t.spawns.find((x) => String(x.title).startsWith("Ops watch"))!;
+    t.hooks.localSource.create({ unit: "p1", title: "Router crash-loop", description: `Fingerprint: \`${FP}\`\n\n_— from bb thread ${ops.id}_` }, null);
+    const report = await t.tool("steward_report", { phase: "watching", summary: "Filed LOCAL-1.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: FP, ticket: "LOCAL-1", did: "filed" }], escalate: { kind: "decision", question: "Filed LOCAL-1 (high): adopt it?", meanwhile: "Keep watching." } }, ops.id);
+    expect(report.error).toBe(false);
+    const project = t.hooks.store.project("p1").threadId!;
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    const esc = /(esc_[\w-]+)/u.exec(wake)![1]!;
+    const forwarded = await t.tool("steward_update", { binding: TARGET, forward: esc, resolution: "choice" }, project);
+    expect(forwarded.error).toBe(false);
+    const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
+    // The owner answers Adopt from a thread; the plugin moves the local ticket to Ready.
+    expect(await t.harness.behavior.runCli(["done", qst, "--choice", "Adopt", "--project", "p1"])).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Chose Adopt/u) });
+    expect(t.hooks.localSource.get("LOCAL-1")).toMatchObject({ state: "Ready" });
+  });
 });
 
 describe("dependency stewards", () => {
@@ -10958,6 +11050,25 @@ describe("dependency stewards", () => {
     await t.hooks.sweep();
     await t.flush();
     expect(t.hooks.store.depsDecision("p1", "ENG-60")).toMatchObject({ status: "resolved", resolution: "ENG-60 was closed (Canceled)." });
+  });
+
+  it("raises the owner's decision for a local autoAdopt ticket and moves it when the owner adopts (BB-367)", async () => {
+    const { t, steward } = await watching([alert({ number: 4, severity: "critical", ghsaId: "GHSA-crit" })], { linear: { teams: [] }, ops: { team: "LOCAL" } });
+    const ops = steward()!.id;
+    // The steward files a local ticket in Backlog.
+    t.hooks.localSource.create({ unit: "p1", title: "Critical alert", description: `Fingerprint: \`acme/web#4\`\n\n_— from bb thread ${ops}_` }, null);
+    expect((await t.tool("steward_report", { phase: "watching", summary: "Filed LOCAL-1.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: "acme/web#4", ticket: "LOCAL-1", did: "filed" }] }, ops)).error).toBe(false);
+    // Critical is in autoAdopt, but a local ticket is never auto-adopted: the owner's decision is raised.
+    const decision = t.hooks.store.depsDecision("p1", "LOCAL-1")!;
+    expect(decision).toMatchObject({ status: "pending", severity: "critical" });
+    expect(t.hooks.store.need(decision.needId!)!.how).toMatch(/the plugin moves the ticket out of Backlog to Ready/u);
+    // The owner answers Adopt; the plugin moves the local ticket to Ready.
+    expect(await t.harness.behavior.runCli(["done", decision.needId!, "--choice", "Adopt", "--project", "p1"])).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Chose Adopt/u) });
+    t.advance(60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.localSource.get("LOCAL-1")).toMatchObject({ state: "Ready" });
+    expect(t.hooks.store.depsDecision("p1", "LOCAL-1")).toMatchObject({ status: "resolved", resolution: "Chose: Adopt" });
   });
 
   it("snoozes Keep tracking to the note's date and re-raises the same decision when it arrives", async () => {

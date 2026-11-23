@@ -9,7 +9,7 @@ import { z } from "zod";
 import { globError } from "./decisions.js";
 import { opsTargetKey, type AlertmanagerTarget, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { REPO_NAME } from "./source-contract.js";
-import { alertmanagerTargets, DEPENDENCY_BOTS, dependabotRepoSchema, filingTargetSchema, filingTargetOf, k8sTargets, LINEAR_PRIORITIES, playbookName, PROJECT_FILE, roleAlertmanagerSchema, sentrySlug, sentryTargets, STEWARDS_DIR, teamKey, zodMessage, type BindingKind, type FilingTarget, type Parsed, type Playbook, type ProjectFile } from "./config.js";
+import { alertmanagerTargets, DEFAULT_LOCAL_PREFIX, DEPENDENCY_BOTS, dependabotRepoSchema, filingTargetSchema, filingTargetOf, k8sTargets, LINEAR_PRIORITIES, playbookName, PROJECT_FILE, roleAlertmanagerSchema, sentrySlug, sentryTargets, STEWARDS_DIR, teamKey, zodMessage, type BindingKind, type FilingTarget, type Parsed, type Playbook, type ProjectFile } from "./config.js";
 
 /** The per-person roles: which watches and the project stewardship a GitHub login's server runs. */
 export const ROLES_FILE = `${STEWARDS_DIR}/roles.json`;
@@ -92,7 +92,7 @@ export const roleOpsSchema = z
     k8sNamespaces: z.array(z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as web-production")).max(50).default([]),
     /** The kubeconfig context kubectl uses on this person's machine; its current context when left out. */
     context: z.string().trim().min(1).max(200).regex(/^[^\s-][^\s]*$/u, "a kubeconfig context name").optional(),
-    /** Where this person's ops tickets are filed (the first of linear.teams when left out): a Linear team key or a GitHub owner/repo. */
+    /** Where this person's ops tickets are filed (the first of linear.teams when left out): a Linear team key, a GitHub owner/repo, or the project's local prefix. */
     team: filingTargetSchema.optional(),
     autoAdopt: z.array(z.enum(LINEAR_PRIORITIES)).max(4).default([]),
     sentry: roleSentrySchema,
@@ -321,10 +321,10 @@ export function rolePullWatches(role: Role | null, repos: readonly string[], dep
   return [...synthesized, ...rolePulls(role)];
 }
 
-/** The Linear team a role's ops steward files in (the first of linear.teams when the role names none), with its source. */
+/** The Linear team, GitHub repo or local source a role's ops steward files in (the first of linear.teams when the role names none), with its source. */
 export const roleOpsTeam = (role: Role | null, project: ProjectFile): FilingTarget | null => {
   const target = role?.ops?.team ?? project.linear.teams[0] ?? null;
-  return target === null ? null : filingTargetOf(target);
+  return target === null ? null : filingTargetOf(target, project.localPrefix ?? DEFAULT_LOCAL_PREFIX);
 };
 
 /**
@@ -563,14 +563,18 @@ export function roleWarnings(roles: RolesFile): string[] {
  * that is not in the project's repo set, and a role's Linear team key that is
  * not one of `linear.teams`. A project file's team key is checked by the
  * schema itself; this adds the repo case the schema cannot see (the repo set
- * comes from `repos.json`) and the role cases the schema never checks.
+ * comes from `repos.json`) and the role cases the schema never checks. The
+ * project's local prefix (BB-367) is the local filing target, so it needs no
+ * `linear.teams` entry.
  */
 export function filingTargetProblems(project: ProjectFile, roles: RolesFile | null, repos: readonly string[]): string[] {
   const out: string[] = [];
+  const prefix = project.localPrefix ?? DEFAULT_LOCAL_PREFIX;
   const repoProblem = (where: string, target: string) => {
     if (!repos.some((r) => r.toLowerCase() === target.toLowerCase())) out.push(`${where}: ${target} is not in repos.json, so a ticket filed there would never be stewarded`);
   };
   const teamProblem = (where: string, target: string) => {
+    if (target.toUpperCase() === prefix.toUpperCase()) return;
     if (!project.linear.teams.includes(target)) out.push(`${where}: ${target} is not one of linear.teams, so a ticket filed there would never be stewarded`);
   };
   const projectTarget = project.ops.team;
