@@ -10724,6 +10724,25 @@ describe("ops stewards", () => {
     expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, choice: "Adopt", answer: null }, { experimental_caller: { kind: "client" } })).toMatchObject({ ok: true });
     expect(t.hooks.localSource.get("LOCAL-1")).toMatchObject({ state: "Ready" });
   });
+
+  it("moves the local ticket when the owner answers a forwarded local ops escalation with bb stewards done (BB-367)", async () => {
+    const { t } = await localOnly();
+    await t.hooks.sweep();
+    await t.flush();
+    const ops = t.spawns.find((x) => String(x.title).startsWith("Ops watch"))!;
+    t.hooks.localSource.create({ unit: "p1", title: "Router crash-loop", description: `Fingerprint: \`${FP}\`\n\n_— from bb thread ${ops.id}_` }, null);
+    const report = await t.tool("steward_report", { phase: "watching", summary: "Filed LOCAL-1.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: FP, ticket: "LOCAL-1", did: "filed" }], escalate: { kind: "decision", question: "Filed LOCAL-1 (high): adopt it?", meanwhile: "Keep watching." } }, ops.id);
+    expect(report.error).toBe(false);
+    const project = t.hooks.store.project("p1").threadId!;
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    const esc = /(esc_[\w-]+)/u.exec(wake)![1]!;
+    const forwarded = await t.tool("steward_update", { binding: TARGET, forward: esc, resolution: "choice" }, project);
+    expect(forwarded.error).toBe(false);
+    const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
+    // The owner answers Adopt from a thread; the plugin moves the local ticket to Ready.
+    expect(await t.harness.behavior.runCli(["done", qst, "--choice", "Adopt", "--project", "p1"])).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Chose Adopt/u) });
+    expect(t.hooks.localSource.get("LOCAL-1")).toMatchObject({ state: "Ready" });
+  });
 });
 
 describe("dependency stewards", () => {
