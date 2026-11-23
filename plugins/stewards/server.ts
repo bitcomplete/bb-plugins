@@ -12348,6 +12348,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             store.addGuidance(b.id, guidance, "user");
             countCorrections(x, guidance);
             store.note(b.id, `The user chose ${chosen} for ${q.question}${text === null ? "" : `: ${text}`}.`);
+            // BB-367: the owner's answer to a local ops escalation is the act.
+            // The local source has no label to adopt with, so the plugin moves
+            // the ticket itself (Ready, or Canceled), as the page's own
+            // owner-turn RPC does.
+            const localTickets = x.data.localTickets;
+            if (Array.isArray(localTickets)) {
+              const state = chosen === ADOPTION_CHOICES.adopt ? "Ready" : chosen === ADOPTION_CHOICES.dismiss ? "Canceled" : null;
+              if (state !== null) for (const key of localTickets) if (typeof key === "string") localSource?.update({ key, state, ownerTurn: true });
+            }
             scheduleReconcile(b.id);
             await wakeProjectOnForwardedAnswer(b, closure, [x]);
             return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.` };
@@ -13814,7 +13823,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Delivered after the status is written, together with any approval
           // request this report makes due, so the project steward reads the
           // new status and is woken once.
-          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, context: input.escalate.context ?? null, meanwhile: input.escalate.meanwhile, why: input.escalate.why ?? null, route: nextRoute(escalationsCtx, b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
+          // BB-367: a local ticket has no labels or priority, so the owner's
+          // answer is the act. The escalation carries the filed local ticket
+          // keys and the Adopt/Keep/Dismiss choices, and the plugin moves the
+          // ticket when the owner answers the forwarded question.
+          const localFiling = config !== null && filingTargetFor(config)?.source === "local";
+          const localTickets = localFiling ? [...new Set(opsTickets.filter((t) => t.did === "filed" || t.did === "reopened").map((t) => t.ticket))] : [];
+          const localChoices = localTickets.length > 0 ? [ADOPTION_CHOICES.adopt, ADOPTION_CHOICES.keep, ADOPTION_CHOICES.dismiss] : [];
+          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, context: input.escalate.context ?? null, meanwhile: input.escalate.meanwhile, why: input.escalate.why ?? null, route: nextRoute(escalationsCtx, b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices !== undefined ? { choices: input.escalate.choices } : localChoices.length > 0 ? { choices: localChoices } : {}), ...(localTickets.length === 0 ? {} : { data: { localTickets } }) });
           const open = store.openEscalations(b.id);
           const status = {
             phase: input.phase,

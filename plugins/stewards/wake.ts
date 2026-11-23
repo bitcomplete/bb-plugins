@@ -1751,7 +1751,7 @@ export function formatProjectWake(input: {
     if (input.routed.some((r) => r.from.kind === "ops")) {
       out.push(
         input.localFiling === true
-          ? "An escalation from an ops steward is a ticket it filed about production, with a priority and a recommendation. This project files in its local source, where a ticket has no labels or priority and only the owner may move it out of Backlog: do not add a label or move it yourself. Forward the decision to the owner (steward_update { binding, forward, resolution: \"adopt-decline\", recommendation, cites: [ids] }), or resolve it with guidance saying the owner adopts it on the Stewards page."
+          ? "An escalation from an ops steward is a ticket it filed about production, with a priority and a recommendation. This project files in its local source, where a ticket has no labels or priority and only the owner may move it out of Backlog: do not add a label or move it yourself. Forward the decision to the owner with steward_update { binding, forward, resolution: \"choice\", recommendation, cites: [ids] } — the escalation carries Adopt/Keep/Dismiss, and the plugin moves the ticket to Ready or Canceled when the owner answers."
           : `An escalation from an ops steward is a ticket it filed about production, with a priority and a recommendation. Adopt it when the project's guidance says the problem is worth working: add the label \`${input.label ?? "bb-managed"}\` and move it to Todo (ticket_update), and a ticket steward picks it up; then resolve the escalation with guidance saying so. Otherwise decline: resolve it with guidance giving the reason.`,
         "",
       );

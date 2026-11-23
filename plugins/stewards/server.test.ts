@@ -10701,7 +10701,7 @@ describe("ops stewards", () => {
     expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: "LOCAL-1" });
   });
 
-  it("tells the project steward to forward a local ops escalation to the owner (BB-367)", async () => {
+  it("moves the local ticket when the owner answers a forwarded local ops escalation (BB-367)", async () => {
     const { t } = await localOnly();
     await t.hooks.sweep();
     await t.flush();
@@ -10713,8 +10713,16 @@ describe("ops stewards", () => {
     const project = t.hooks.store.project("p1").threadId!;
     const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
     expect(wake).toMatch(/This project files in its local source/u);
-    expect(wake).toMatch(/Forward the decision to the owner/u);
+    expect(wake).toMatch(/Forward the decision to the owner with steward_update \{ binding, forward, resolution: "choice"/u);
     expect(wake).not.toMatch(/add the label `bb-managed` and move it to Todo/u);
+    // The project steward forwards with the escalation's Adopt/Keep/Dismiss choices.
+    const esc = /(esc_[\w-]+)/u.exec(wake)![1]!;
+    const forwarded = await t.tool("steward_update", { binding: TARGET, forward: esc, resolution: "choice" }, project);
+    expect(forwarded.error).toBe(false);
+    const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
+    // The owner answers Adopt; the plugin moves the local ticket to Ready.
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, choice: "Adopt", answer: null }, { experimental_caller: { kind: "client" } })).toMatchObject({ ok: true });
+    expect(t.hooks.localSource.get("LOCAL-1")).toMatchObject({ state: "Ready" });
   });
 });
 
