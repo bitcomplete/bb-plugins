@@ -11,17 +11,15 @@
 // over the same rows and returns every place the old answer and the assessment
 // disagree, so the divergence log can be read for several days before any
 // consumer reads the assessment.
-import { assessedPullGate, gateInputKey, pullGate } from "./assessed-gate.js";
+import { composeGate, pullGate, type ComposedAssessment } from "./contribution.js";
 import { latestReviewMarker, type PrGate, type ProjectApprovalRecord } from "./gate.js";
 import { parsePullRef } from "./github.js";
-import { gateState } from "./ready-gate.js";
 import { anyWorkerInFlight, idleInActiveStage, observedStall, productGateOptions, runningWorkerReason, stuckDue, type IdleBinding } from "./reconcile.js";
 import { hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Worker } from "./store.js";
 import type { Wait, WaitKind } from "./wait.js";
-import type { ComposedAssessment } from "./contribution.js";
 
 export type DecideMark = "project" | "user";
 
@@ -172,12 +170,6 @@ export type AssessmentInput = {
 
 const lc = (s: string | null | undefined): string => (s ?? "").toLowerCase();
 
-/** The remembered requesters for one pull request, by its lowercased key or URL (BB-327). */
-export function rememberedFor(map: ReadonlyMap<string, readonly string[]> | undefined, e: EntitySnapshot): readonly string[] {
-  if (map === undefined) return [];
-  return map.get(lc(e.key)) ?? (e.url === null ? [] : map.get(lc(e.url)) ?? []);
-}
-
 /** Whether an observed entity is one of the binding's own pull requests (BB-52 rule 0). */
 const isOwn = (e: EntitySnapshot, own: ReadonlySet<string>): boolean =>
   (e.key !== "" && own.has(lc(e.key))) || (e.url !== null && e.url !== "" && own.has(lc(e.url)));
@@ -283,17 +275,6 @@ export function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
   }
 }
 
-/**
- * Whether the project steward forwarded this pull request's approval escalation
- * to the owner (BB-192): an open `approval` escalation for the pull, routed to
- * the user with `resolutionKind: "approve-decline"`. A `project`-entry pull is
- * the owner's from the forward on (BB-322 blocker 1).
- */
-export function forwardedToOwner(escalations: readonly Escalation[], e: EntitySnapshot): boolean {
-  const url = lc(e.url ?? e.key);
-  return escalations.some((x) => x.status === "open" && x.kind === "approval" && x.route === "user" && x.resolutionKind === "approve-decline" && lc(x.url) === url);
-}
-
 /** Every own pull request the binding's workers opened, the binding's own entity first. */
 export function ownPullEntities(observed: Observed, own: ReadonlySet<string>): EntitySnapshot[] {
   return [observed.entity, ...observed.pulls].filter((e) => e.pull !== null && isOwn(e, own));
@@ -331,25 +312,14 @@ export function assessLiveWakeSource(sources: WakeSourceInput): boolean {
 }
 
 /** Derive the one assessment for a binding from the rows the reconcile already read. */
-export function assess(input: AssessmentInput): Assessment {
-  const { binding, observed, ownPulls, decisions, projectApprovals, workers, escalations, needs, sources, playbook, currentSpecHash, now } = input;
-  const pulls: AssessedGate[] = [];
-  const gatePulls = input.gatePulls ?? ownPulls;
-  for (const e of ownPullEntities(observed, gatePulls)) {
-    // BB-322 blocker 1: a `project` entry the project steward forwarded to the
-    // owner (BB-192) is the owner's from the moment of the forward, not only
-    // after they approve. The forward is an open `approval` escalation routed
-    // to the user with the pull's url and `resolutionKind: "approve-decline"`
-    // (a normal owner-lane approval is the same shape but the mark is already
-    // `user`). Without this the gate says `project`, the page refuses the
-    // owner's approval and the reconcile reroutes the escalation back.
-    const decideMark = decisions.get(lc(e.key)) ?? "user";
-    const mark: DecideMark = decideMark === "project" && forwardedToOwner(escalations, e) ? "user" : decideMark;
-    const remembered = rememberedFor(input.rememberedRequesters, e);
-    const reRequested = rememberedFor(input.reRequestedDelegates, e);
-    const g = assessedPullGate(binding, e, mark, projectApprovals, remembered, reRequested);
-    pulls.push({ ...g, pull: e.key, met: g.gateMet, key: gateInputKey(binding, e, g.decision, projectApprovals, remembered, reRequested) });
-  }
+export function assess(input: AssessmentInput, composed?: ComposedAssessment): Assessment {
+  const { binding, observed, ownPulls, workers, escalations, needs, sources, playbook, now } = input;
+  // BB-387 (C3): the merge gate is the github contributor's `merge` items,
+  // folded by core; `assess()` names no pull-specific derivation. A caller
+  // that already composed the answer passes it in, so the reconcile does not
+  // compose twice.
+  const gate = composed?.gate ?? composeGate(input);
+  const pulls = gate.pulls;
   const idleBinding: IdleBinding = {
     stage: binding.stage,
     ending: binding.ending,
@@ -376,13 +346,7 @@ export function assess(input: AssessmentInput): Assessment {
   return {
     bindingId: binding.id,
     entityKey: binding.entityKey,
-    gate: {
-      pulls,
-      met: pulls.every((p) => p.met),
-      decision: pulls[0]?.decision ?? "user",
-      missing: pulls.find((p) => !p.met)?.missing ?? null,
-      readyPassed: gateState(playbook, binding.ready, currentSpecHash).passed,
-    },
+    gate,
     worker: assessWorker(workers),
     liveness: {
       live,
@@ -435,12 +399,13 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  * a real difference, not a fixture. It is read through `pullGate`, the same
  * single `prGate` site, so no second call site appears.
  *
- * BB-380 (C2) adds the shadow composer's own surfaces: `compose.gate`,
- * `compose.waits` and `compose.holds`. The composed answer is a refactor of
- * today's derivation, so a row on one of them is a defect, not a fixture. The
- * comparison runs only when the caller passes the composed answer; the C1
- * characterization tests call `compare` without one and see the seven surfaces
- * they pin.
+ * BB-380 (C2) adds the shadow composer's own surfaces: `compose.waits` and
+ * `compose.holds` (BB-387/C3 retired `compose.gate`, since the gate now comes
+ * from the composed answer and cannot diverge from it). The composed answer is
+ * a refactor of today's derivation, so a row on one of them is a defect, not a
+ * fixture. The comparison runs only when the caller passes the composed answer;
+ * the C1 characterization tests call `compare` without one and see the seven
+ * surfaces they pin.
  */
 export function compare(input: AssessmentInput, assessment: Assessment, composed?: ComposedAssessment): Divergence[] {
   const { binding, observed, ownPulls, projectApprovals, workers } = input;
@@ -496,17 +461,14 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     waitLive: assessment.liveness.waitLive === true,
   });
 
-  // (5) BB-380 (C2): the shadow composer's gate, waits and holds against the
+  // (5) BB-380 (C2): the shadow composer's waits and holds against the
   // assessment. The composed answer is computed from the same rows by the
   // in-process contributors; a difference here is a defect in the refactor, so
   // the row is the evidence the next slice's consumer can rely on the
-  // composed answer. Nothing reads the composed answer yet.
+  // composed answer. Nothing reads the composed answer yet. BB-387 (C3)
+  // retired the `compose.gate` comparison: the gate now comes from the composed
+  // answer, so it cannot diverge.
   if (composed !== undefined) {
-    const pullText = (p: Assessment["gate"]["pulls"][number]): string => `${lc(p.pull)}:${p.met ? "met" : "unmet"}:${p.missing ?? ""}:${p.decision}`;
-    const composedGate = `${composed.gate.met ? "met" : "unmet"}|${composed.gate.decision}|${composed.gate.missing ?? ""}|${composed.gate.pulls.map(pullText).join(",")}`;
-    const assessedGate = `${assessment.gate.met ? "met" : "unmet"}|${assessment.gate.decision}|${assessment.gate.missing ?? ""}|${assessment.gate.pulls.map(pullText).join(",")}`;
-    if (composedGate !== assessedGate) add("compose.gate", assessedGate, composedGate, { binding: binding.id, pulls: composed.gate.pulls.length });
-
     // The typed wait the assessment derived, against the composed item. A
     // binding has at most one stored typed wait, so the match is by kind and ref.
     const composedWait = composed.waits.find((w) => w.kind === (assessment.wait?.kind ?? "") && w.ref === (assessment.wait?.ref ?? "")) ?? null;

@@ -9,7 +9,9 @@
 // the BB-291 matrix (one binding kind at one stage, a gate-met own pull
 // request, a second open own pull request and a parked worker), the typed
 // waits, the project-approved gate and the report-time no-wake-source flag.
-import { describe, expect, it } from "vitest";
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it, vi } from "vitest";
 import { assess, compare, type AssessmentInput } from "./assessment.js";
 import { compose, composeAssessment, githubContributor, linearContributor, localContributor, type GateContribution, type SourceContribution } from "./contribution.js";
 import { parsePlaybook, type Playbook } from "./config.js";
@@ -364,5 +366,66 @@ describe("the contribution interface (BB-380)", () => {
     const g: GateContribution = githubContributor.contribute(onlyGateMetAt("build")).gate[0]!;
     expect(g).toMatchObject({ source: "github", subject: { kind: "pull", id: "acme/web#7" }, id: "merge", met: true, missing: null, lane: "user" });
     expect(g.inputs).toBe(g.assessed.key);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BB-387 (C3): the gate is the github contributor's, composed by `assess()`.
+// ---------------------------------------------------------------------------
+
+describe("the composed gate is the github contributor's (BB-387)", () => {
+  it("takes `assess()`'s gate from the github contributor: a stubbed contribution changes it", () => {
+    const i = onlyGateMetAt("build");
+    const real = assess(i);
+    expect(real.gate).toMatchObject({ met: true, decision: "user", missing: null });
+
+    const stub: GateContribution = {
+      source: "github",
+      subject: { kind: "pull", id: "acme/web#7" },
+      id: "merge",
+      met: false,
+      missing: "the stub says unmet",
+      lane: "project",
+      escalated: false,
+      product: false,
+      inputs: "stub",
+      assessed: { ...real.gate.pulls[0]!, met: false, missing: "the stub says unmet", decision: "project", key: "stub" },
+    };
+    const spy = vi.spyOn(githubContributor, "contribute").mockReturnValue({ source: "github", gate: [stub], waits: [], resources: [], holds: [], reasons: [] });
+    try {
+      const stubbed = assess(i);
+      expect(stubbed.gate).toMatchObject({ met: false, decision: "project", missing: "the stub says unmet" });
+      expect(stubbed.gate.pulls).toEqual([stub.assessed]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("keeps assessment.ts free of the pull-specific gate computation", () => {
+    const source = readFileSync(fileURLToPath(new URL("./assessment.ts", import.meta.url)), "utf8");
+    // No import names the computation the github contributor owns. The body may
+    // still discuss `prGate` in the divergence-log comment, so only the import
+    // statements are checked.
+    expect(source).not.toMatch(/import\s*\{[^}]*\bassessedPullGate\b[^}]*\}/s);
+    expect(source).not.toMatch(/import\s*\{[^}]*\bprGate\b[^}]*\}/s);
+    // The gate arrives through the contributor's composer.
+    expect(source).toMatch(/\bcomposeGate\b/);
+  });
+
+  it("calls prGate from exactly one site in the plugin source, pullGate (BB-322 criterion 1)", () => {
+    const dir = fileURLToPath(new URL(".", import.meta.url));
+    const files = readdirSync(dir, { recursive: true, encoding: "utf8" }).filter((f) => (f.endsWith(".ts") || f.endsWith(".tsx")) && !f.endsWith(".test.ts") && !f.endsWith(".test.tsx") && !f.includes("node_modules"));
+    const calls: Array<{ file: string; line: string }> = [];
+    for (const file of files) {
+      const text = readFileSync(`${dir}${file}`, "utf8");
+      for (const line of text.split("\n")) {
+        // The gate module's own `export function prGate(` is the definition, not
+        // a call site.
+        if (/\bprGate\s*\(/.test(line) && !/function\s+prGate\s*\(/.test(line)) calls.push({ file, line: line.trim() });
+      }
+    }
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.file).toBe("contribution.ts");
+    expect(calls[0]!.line).toBe("return prGate(entity, options);");
   });
 });

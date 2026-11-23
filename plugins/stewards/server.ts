@@ -5444,16 +5444,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       config: ProjectConfig,
     ): Promise<Assessment> {
       const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config);
-      const assessment = assess(input);
+      // BB-380 (C2) / BB-387 (C3): the composed answer is the gate's source and
+      // the waits/holds shadow, computed once and handed to `assess`, so the
+      // reconcile does not compose twice. No consumer reads it yet.
+      const composed = composeAssessment(input);
+      const assessment = assess(input, composed);
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
       // The shadow's `noWakeSource` divergence is retired with the flag: the
       // two agree by construction now, so `wait_divergence_state` stops being
       // written and keeps its history. The other surfaces' rows still record.
       // The derived `noWakeSource` itself rides the reconcile's existing
       // binding patch, so no extra store read is added.
-      // BB-380 (C2): the composed answer is computed beside the assessment and
-      // compared through the existing divergence log. No consumer reads it.
-      store.recordDivergences(compare(input, assessment, composeAssessment(input)).filter((d) => d.surface !== "noWakeSource"));
+      store.recordDivergences(compare(input, assessment, composed).filter((d) => d.surface !== "noWakeSource"));
       store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
       return assessment;
     }

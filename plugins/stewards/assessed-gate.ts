@@ -1,54 +1,22 @@
-// BB-322 (child of BB-291, criterion 1): the one place a pull request's merge
-// gate is computed, and the read of the stored per-binding assessment every
-// surface uses. `pullGate` is the single `prGate` call site outside the
-// assessment module (`assessment.ts` calls `assessedPullGate`, never `prGate`);
-// `assessedGate` reads the assessment the reconcile stored and, when it is
-// missing or not for the pull's current head sha, computes the pull's gate and
-// stores it rather than falling back to a surface's own predicate. A missing
-// or stale assessment therefore never counts as met (fail closed).
-import { createHash } from "node:crypto";
+// BB-322 (child of BB-291, criterion 1): the read of the stored per-binding
+// assessment every surface uses. `assessedGate` reads the assessment the
+// reconcile stored and, when it is missing or not for the pull's current head
+// sha, computes the pull's gate and stores it rather than falling back to a
+// surface's own predicate. A missing or stale assessment therefore never counts
+// as met (fail closed).
+//
+// BB-387 (C3): the per-pull computation itself (the `pullGate`/`prGate` call,
+// the `gateInputKey` fingerprint and the BB-321 forwarded-owner rule) lives in
+// the github contributor's home (`contribution.ts`). This module keeps the
+// store read/refresh helpers and imports the computation; `assessedPullGate` is
+// re-exported for the tests that still name it here.
 import { decideForPull, type BigDecision, type DecideMark } from "./decisions.js";
-import { prGate, type PrGate, type PrGateOptions, type ProjectApprovalRecord } from "./gate.js";
-import { productGateOptions } from "./reconcile.js";
+import { assessedPullGate, gateInputKey } from "./contribution.js";
+import type { PrGate, ProjectApprovalRecord } from "./gate.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding } from "./store.js";
 
-/** The single `prGate` call site outside `assessment.ts` (BB-322 criterion 1). */
-export function pullGate(entity: EntitySnapshot, options: PrGateOptions = {}): PrGate {
-  return prGate(entity, options);
-}
-
-/** The gate options for one own pull request: the decide-list mark, the product inputs and the delegate records (BB-327). */
-function gateOptions(binding: Pick<Binding, "kind" | "ready">, entity: EntitySnapshot, mark: DecideMark, projectApprovals: readonly ProjectApprovalRecord[], rememberedRequesters: readonly string[] = [], reRequestedDelegates: readonly string[] = []): PrGateOptions {
-  return { decision: mark, projectApprovals, rememberedRequesters, reRequestedDelegates, ...productGateOptions(binding, entity) };
-}
-
-/**
- * A fingerprint of everything `prGate` reads for one pull request. The stored
- * assessment is reused only when it carries this same fingerprint, so a
- * reviewer marker, an approval, a check result or the base state that changed
- * at the same head sha is never read as the old answer (BB-210).
- */
-export function gateInputKey(binding: Pick<Binding, "kind" | "ready">, entity: EntitySnapshot, mark: DecideMark, projectApprovals: readonly ProjectApprovalRecord[], rememberedRequesters: readonly string[] = [], reRequestedDelegates: readonly string[] = []): string {
-  return createHash("sha1").update(JSON.stringify({ entity, options: gateOptions(binding, entity, mark, projectApprovals, rememberedRequesters, reRequestedDelegates) })).digest("hex");
-}
-
-/**
- * The gate for one own pull request: the decide-list mark and the BB-321
- * forwarded-owner rule. The decide list places the pull request, but the
- * project steward may forward a `project` entry's approval escalation to the
- * owner (BB-192). The owner's unsigned approval is then the gate, so a gate
- * that still demanded a project-steward approval would be stricter than the
- * lane rules. The escalation is resolved once the owner answers and is no
- * longer in the rows the reconcile holds, so the approval it produced is the
- * fact that remains. A recorded project-steward approval keeps the pull
- * request the project steward's.
- */
-export function assessedPullGate(binding: Pick<Binding, "kind" | "ready">, entity: EntitySnapshot, mark: DecideMark, projectApprovals: readonly ProjectApprovalRecord[], rememberedRequesters: readonly string[] = [], reRequestedDelegates: readonly string[] = []): PrGate {
-  const options = gateOptions(binding, entity, mark, projectApprovals, rememberedRequesters, reRequestedDelegates);
-  const probe = pullGate(entity, options);
-  return mark === "project" && probe.ownerApproved && !probe.projectApproved ? pullGate(entity, { ...options, decision: "user" }) : probe;
-}
+export { assessedPullGate };
 
 /** The full gate stored per own pull request, plus the key and input fingerprint it names. */
 export type StoredGate = PrGate & { pull: string; met: boolean; key: string };
