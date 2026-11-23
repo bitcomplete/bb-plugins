@@ -10700,6 +10700,22 @@ describe("ops stewards", () => {
     expect(first).not.toMatch(/### New: no ticket yet/u);
     expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: "LOCAL-1" });
   });
+
+  it("tells the project steward to forward a local ops escalation to the owner (BB-367)", async () => {
+    const { t } = await localOnly();
+    await t.hooks.sweep();
+    await t.flush();
+    const ops = t.spawns.find((x) => String(x.title).startsWith("Ops watch"))!;
+    t.hooks.localSource.create({ unit: "p1", title: "Router crash-loop", description: `Fingerprint: \`${FP}\`\n\n_— from bb thread ${ops.id}_` }, null);
+    const report = await t.tool("steward_report", { phase: "watching", summary: "Filed LOCAL-1.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: FP, ticket: "LOCAL-1", did: "filed" }], escalate: { kind: "decision", question: "Filed LOCAL-1 (high): adopt it?", meanwhile: "Keep watching." } }, ops.id);
+    expect(report.error).toBe(false);
+    // The project steward's wake names the local filing and tells it to forward, not label.
+    const project = t.hooks.store.project("p1").threadId!;
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(wake).toMatch(/This project files in its local source/u);
+    expect(wake).toMatch(/Forward the decision to the owner/u);
+    expect(wake).not.toMatch(/add the label `bb-managed` and move it to Todo/u);
+  });
 });
 
 describe("dependency stewards", () => {
@@ -11007,6 +11023,25 @@ describe("dependency stewards", () => {
     await t.hooks.sweep();
     await t.flush();
     expect(t.hooks.store.depsDecision("p1", "ENG-60")).toMatchObject({ status: "resolved", resolution: "ENG-60 was closed (Canceled)." });
+  });
+
+  it("raises the owner's decision for a local autoAdopt ticket and moves it when the owner adopts (BB-367)", async () => {
+    const { t, steward } = await watching([alert({ number: 4, severity: "critical", ghsaId: "GHSA-crit" })], { linear: { teams: [] }, ops: { team: "LOCAL" } });
+    const ops = steward()!.id;
+    // The steward files a local ticket in Backlog.
+    t.hooks.localSource.create({ unit: "p1", title: "Critical alert", description: `Fingerprint: \`acme/web#4\`\n\n_— from bb thread ${ops}_` }, null);
+    expect((await t.tool("steward_report", { phase: "watching", summary: "Filed LOCAL-1.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: "acme/web#4", ticket: "LOCAL-1", did: "filed" }] }, ops)).error).toBe(false);
+    // Critical is in autoAdopt, but a local ticket is never auto-adopted: the owner's decision is raised.
+    const decision = t.hooks.store.depsDecision("p1", "LOCAL-1")!;
+    expect(decision).toMatchObject({ status: "pending", severity: "critical" });
+    expect(t.hooks.store.need(decision.needId!)!.how).toMatch(/the plugin moves the ticket out of Backlog to Ready/u);
+    // The owner answers Adopt; the plugin moves the local ticket to Ready.
+    expect(await t.harness.behavior.runCli(["done", decision.needId!, "--choice", "Adopt", "--project", "p1"])).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Chose Adopt/u) });
+    t.advance(60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.localSource.get("LOCAL-1")).toMatchObject({ state: "Ready" });
+    expect(t.hooks.store.depsDecision("p1", "LOCAL-1")).toMatchObject({ status: "resolved", resolution: "Chose: Adopt" });
   });
 
   it("snoozes Keep tracking to the note's date and re-raises the same decision when it arrives", async () => {

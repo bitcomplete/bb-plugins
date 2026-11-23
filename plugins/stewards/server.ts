@@ -6432,8 +6432,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // owner once the deadline (or a snooze) has passed, and resolves it when
     // the owner answers, the ticket is labelled, or the ticket closes.
 
-    /** Whether a ticket's severity is one deps.autoAdopt names: such a ticket is adopted when filed and needs no decision. */
-    const autoAdopted = (severity: string | null, config: ProjectConfig): boolean => severity !== null && (config.file.deps.autoAdopt as string[]).includes(severity);
+    /**
+     * Whether a ticket's severity is one deps.autoAdopt names: such a ticket
+     * is adopted when filed and needs no decision. The local source (BB-367)
+     * has no labels or priority, so a local ticket is never auto-adopted: the
+     * owner's decision is always raised, and the plugin moves the ticket when
+     * the owner answers.
+     */
+    const autoAdopted = (severity: string | null, config: ProjectConfig): boolean => filingTargetFor(config)?.source !== "local" && severity !== null && (config.file.deps.autoAdopt as string[]).includes(severity);
 
     /** Whether the deps-alerts playbook's `may` list lets a steward dismiss an alert on GitHub. */
     const dismissAllowed = (config: ProjectConfig): boolean => config.depsAlerts?.may.includes("dismiss-alert") === true;
@@ -6470,7 +6476,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         kind: "decide",
         url: ticket?.url ?? ticketKey,
         what: adoptionNeedLine(ticketKey, repo, severities),
-        how: adoptionHow(allowDismiss),
+        how: adoptionHow(allowDismiss, filingTargetFor(config)?.source === "local"),
         why: ADOPTION_WHY,
         details: adoptionQuestion(ticketKey, repo, alerts, due, overdueBy),
         data: { adoption: true, ticket: ticketKey, fingerprints, choices: adoptionChoices(hasFix, allowDismiss), dueDate: due },
@@ -6555,7 +6561,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           // The owner answered on the Stewards page or with `bb stewards done`.
           // Only that answer snoozes a decision; the plugin never snoozes or
-          // dismisses on a steward's word.
+          // dismisses on a steward's word. For a local target (BB-367) the
+          // owner's answer is the act: the local source has no label to adopt
+          // with, so the plugin moves the ticket itself (Ready, or Canceled),
+          // exactly as the page's own owner-turn RPC does.
           if (need !== null && need.status === "done") {
             const resolution = need.resolution ?? "Answered.";
             if (resolution.startsWith(`Chose: ${ADOPTION_CHOICES.keep}`)) {
@@ -6565,6 +6574,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 store.note(b.id, `${ticketKey} is snoozed until ${dueDate(until, config.file.nightly.timezone)}; the plugin asks again then.`, true);
               }
             } else {
+              if (filingTargetFor(config)?.source === "local") {
+                if (resolution.startsWith(`Chose: ${ADOPTION_CHOICES.adopt}`)) localSource?.update({ key: ticketKey, state: "Ready", ownerTurn: true });
+                else if (resolution.startsWith(`Chose: ${ADOPTION_CHOICES.dismiss}`)) localSource?.update({ key: ticketKey, state: "Canceled", ownerTurn: true });
+              }
               settleAdoption(b, decision, resolution);
               continue;
             }
@@ -8432,7 +8445,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
       const assumptions = store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) }));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), refreshes: store.playbookRefreshes(projectId), guidance: await wakeGuidance(projectId, null), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), refreshes: store.playbookRefreshes(projectId), guidance: await wakeGuidance(projectId, null), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, localFiling: filingTargetFor(config)?.source === "local", ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.

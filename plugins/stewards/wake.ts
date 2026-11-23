@@ -852,7 +852,7 @@ function ticketExample(target: FilingTarget | null): string {
  * (BB-235).
  */
 function autoAdoptInstruction(target: FilingTarget | null, autoAdopt: string[], label: string, kind: "ops" | "deps"): string {
-  if (target?.source === "local") return `${kind}.autoAdopt: a local ticket has no labels or priority and only the owner may move it out of Backlog, so file it in Backlog and raise no escalation for it.`;
+  if (target?.source === "local") return `${kind}.autoAdopt: a local ticket has no labels or priority, so autoAdopt cannot adopt it. File it in Backlog and report it: the plugin raises the owner's adoption decision for a dependency ticket, and an ops ticket is escalated as usual; the owner adopts it on the Stewards page.`;
   const what = kind === "deps" ? `a ticket you file for a ${autoAdopt.join(" or ")} alert` : `a ticket you file at ${autoAdopt.join(" or ")} priority`;
   const adopt =
     target?.source === "github"
@@ -1035,12 +1035,12 @@ export function formatDepsWake(input: DepsWakeInput): string {
   const allowDismiss = playbook.may.includes("dismiss-alert");
   const githubTarget = input.target?.source === "github";
   const localTarget = input.target?.source === "local";
-  const adoptAction = githubTarget ? `add the labels \`${input.label}\` and \`${GITHUB_TODO_LABEL}\`` : localTarget ? "the owner moves it out of Backlog on the Stewards page (a local ticket has no labels or priority)" : `add the label \`${input.label}\` and move the ticket to Todo`;
-  const dismissAction = githubTarget ? "close the issue with a comment saying why" : localTarget ? "the owner moves it to Canceled on the Stewards page (a steward's own update cannot leave Backlog)" : "move the ticket to Done with a comment saying why";
+  const adoptAction = githubTarget ? `add the labels \`${input.label}\` and \`${GITHUB_TODO_LABEL}\`` : localTarget ? "the plugin moves the ticket out of Backlog to Ready, and a ticket steward builds the upgrade" : `add the label \`${input.label}\` and move the ticket to Todo`;
+  const dismissAction = githubTarget ? "close the issue with a comment saying why" : localTarget ? "the plugin moves the ticket to Canceled" : "move the ticket to Done with a comment saying why";
   const keepAction = githubTarget
     ? "keep the issue open and unadopted and update the due date in the body to the one the note gives, or by one SLA window from today when it gives none"
     : localTarget
-      ? "keep the ticket in Backlog and unadopted; a local ticket has no due date, so record the one the note gives in a comment"
+      ? "the ticket stays open and unadopted in Backlog; the plugin asks again when the deadline arrives"
       : "keep the ticket open and unadopted and move its due date to the one the note gives, or by one SLA window from today when it gives none, with a comment on the ticket saying so";
   out.push(
     `Adoption of any other ticket is the owner's decision, and the plugin asks it: once your report lists the ticket as filed, a decide item appears on the Stewards page and in \`bb stewards needs\`, kept by ticket until the owner answers, the ticket is labelled \`${input.label}\`, or it closes. Do not raise a decision escalation for it yourself, and do not ask the owner in prose. ` +
@@ -1091,7 +1091,7 @@ export function formatDepsWake(input: DepsWakeInput): string {
         }
       }
     }
-    out.push("", `These are on the Stewards page; the plugin reminds the owner once a deadline has passed. Do not ask again, and never dismiss or snooze on a steward's own initiative. ${adoptionHow(allowDismiss)}`);
+    out.push("", `These are on the Stewards page; the plugin reminds the owner once a deadline has passed. Do not ask again, and never dismiss or snooze on a steward's own initiative. ${adoptionHow(allowDismiss, localTarget)}`);
   }
 
   const snapshot = out.splice(0);
@@ -1715,6 +1715,13 @@ export function formatProjectWake(input: {
   timeZone?: string;
   /** The adoption label, for adopting what an ops steward filed. */
   label?: string;
+  /**
+   * BB-367: whether this project files tickets in its local source. A local
+   * ticket has no labels or priority and only the owner may move it out of
+   * Backlog, so an ops escalation about one is the owner's to adopt on the
+   * Stewards page, never a label to add.
+   */
+  localFiling?: boolean;
   /** The project's standing-rules list from `.bb/stewards/project.json`, shown in an approval wake; empty when none is configured. */
   standingRules?: string[];
 }): string {
@@ -1743,7 +1750,9 @@ export function formatProjectWake(input: {
     );
     if (input.routed.some((r) => r.from.kind === "ops")) {
       out.push(
-        `An escalation from an ops steward is a ticket it filed about production, with a priority and a recommendation. Adopt it when the project's guidance says the problem is worth working: add the label \`${input.label ?? "bb-managed"}\` and move it to Todo (ticket_update), and a ticket steward picks it up; then resolve the escalation with guidance saying so. Otherwise decline: resolve it with guidance giving the reason.`,
+        input.localFiling === true
+          ? "An escalation from an ops steward is a ticket it filed about production, with a priority and a recommendation. This project files in its local source, where a ticket has no labels or priority and only the owner may move it out of Backlog: do not add a label or move it yourself. Forward the decision to the owner (steward_update { binding, forward, resolution: \"adopt-decline\", recommendation, cites: [ids] }), or resolve it with guidance saying the owner adopts it on the Stewards page."
+          : `An escalation from an ops steward is a ticket it filed about production, with a priority and a recommendation. Adopt it when the project's guidance says the problem is worth working: add the label \`${input.label ?? "bb-managed"}\` and move it to Todo (ticket_update), and a ticket steward picks it up; then resolve the escalation with guidance saying so. Otherwise decline: resolve it with guidance giving the reason.`,
         "",
       );
     }
