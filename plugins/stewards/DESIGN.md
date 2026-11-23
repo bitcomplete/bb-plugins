@@ -695,8 +695,8 @@ evidence it is safe, in shadow:
 decide-list mark and the recorded project approvals the `approvals.ts` path
 omits), the worker state (an explicit `parked`, distinct from `running`) and
 the liveness (wake source, idle, stall from the observable rows, not the
-stored `noWakeSource` flag, which only a reconcile writes for a ticket or
-pull request; an ops binding's report still writes it, BB-375). `compare`
+stored `noWakeSource` flag, which only a reconcile writes, for every binding
+kind, an ops binding included (BB-375). `compare`
 runs the predicates the assessment will replace and returns every
 disagreement.
 - `reconcile.ts` calls it on every binding inside a try/catch that can never
