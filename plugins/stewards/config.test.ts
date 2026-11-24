@@ -129,7 +129,7 @@ describe("the project file", () => {
     else expect.fail("a URL is not owner/repo");
   });
 
-  it("parses the optional backlog block with its defaults, and refuses unknown keys, non-positive numbers and a bad team (BB-334)", () => {
+  it("parses the optional backlog block with its defaults, and refuses unknown keys, non-positive numbers and a bad team (BB-334, BB-395)", () => {
     const absent = parseProjectFile(JSON.stringify({ version: 1 }));
     if (!absent.ok) throw new Error(absent.error);
     expect(absent.value.backlog).toBeUndefined();
@@ -142,6 +142,12 @@ describe("the project file", () => {
     if (!defaults.ok) throw new Error(defaults.error);
     expect(defaults.value.backlog).toEqual({ wipLimit: 5, staleDays: 14, commentsPerWeek: 1, triage: false, promote: false });
 
+    // BB-395: GitHub repos sit beside team, and both may be named in one block.
+    const repos = parseProjectFile(JSON.stringify({ version: 1, backlog: { team: "BB", repos: ["acme/web", "acme/api"] } }));
+    if (!repos.ok) throw new Error(repos.error);
+    expect(repos.value.backlog).toEqual({ team: "BB", repos: ["acme/web", "acme/api"], wipLimit: 5, staleDays: 14, commentsPerWeek: 1, triage: false, promote: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { repos: ["not a repo"] } }))).toMatchObject({ ok: false });
+
     expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { bogus: true } }))).toMatchObject({ ok: false });
     expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { promote: "yes" } }))).toMatchObject({ ok: false });
     expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { wipLimit: 0 } }))).toMatchObject({ ok: false });
@@ -150,12 +156,20 @@ describe("the project file", () => {
     expect(parseProjectFile(JSON.stringify({ version: 1, backlog: { team: "bad key" } }))).toMatchObject({ ok: false });
   });
 
-  it("reads a role's backlog team as a target, and round-trips its key (BB-334)", () => {
-    expect(roleBacklogTargets({ ops: { backlog: { team: "BB" } } })).toEqual([{ kind: "backlog", team: "BB" }]);
+  it("reads a role's backlog team and repos as targets, and round-trips their keys (BB-334, BB-395)", () => {
+    expect(roleBacklogTargets({ ops: { backlog: { team: "BB" } } })).toEqual([{ kind: "backlog", source: "linear", unit: "BB" }]);
+    expect(roleBacklogTargets({ ops: { backlog: { repos: ["acme/web", "acme/api"] } } })).toEqual([
+      { kind: "backlog", source: "github", unit: "acme/web" },
+      { kind: "backlog", source: "github", unit: "acme/api" },
+    ]);
     expect(roleBacklogTargets({ ops: {} })).toEqual([]);
     expect(roleBacklogTargets(null)).toEqual([]);
-    expect(opsTargetKey({ kind: "backlog", team: "BB" })).toBe("backlog/BB");
-    expect(parseOpsTargetKey("backlog/BB")).toEqual({ kind: "backlog", team: "BB" });
+    expect(opsTargetKey({ kind: "backlog", source: "linear", unit: "BB" })).toBe("backlog/BB");
+    expect(parseOpsTargetKey("backlog/BB")).toEqual({ kind: "backlog", source: "linear", unit: "BB" });
+    expect(opsTargetKey({ kind: "backlog", source: "github", unit: "acme/web" })).toBe("backlog/github/acme/web");
+    expect(parseOpsTargetKey("backlog/github/acme/web")).toEqual({ kind: "backlog", source: "github", unit: "acme/web" });
+    // A team key is still folded on parse, byte for byte for the existing binding.
+    expect(parseOpsTargetKey("backlog/bb")).toEqual({ kind: "backlog", source: "linear", unit: "BB" });
   });
 
   it("fills the dependency watch's SLA, batch and autoAdopt defaults, and takes explicit values", () => {
@@ -1030,7 +1044,7 @@ describe("roles.json version 2 (BB-163)", () => {
   });
 });
 
-describe("roles.json backlog role (BB-332)", () => {
+describe("roles.json backlog role (BB-332, BB-395)", () => {
   const backlog = (role: Record<string, unknown>) => parseRolesFile(JSON.stringify({ version: 2, roles: { backlog: role }, holders: { trotterdylan: ["backlog"] } }));
 
   it("parses a backlog role's team, folded to upper case, on the definition and the effective role", () => {
@@ -1044,11 +1058,27 @@ describe("roles.json backlog role (BB-332)", () => {
     expect(example.value.roles["trotterdylan"]!.ops?.backlog).toEqual({ team: "BB" });
   });
 
-  it("rejects an empty backlog, a missing or bad team, and an unknown key inside it", () => {
-    expect(backlog({ backlog: {} })).toMatchObject({ ok: false, error: expect.stringMatching(/roles\.backlog\.backlog\.team/u) });
+  it("parses a backlog role's repos, kept as GitHub spells them, and emits one GitHub target per repo", () => {
+    const parsed = backlog({ backlog: { repos: ["Acme/Web", "acme/api"] } });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.definitions.backlog).toMatchObject({ backlog: { repos: ["Acme/Web", "acme/api"] } });
+    expect(parsed.value.roles["trotterdylan"]!.ops?.backlog).toEqual({ repos: ["Acme/Web", "acme/api"] });
+    expect(roleBacklogTargets(parsed.value.roles["trotterdylan"]!)).toEqual([
+      { kind: "backlog", source: "github", unit: "Acme/Web" },
+      { kind: "backlog", source: "github", unit: "acme/api" },
+    ]);
+  });
+
+  it("rejects an empty backlog, a bad team or repo, both team and repos, and an unknown key inside it", () => {
+    expect(backlog({ backlog: {} })).toMatchObject({ ok: false });
     expect(backlog({ backlog: { team: "" } })).toMatchObject({ ok: false });
     expect(backlog({ backlog: { team: "Bad Key" } })).toMatchObject({ ok: false });
     expect(backlog({ backlog: { team: "BB", bogus: true } })).toMatchObject({ ok: false });
+    expect(backlog({ backlog: { repos: [] } })).toMatchObject({ ok: false });
+    expect(backlog({ backlog: { repos: ["not a repo"] } })).toMatchObject({ ok: false });
+    // Exactly one of team and repos: both and neither are refused.
+    expect(backlog({ backlog: { team: "BB", repos: ["acme/web"] } })).toMatchObject({ ok: false });
+    expect(backlog({ backlog: { repos: ["acme/web"], bogus: true } })).toMatchObject({ ok: false });
   });
 
   it("leaves a role without backlog exactly as before", () => {

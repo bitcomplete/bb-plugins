@@ -2943,7 +2943,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * changing roles.ts.
      */
     const usesKindFor = (file: ProjectFile, kind: BindingKind, role: StewardRole | null): boolean =>
-      kind === "ops" && role?.ops?.backlog !== undefined ? true : usesKind(file, kind, role);
+      kind === "ops" && roleBacklogTargets(role).length > 0 ? true : usesKind(file, kind, role);
 
     /**
      * The project's stewards configuration, or null when the project has none.
@@ -3077,16 +3077,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // legacy ops no longer runs once roles.json wins, but the watch is not
       // moved until the project file drops it.
       if (legacyOpsPresent(file)) problems.push(`ops now belongs in ${ROLES_FILE}`);
-      // BB-334: the project's backlog block must name a team a role actually
-      // watches. A block with no matching role, or a `team` naming a different
-      // team, is one problem line; the binding never silently picks one.
+      // BB-334, BB-395: the project's backlog block must name a target a role
+      // actually watches. A block with no matching role, or a `team` naming a
+      // different team, is one problem line; the binding never silently picks
+      // one. A GitHub-only role is valid and reads nothing yet, so it raises no
+      // problem here.
       if (file.backlog !== undefined) {
+        const roleBacklogs = Object.values(roles?.roles ?? {}).flatMap((r) => (r.ops?.backlog === undefined ? [] : [r.ops.backlog]));
+        const backlogTeams = [...new Set(roleBacklogs.flatMap((b) => ("team" in b ? [b.team] : [])))];
+        const backlogRepos = [...new Set(roleBacklogs.flatMap((b) => ("repos" in b ? b.repos : [])))];
         // BB-362: the backlog role reads `sourceBacklog`, which only the linear
-        // source serves, so a project with no Linear team cannot run it. Say
-        // so plainly rather than reading an empty backlog for ever.
-        if (file.linear.teams.length === 0) problems.push(`${PROJECT_FILE}: backlog needs a Linear team; the backlog role is Linear-only`);
-        const backlogTeams = [...new Set(Object.values(roles?.roles ?? {}).flatMap((r) => (r.ops?.backlog === undefined ? [] : [r.ops.backlog.team])))];
-        if (backlogTeams.length === 0) problems.push(`${PROJECT_FILE}: backlog is configured but no role watches a backlog; add a backlog role or remove the block`);
+        // source serves, so a project with a Linear backlog and no Linear team
+        // cannot run it. Say so plainly rather than reading an empty backlog
+        // for ever. A project with only GitHub repos is not a Linear problem,
+        // but a GitHub role must not hide a Linear role's missing team.
+        const hasGithubBacklog = backlogRepos.length > 0 || (file.backlog.repos?.length ?? 0) > 0;
+        if (file.linear.teams.length === 0 && (backlogTeams.length > 0 || file.backlog.team !== undefined || !hasGithubBacklog)) problems.push(`${PROJECT_FILE}: backlog needs a Linear team; the backlog role is Linear-only`);
+        if (backlogTeams.length === 0 && backlogRepos.length === 0) problems.push(`${PROJECT_FILE}: backlog is configured but no role watches a backlog; add a backlog role or remove the block`);
         else if (file.backlog.team !== undefined && !backlogTeams.includes(file.backlog.team)) problems.push(`${PROJECT_FILE}: backlog.team is ${file.backlog.team} but no role watches that team (${backlogTeams.join(", ")}); they must name the same team`);
       }
 
@@ -6820,19 +6827,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * One read of a backlog binding's Linear team through `sourceBacklog`
-     * (BB-334). It is read-only: no Linear write is ever made on this path.
-     * An unsupported capability or a read error is an `error` look, never an
-     * empty one; `issues: []` with a null `error` is the only empty report.
+     * One read of a backlog binding's target through `sourceBacklog`
+     * (BB-334, BB-396): the Linear team or the GitHub repo the target names.
+     * It is read-only: no write is ever made on this path. An unsupported
+     * capability or a read error is an `error` look, never an empty one;
+     * `issues: []` with a null `error` is the only empty report.
      */
     async function lookAtBacklog(target: BacklogTarget): Promise<BacklogLook> {
       const at = now();
       try {
-        const out = await sourceRpc("linear", "sourceBacklog", { team: target.team }, sourceContract.sourceBacklog.output);
-        const error = out.unsupported ? "the linear source does not support sourceBacklog" : out.errors.length > 0 ? out.errors.join("; ") : null;
-        return { at, target: opsTargetKey(target), team: target.team, error, issues: out.issues, unsupported: out.unsupported, truncated: out.truncated };
+        const out = await sourceRpc(target.source, "sourceBacklog", { team: target.unit }, sourceContract.sourceBacklog.output);
+        const error = out.unsupported ? `the ${target.source} source does not support sourceBacklog` : out.errors.length > 0 ? out.errors.join("; ") : null;
+        return { at, target: opsTargetKey(target), team: target.unit, error, issues: out.issues, unsupported: out.unsupported, truncated: out.truncated };
       } catch (error) {
-        return { at, target: opsTargetKey(target), team: target.team, error: errorMessage(error), issues: [], unsupported: false, truncated: false };
+        return { at, target: opsTargetKey(target), team: target.unit, error: errorMessage(error), issues: [], unsupported: false, truncated: false };
       }
     }
 
@@ -6872,9 +6880,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * The backlog binding's look: read the team's whole open backlog and keep it
-     * for the digest, then spawn and wake the steward thread the way
-     * `reconcileDeps` does (BB-378). It writes nothing to Linear on this path.
+     * The backlog binding's look: read the target's whole open backlog and keep
+     * it for the digest, then spawn and wake the steward thread the way
+     * `reconcileDeps` does (BB-378). It writes nothing to the source on this
+     * path.
      */
     async function reconcileBacklog(b: Binding, config: ProjectConfig, playbook: Playbook, target: BacklogTarget, force: WakeReason | null): Promise<void> {
       const before = b.backlogLook;
@@ -6884,14 +6893,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       b = store.patch(b.id, { backlogLook: look, requeueAt });
       if (look.error !== null) {
         if (before?.error !== look.error) {
-          bb.log.warn(`stewards: cannot read the backlog of ${target.team}: ${look.error}`);
-          store.noteProject(b.projectId, `Backlog ${target.team} could not be read: ${look.error}`);
+          bb.log.warn(`stewards: cannot read the backlog of ${target.unit}: ${look.error}`);
+          store.noteProject(b.projectId, `Backlog ${target.unit} could not be read: ${look.error}`);
         }
         return;
       }
-      if (look.truncated) bb.log.warn(`stewards: the backlog of ${target.team} was truncated by the source's hard cap`);
+      if (look.truncated) bb.log.warn(`stewards: the backlog of ${target.unit} was truncated by the source's hard cap`);
 
-      const isBound = (issue: BacklogIssue): boolean => store.openByEntity("linear", issue.id)?.projectId === config.projectId;
+      const isBound = (issue: BacklogIssue): boolean => store.openByEntity(target.source, issue.id)?.projectId === config.projectId;
       const changes = backlogChanges(before, look, isBound);
       if (requeueCame) changes.push({ text: look.issues.length > 0 ? "Requeue time came, with tickets still in the backlog" : "Requeue time came: a scheduled look", actionable: true });
       if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
@@ -6931,7 +6940,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         commentsPerWeek: block?.commentsPerWeek ?? 1,
         staleDays: block?.staleDays ?? 14,
         escalations: store.openEscalations(b.id),
-        ledger: store.backlogWrites(config.projectId, { team: target.team, since: now() - BACKLOG_COMMENT_WINDOW_MS }),
+        ledger: store.backlogWrites(config.projectId, { team: target.unit, since: now() - BACKLOG_COMMENT_WINDOW_MS }),
         changes: [...new Set(changes.map((c) => c.text))],
       });
       const delivery = await deliverWake(b, config, playbook, text);
@@ -7511,7 +7520,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const b = existing.find((x) => x.entityId === key);
         if (b === undefined) {
           let created: Binding;
-          const title = target.kind === "k8s-namespace" ? `Ops watch: ${target.name}` : target.kind === "dependabot" ? `Deps watch: ${target.repo}` : target.kind === "alertmanager" ? `Alertmanager watch: ${target.namespace}` : target.kind === "backlog" ? `Backlog watch: ${target.team}` : `Sentry watch: ${target.org}/${target.project}`;
+          const title = target.kind === "k8s-namespace" ? `Ops watch: ${target.name}` : target.kind === "dependabot" ? `Deps watch: ${target.repo}` : target.kind === "alertmanager" ? `Alertmanager watch: ${target.namespace}` : target.kind === "backlog" ? `Backlog watch: ${target.unit}` : `Sentry watch: ${target.org}/${target.project}`;
           try {
             created = store.create({ projectId: config.projectId, source: "ops", entityId: key, entityKey: key, url: null, title, kind: "ops", playbook: playbook.name, playbookVersion: playbook.version, parentBindingId: null, phase: "watching", stage: null });
           } catch {
@@ -8403,6 +8412,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const deps = store.byEntity("ops", opsTargetKey({ kind: "dependabot", repo }));
           if (deps !== null && deps.endedAt === null) scheduleReconcile(deps.id);
         }
+        // BB-396: a GitHub issue doorbell also wakes the backlog binding of the
+        // issue's repository, so a new or moved issue reaches the backlog report
+        // between nightly passes. The doorbell's id is "owner/repo#N".
+        const backlogRepo = repoOfFingerprint(id);
+        if (backlogRepo !== null) {
+          for (const b of store.open()) {
+            const target = parseOpsTargetKey(b.entityId);
+            if (b.kind === "ops" && target?.kind === "backlog" && target.source === "github" && lc(target.unit) === lc(backlogRepo)) scheduleReconcile(b.id);
+          }
+        }
         for (const t of store.open()) {
           const linked = t.kind === "ticket" && (t.lastSnapshot?.entity.linkedPulls ?? []).some((l) => lc(l.key) === lc(id));
           const waited = waitedPullKeys(t).some((k) => lc(k) === lc(id));
@@ -8420,7 +8439,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const team = entity === null ? null : entity.unit.toUpperCase();
           for (const b of backlogs) {
             const target = parseOpsTargetKey(b.entityId);
-            if (target?.kind === "backlog" && (team === null || target.team === team)) scheduleReconcile(b.id);
+            if (target?.kind === "backlog" && target.source === "linear" && (team === null || target.unit === team)) scheduleReconcile(b.id);
           }
         }
       }
@@ -8585,7 +8604,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (b.kind !== "ops" || b.backlogLook === null || target?.kind !== "backlog") continue;
         // BB-341: the triage ledger since the previous digest, so the section
         // lists each write and counts the refusals.
-        const writes = store.backlogWrites(projectId, { team: target.team, since });
+        const writes = store.backlogWrites(projectId, { team: target.unit, since });
         digests.push(backlogDigest(b.backlogLook, b.backlogSnapshot, { staleDays, writes }, at));
         // A failed read keeps the previous snapshot: the next digest still
         // compares against the last good one.
@@ -12944,8 +12963,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // offered to a backlog thread. The tool re-reads the flag itself, so
         // turning it off refuses at once even before the selection refreshes.
         const backlogBlock = configs.get(b.projectId)?.value?.file.backlog;
-        const backlogTriage = target?.kind === "backlog" && backlogBlock?.triage === true;
-        const backlogPromote = target?.kind === "backlog" && backlogBlock?.promote === true;
+        // BB-396: triage writes and promotion are Linear-only, so a GitHub
+        // backlog steward is read-only. Neither tool is offered, and the prompt
+        // says so, rather than inviting a tool that can only fail.
+        const linearBacklog = target?.kind === "backlog" && target.source === "linear";
+        const backlogTriage = linearBacklog && backlogBlock?.triage === true;
+        const backlogPromote = linearBacklog && backlogBlock?.promote === true;
         if (target?.kind === "backlog") {
           const backlogWrites = ["steward_report", "steward_update", ...(backlogTriage ? ["backlog_triage"] : []), ...(backlogPromote ? ["backlog_promote"] : []), "ticket_read", "ticket_search"];
           return {
@@ -12953,13 +12976,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             skills: [...STEWARDS_SKILLS],
             instructions:
               `You are the backlog steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
-              "The plugin reads the Linear team for you and every wake carries the whole open backlog. You never edit a description, start a worker, cancel or close a ticket. " +
-              (backlogTriage
-                ? "`backlog_triage` adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
-                : "The backlog is read-only for triage on this project: `backlog.triage` is off. ") +
-              (backlogPromote
-                ? "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit; the plugin picks the ticket, so a key that is not the top-ordered eligible one is ignored. "
-                : "No promotion is offered: `backlog.promote` is off. ") +
+              "The plugin reads the target (a Linear team or a GitHub repository) for you and every wake carries the whole open backlog. You never edit a description, start a worker, cancel or close a ticket. " +
+              (target.source !== "linear"
+                ? "This is a GitHub backlog, so it is read-only: triage writes and promotion are Linear-only, and neither `backlog_triage` nor `backlog_promote` is offered. "
+                : (backlogTriage
+                    ? "`backlog_triage` adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
+                    : "The backlog is read-only for triage on this project: `backlog.triage` is off. ") +
+                  (backlogPromote
+                    ? "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit; the plugin picks the ticket, so a key that is not the top-ordered eligible one is ignored. "
+                    : "No promotion is offered: `backlog.promote` is off. ")) +
               "`ticket_read` and `ticket_search` are reads only. End every turn you were woken for with steward_report. Read the stewards skill for the protocol.",
           };
         }
@@ -13236,8 +13261,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (binding === null || target === null || target.kind !== "backlog") {
           return toolError(new Error("backlog_triage is for a backlog steward's thread; this thread is not one."));
         }
+        // BB-396: triage is a Linear write; a GitHub backlog is read-only, and
+        // the refusal happens before any read or ledger write.
+        if (target.source !== "linear") return toolError(new Error("backlog_triage is Linear-only; a GitHub backlog is read-only."));
         const projectId = binding.projectId;
-        const team = target.team;
+        const team = target.unit;
         const record = (outcome: "accepted" | "refused", kind: BacklogWrite["kind"], detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
           store.addBacklogWrite({ id: newId("btw"), projectId, team, issueId, issueKey, at: now(), outcome, kind, detail, reason });
         const attempted = Object.keys(input).filter((k) => k !== "key");
@@ -13366,8 +13394,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (binding === null || target === null || target.kind !== "backlog") {
           return toolError(new Error("backlog_promote is for a backlog steward's thread; this thread is not one."));
         }
+        // BB-396: promotion is a Linear write; a GitHub backlog is read-only,
+        // and the refusal happens before any read or ledger write.
+        if (target.source !== "linear") return toolError(new Error("backlog_promote is Linear-only; a GitHub backlog is read-only."));
         const projectId = binding.projectId;
-        const team = target.team;
+        const team = target.unit;
         const record = (outcome: "accepted" | "refused", detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
           store.addBacklogWrite({ id: newId("btw"), projectId, team, issueId, issueKey, at: now(), outcome, kind: "promote", detail, reason });
         // Serialise promotion passes per project, so two calls cannot both read
