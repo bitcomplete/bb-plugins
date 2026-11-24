@@ -157,7 +157,9 @@ Push and open a pull request against the repo's base branch, titled
 closing keywords. **A GitHub issue's PR names the issue in its body without a
 closing keyword** — no `Fixes #n`, `Closes #n` or `Resolves #n` — so GitHub
 does not close the issue at merge; the steward closes it once the deployment
-source confirms the merge is live. The body:
+source confirms the merge is live. Write the issue reference as a Markdown
+link or a plain `owner/repo#n`, never in code formatting: GitHub links nothing
+inside backticks, so the steward never sees the pull request. The body:
 
 ```
 Implements [<KEY>](<url>). <Two to five lines: what changed and why.>
