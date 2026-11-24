@@ -1081,24 +1081,45 @@
   gap: 8px;
   margin-top: 20px;
 }
-.calm-reviewer-choices {
+.calm-reviewer-heading {
+  padding: 8px 0 2px;
+  font-size: 11px;
+}
+.calm-reviewer-link {
+  text-decoration: none;
+}
+.calm-reviewer-link:hover {
+  text-decoration: underline;
+}
+.calm-reviewer-actions {
   display: flex;
-  flex-direction: column;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 0;
 }
-.calm-reviewer-choices fieldset {
+.calm-reviewer-trigger {
   min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.calm-reviewer-choices legend {
+.calm-reviewer-choices {
+  width: 320px;
+  max-width: calc(100vw - 36px);
+  max-height: min(var(--available-height), 320px);
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+  box-shadow: 0 8px 24px color-mix(in oklch, var(--foreground) 12%, transparent);
+}
+.calm-reviewer-choices h2 {
   font-size: 12px;
   font-weight: 600;
-  margin-bottom: 6px;
 }
-.calm-reviewer-choices fieldset > p {
-  margin-bottom: 6px;
+.calm-reviewer-choices > p {
+  margin-top: 6px;
 }
 .calm-reviewer-choices label {
   display: flex;

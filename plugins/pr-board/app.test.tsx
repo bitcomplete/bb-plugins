@@ -1636,18 +1636,237 @@ it("never invents asking status for old finished threads and opens live agents",
     slot.getByRole("heading", { name: "PRs with finished threads" }),
   ).toBeTruthy();
 });
-it("loads actual reviewer candidates and writes only after the explicit Send click", async () => {
+it("links each One click PR and loads candidates once on the first selector interaction", async () => {
+  const openUrl = vi.fn(() => true);
+  const slot = await mount({ openUrl });
+  const link = slot.getByRole("link", { name: "Change 1 #1" });
+  expect(link.getAttribute("href")).toBe(url(1));
+  fireEvent.click(link);
+  expect(openUrl).toHaveBeenCalledWith(url(1));
+  expect(link.closest("li")?.textContent).toContain(repo);
+  expect(link.closest("li")?.querySelector(".calm-size-dot")).toBeTruthy();
+  expect(calls(slot, "reviewers_get")).toEqual([]);
+  const trigger = slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" });
+  expect(trigger.textContent).toContain("dev-one");
+  fireEvent.click(trigger);
+  const dialog = within(await slot.findByRole("dialog", { name: "Reviewers for Change 1 #1" }));
+  await dialog.findByText("dev-two");
+  expect(dialog.getByRole("checkbox", { name: "dev-one for Change 1 #1" }).getAttribute("aria-checked")).toBe("true");
+  expect(dialog.getByText("CODEOWNER · 2 waiting")).toBeTruthy();
+  expect(calls(slot, "reviewers_request")).toEqual([]);
+  fireEvent.keyDown(document.activeElement ?? trigger, { key: "Escape" });
+  fireEvent.click(trigger);
+  await slot.findByRole("dialog", { name: "Reviewers for Change 1 #1" });
+  await slot.behavior.emitRealtime("board-changed", null);
+  expect(calls(slot, "reviewers_get")).toEqual([{ keys: [key(1)] }]);
+});
+it("loads actual reviewer candidates and writes only after the row Send click", async () => {
   const slot = await mount();
-  fireEvent.click(slot.getByRole("button", { name: "Send all" }));
+  fireEvent.click(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }));
   const dialog = within(await slot.findByRole("dialog"));
   await dialog.findByText("dev-two");
   expect(calls(slot, "reviewers_request")).toHaveLength(0);
   fireEvent.click(dialog.getByRole("checkbox", { name: /dev-two/ }));
-  fireEvent.click(dialog.getByRole("button", { name: "Send 1" }));
-  await dialog.findByText("1 review request sent.");
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+  fireEvent.click(slot.getByRole("button", { name: "Send review request for Change 1 #1" }));
+  await slot.findByText("1 review request sent.");
   expect(calls(slot, "reviewers_request")).toEqual([
     { requests: [{ key: key(1), reviewers: ["dev-one", "dev-two"] }] },
   ]);
+  expect(slot.getByRole("button", { name: "Send review request for Change 1 #1" }).hasAttribute("disabled")).toBe(true);
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }).hasAttribute("disabled")).toBe(true);
+  expect(slot.getByText("sent")).toBeTruthy();
+  expect(slot.getByRole("button", { name: "Send 0" }).hasAttribute("disabled")).toBe(true);
+});
+function reviewerBoard() {
+  return state({ view: { ...view, prs: [
+    row(1, { group: "one-click", action: null, review_targets: ["dev-two"] }),
+    row(11, { group: "one-click", action: null, review_targets: ["dev-two", "ineligible"] }),
+    row(12, { group: "one-click", action: null }),
+  ] } });
+}
+const reviewerOptions = () => [1, 11, 12].map((number) => ({
+  key: key(number), note: null, candidates: [
+    { login: "dev-one", owned: true, load: 2 },
+    { login: "dev-two", owned: false, load: 0 },
+  ],
+}));
+it("loads the section once on send, uses each suggestion, and sends only that row", async () => {
+  const slot = await mount({
+    board: reviewerBoard(), waitFor: "Change 11",
+    rpc: {
+      reviewers_get: reviewerOptions,
+      reviewers_request: () => ({ sent: [key(11)], skipped: [] }),
+    },
+  });
+  expect(slot.getByRole("link", { name: "Change 11 #11" }).getAttribute("href")).toBe(url(11));
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }).textContent).toContain("dev-one");
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 11 #11" }).textContent).toContain("dev-two");
+  expect(calls(slot, "reviewers_get")).toEqual([]);
+  fireEvent.click(slot.getByRole("button", { name: "Send review request for Change 11 #11" }));
+  await slot.findByText("1 review request sent.");
+  expect(calls(slot, "reviewers_get")).toEqual([{ keys: [key(1), key(11), key(12)] }]);
+  expect(calls(slot, "reviewers_request")).toEqual([
+    { requests: [{ key: key(11), reviewers: ["dev-two"] }] },
+  ]);
+  fireEvent.click(slot.getByRole("button", { name: "Choose reviewers for Change 12 #12" }));
+  await slot.findByRole("dialog", { name: "Reviewers for Change 12 #12" });
+  expect(calls(slot, "reviewers_get")).toHaveLength(1);
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }).hasAttribute("disabled")).toBe(false);
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 11 #11" }).hasAttribute("disabled")).toBe(true);
+});
+it("sends every row with an eligible choice from the header and keeps sent rows disabled", async () => {
+  const slot = await mount({
+    board: reviewerBoard(), waitFor: "Change 11",
+    rpc: {
+      reviewers_get: reviewerOptions,
+      reviewers_request: () => ({ sent: [key(1), key(11)], skipped: [] }),
+    },
+  });
+  fireEvent.click(slot.getByRole("button", { name: "Send 2" }));
+  await slot.findByText("2 review requests sent.");
+  expect(calls(slot, "reviewers_request")).toEqual([{ requests: [
+    { key: key(1), reviewers: ["dev-one"] },
+    { key: key(11), reviewers: ["dev-two"] },
+  ] }]);
+  for (const number of [1, 11]) {
+    expect(slot.getByRole("button", { name: `Choose reviewers for Change ${number} #${number}` }).hasAttribute("disabled")).toBe(true);
+    expect(slot.getByRole("button", { name: `Send review request for Change ${number} #${number}` }).hasAttribute("disabled")).toBe(true);
+  }
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 12 #12" }).hasAttribute("disabled")).toBe(false);
+});
+it("shows an ineligible suggestion and never sends it, including when send triggers loading", async () => {
+  const slot = await mount({ rpc: {
+    reviewers_get: () => [{ key: key(1), note: null, candidates: [{ login: "dev-two", owned: false, load: 0 }] }],
+  } });
+  fireEvent.click(slot.getByRole("button", { name: "Send 1" }));
+  await slot.findByText("Suggested reviewers not eligible: dev-one");
+  expect(calls(slot, "reviewers_request")).toEqual([]);
+  expect(slot.getByRole("button", { name: "Send 0" }).hasAttribute("disabled")).toBe(true);
+  const trigger = slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" });
+  expect(trigger.textContent).not.toContain("dev-one");
+  fireEvent.click(trigger);
+  const dialog = within(await slot.findByRole("dialog"));
+  expect(dialog.getByRole("checkbox", { name: /dev-two/ }).getAttribute("aria-checked")).toBe("false");
+  expect(calls(slot, "reviewers_get")).toHaveLength(1);
+});
+it("sends edited choices from the header and excludes rows whose choices were cleared", async () => {
+  const slot = await mount({
+    board: reviewerBoard(), waitFor: "Change 11",
+    rpc: { reviewers_get: reviewerOptions, reviewers_request: () => ({ sent: [key(1), key(12)], skipped: [] }) },
+  });
+  const user = userEvent.setup();
+  const trigger = slot.getByRole("button", { name: "Choose reviewers for Change 11 #11" });
+  trigger.focus();
+  await user.keyboard("{Enter}");
+  const dialog = within(await slot.findByRole("dialog", { name: "Reviewers for Change 11 #11" }));
+  const selected = await dialog.findByRole("checkbox", { name: "dev-two for Change 11 #11" });
+  selected.focus();
+  await user.keyboard(" ");
+  expect(selected.getAttribute("aria-checked")).toBe("false");
+  await user.keyboard("{Escape}");
+  expect(document.activeElement).toBe(trigger);
+  fireEvent.click(slot.getByRole("button", { name: "Choose reviewers for Change 12 #12" }));
+  const next = within(await slot.findByRole("dialog", { name: "Reviewers for Change 12 #12" }));
+  fireEvent.click(next.getByRole("checkbox", { name: "dev-two for Change 12 #12" }));
+  await user.keyboard("{Escape}");
+  fireEvent.click(slot.getByRole("button", { name: "Send 2" }));
+  await slot.findByText("2 review requests sent.");
+  expect(calls(slot, "reviewers_request")).toEqual([{ requests: [
+    { key: key(1), reviewers: ["dev-one"] },
+    { key: key(12), reviewers: ["dev-two"] },
+  ] }]);
+});
+it("shares an in-flight candidate load across selectors and shows its loading and error states", async () => {
+  let fail = (_cause: Error) => {};
+  const slot = await mount({
+    board: reviewerBoard(), waitFor: "Change 11",
+    rpc: { reviewers_get: () => new Promise((_resolve, reject) => { fail = reject; }) },
+  });
+  fireEvent.click(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }));
+  await slot.findByText("Loading eligible reviewers…");
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+  fireEvent.click(slot.getByRole("button", { name: "Choose reviewers for Change 11 #11" }));
+  await slot.findByRole("dialog", { name: "Reviewers for Change 11 #11" });
+  expect(calls(slot, "reviewers_get")).toHaveLength(1);
+  await act(async () => fail(new Error("Candidates unavailable")));
+  await slot.findByRole("alert");
+  expect(slot.getByRole("alert").textContent).toBe("Candidates unavailable");
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 11 #11" }).textContent).toContain("Reviewers unavailable");
+  expect(calls(slot, "reviewers_request")).toEqual([]);
+  // Reopening a selector retries the failed load.
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+  fireEvent.click(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }));
+  await waitFor(() => expect(calls(slot, "reviewers_get")).toHaveLength(2));
+});
+it("limits reviewer choices to ten while allowing deselection", async () => {
+  const candidates = Array.from({ length: 11 }, (_, index) => ({ login: `dev-${index + 1}`, owned: false, load: 0 }));
+  const slot = await mount({ rpc: { reviewers_get: () => [{ key: key(1), note: null, candidates }] } });
+  fireEvent.click(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }));
+  const dialog = within(await slot.findByRole("dialog"));
+  await dialog.findByText("dev-11");
+  for (let index = 1; index <= 10; index++) fireEvent.click(dialog.getByRole("checkbox", { name: `dev-${index} for Change 1 #1` }));
+  const extra = dialog.getByRole("checkbox", { name: "dev-11 for Change 1 #1" });
+  expect(extra.hasAttribute("disabled")).toBe(true);
+  fireEvent.click(extra);
+  expect(extra.getAttribute("aria-checked")).toBe("false");
+  fireEvent.click(dialog.getByRole("checkbox", { name: "dev-1 for Change 1 #1" }));
+  expect(extra.hasAttribute("disabled")).toBe(false);
+  fireEvent.click(extra);
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+  fireEvent.click(slot.getByRole("button", { name: "Send 1" }));
+  await slot.findByText("1 review request sent.");
+  expect(calls(slot, "reviewers_request")).toEqual([{ requests: [{
+    key: key(1), reviewers: candidates.slice(1).map((candidate) => candidate.login),
+  }] }]);
+});
+it("caps prefilled suggestions before sending and keeps choices across a board refresh", async () => {
+  const candidates = Array.from({ length: 11 }, (_, index) => ({ login: `dev-${index + 1}`, owned: false, load: 0 }));
+  const initial = state({ view: { ...view, reviewer_batches: [], prs: [
+    row(1, { group: "one-click", action: null, review_targets: candidates.map((candidate) => candidate.login) }),
+  ] } });
+  const slot = await mount({
+    board: initial, waitFor: "Change 1",
+    rpc: {
+      reviewers_get: () => [{ key: key(1), note: null, candidates }],
+      board_refresh: () => ({ ...initial, view: { ...initial.view, fetched_at: new Date().toISOString() } }),
+    },
+  });
+  fireEvent.click(slot.getByRole("button", { name: "Send 1" }));
+  await slot.findByText("1 review request sent.");
+  expect(calls(slot, "reviewers_request")).toEqual([{ requests: [{
+    key: key(1), reviewers: candidates.slice(0, 10).map((candidate) => candidate.login),
+  }] }]);
+  await slot.behavior.emitRealtime("board-changed", null);
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }).hasAttribute("disabled")).toBe(true);
+  expect(calls(slot, "reviewers_get")).toHaveLength(1);
+  // A background refresh must not wipe in-progress choices or the sent state while the same PRs are listed.
+  fireEvent.click(slot.getByRole("button", { name: "Refresh" }));
+  await waitFor(() => expect(calls(slot, "board_refresh")).toHaveLength(1));
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }).hasAttribute("disabled")).toBe(true);
+  expect(calls(slot, "reviewers_get")).toHaveLength(1);
+});
+it("shows when no eligible reviewers are available", async () => {
+  const slot = await mount({ rpc: { reviewers_get: () => [{ key: key(1), note: "No individual owner found.", candidates: [] }] } });
+  fireEvent.click(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }));
+  await slot.findByText("No eligible reviewers are available.");
+  expect(slot.getByText("No individual owner found.")).toBeTruthy();
+  expect(slot.getByRole("button", { name: "Send review request for Change 1 #1" }).hasAttribute("disabled")).toBe(true);
+});
+it("keeps request failures retryable and reports skipped rows without disabling them", async () => {
+  let fail = true;
+  const slot = await mount({ rpc: { reviewers_request: () => {
+    if (fail) throw new Error("Review request failed");
+    return { sent: [], skipped: [{ key: key(1), reason: "PR no longer needs a review request." }] };
+  } } });
+  fireEvent.click(slot.getByRole("button", { name: "Send 1" }));
+  await slot.findByText("Review request failed");
+  expect(slot.getByRole("button", { name: "Send 1" }).hasAttribute("disabled")).toBe(false);
+  fail = false;
+  fireEvent.click(slot.getByRole("button", { name: "Send 1" }));
+  await slot.findByText("0 review requests sent. Change 1 #1: PR no longer needs a review request.");
+  expect(slot.getByRole("button", { name: "Choose reviewers for Change 1 #1" }).hasAttribute("disabled")).toBe(false);
+  expect(calls(slot, "reviewers_get")).toHaveLength(1);
 });
 it("keeps last successful Mine data after refresh failure and marks old timestamps", async () => {
   const slot = await mount({

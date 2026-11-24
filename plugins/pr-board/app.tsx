@@ -15,6 +15,12 @@ import {
   SelectValue,
 } from "@ui-sdk/react/select";
 import {
+  Popover,
+  PopoverContent,
+  PopoverTitle,
+  PopoverTrigger,
+} from "@ui-sdk/react/popover";
+import {
   Checkbox,
   CheckboxGroup,
   CheckboxIndicator,
@@ -26,6 +32,7 @@ import {
   useBbNavigate,
   useRealtime,
   useRpc,
+  UrlLink,
   type ExperimentalBadge,
 } from "@get-bb/plugin-sdk/app";
 import { z } from "zod";
@@ -42,7 +49,6 @@ import {
 import {
   age,
   CalmButton,
-  CalmDialog,
   EffortGroup,
   FoldDots,
   Later,
@@ -256,185 +262,27 @@ type ReviewerOptions = z.infer<(typeof rpcContract)["reviewers_get"]["output"]>;
 type AgentModelContext = z.infer<
   (typeof rpcContract)["agent_model_get"]["output"]
 >;
-type PickerLoad =
-  | { kind: "loading" }
+type ReviewerLoad =
+  | { kind: "idle" | "loading" }
   | { kind: "error"; message: string }
   | { kind: "ready"; rows: ReviewerOptions };
-function ReviewerPicker({
-  rows,
-  login,
-  onClose,
+function OneClick({
+  prs,
+  view,
   refetch,
 }: {
-  rows: CalmRow[];
-  login: string | null;
-  onClose: () => void;
+  prs: MinePr[];
+  view: NonNullable<BoardState["view"]>;
   refetch: () => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
-  const [load, setLoad] = useState<PickerLoad>({ kind: "loading" });
+  const [load, setLoad] = useState<ReviewerLoad>({ kind: "idle" });
+  const pending = useRef<Promise<ReviewerOptions> | null>(null);
   const [chosen, setChosen] = useState<Map<string, string[]>>(new Map());
   const [sent, setSent] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    let active = true;
-    rpc.call("reviewers_get", { keys: rows.map((row) => row.key) }).then(
-      (options) => {
-        if (!active) return;
-        setLoad({ kind: "ready", rows: options });
-        setChosen(
-          new Map(
-            options.map((option) => {
-              const targets = login
-                ? [login]
-                : (rows.find((row) => row.key === option.key)?.review_targets ??
-                  []);
-              return [
-                option.key,
-                option.candidates
-                  .filter((candidate) => targets.includes(candidate.login))
-                  .map((candidate) => candidate.login),
-              ];
-            }),
-          ),
-        );
-      },
-      (cause) => {
-        if (active) setLoad({ kind: "error", message: message(cause) });
-      },
-    );
-    return () => {
-      active = false;
-    };
-  }, [rows, login, rpc]);
-  const requests = rows
-    .filter((row) => !sent.has(row.key))
-    .flatMap((row) => {
-      const reviewers = [...(chosen.get(row.key) ?? [])];
-      return reviewers.length ? [{ key: row.key, reviewers }] : [];
-    });
-  const send = async () => {
-    if (busy || !requests.length) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await rpc.call("reviewers_request", { requests });
-      setSent((current) => new Set([...current, ...result.sent]));
-      refetch();
-      setNotice(
-        `${result.sent.length} review ${result.sent.length === 1 ? "request" : "requests"} sent.${result.skipped.length ? ` ${result.skipped.map((skip) => `#${skip.key.split("#").pop()}: ${skip.reason}`).join(" · ")}` : ""}`,
-      );
-    } catch (cause) {
-      setError(message(cause));
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <CalmDialog
-      title="Ask for review"
-      description="Choose eligible reviewers, then send the requests to GitHub."
-      onClose={onClose}
-      busy={busy}
-    >
-      {(close) => (
-        <>
-          {load.kind === "loading" ? (
-            <p role="status">Loading eligible reviewers…</p>
-          ) : load.kind === "error" ? (
-            <p role="alert">{load.message}</p>
-          ) : (
-            <div className="calm-reviewer-choices">
-              {load.rows.map((option) => {
-                const row = rows.find(
-                  (candidate) => candidate.key === option.key,
-                );
-                return (
-                  <fieldset
-                    key={option.key}
-                    disabled={busy || sent.has(option.key)}
-                  >
-                    <legend>
-                      {row?.title}{" "}
-                      <span className="calm-muted">#{row?.number}</span>
-                      {sent.has(option.key) ? " · sent" : ""}
-                    </legend>
-                    {option.note ? (
-                      <p className="calm-muted">{option.note}</p>
-                    ) : null}
-                    {option.candidates.length === 0 ? (
-                      <p>No eligible reviewers are available.</p>
-                    ) : (
-                      <CheckboxGroup
-                        data-prs-agent-local=""
-                        aria-label={`Reviewers for ${row?.title} #${row?.number}`}
-                        value={chosen.get(option.key) ?? []}
-                        onValueChange={(next, details) => {
-                          if (next.length > 10) details.cancel();
-                          else
-                            setChosen((current) =>
-                              new Map(current).set(option.key, next),
-                            );
-                        }}
-                      >
-                        {option.candidates.map((candidate) => (
-                          <label key={candidate.login}>
-                            <Checkbox
-                              data-prs-agent-local=""
-                              value={candidate.login}
-                              className="calm-checkbox"
-                            >
-                              <CheckboxIndicator aria-hidden>
-                                ✓
-                              </CheckboxIndicator>
-                            </Checkbox>
-                            {candidate.login}
-                            <span className="calm-muted">
-                              {candidate.owned ? "CODEOWNER · " : ""}
-                              {candidate.load} waiting
-                            </span>
-                          </label>
-                        ))}
-                      </CheckboxGroup>
-                    )}
-                  </fieldset>
-                );
-              })}
-            </div>
-          )}
-          {notice ? <p role="status">{notice}</p> : null}
-          {error ? (
-            <p role="alert" className="text-red">
-              {error}
-            </p>
-          ) : null}
-          <div className="calm-dialog-actions">
-            <CalmButton onClick={close} disabled={busy}>
-              Close
-            </CalmButton>
-            <CalmButton
-              onClick={() => void send()}
-              disabled={busy || !requests.length}
-            >
-              {busy ? "Sending…" : `Send ${requests.length}`}
-            </CalmButton>
-          </div>
-        </>
-      )}
-    </CalmDialog>
-  );
-}
-function OneClick({
-  prs,
-  view,
-  onPick,
-}: {
-  prs: MinePr[];
-  view: NonNullable<BoardState["view"]>;
-  onPick: (rows: CalmRow[], login: string | null) => void;
-}) {
   const groups = view.reviewer_batches
     .map((batch) => ({
       ...batch,
@@ -452,6 +300,68 @@ function OneClick({
       keys: remaining.map((pr) => pr.row.key),
       prs: remaining,
     });
+  const suggestion = (row: CalmRow) => {
+    const login = groups.find((batch) => batch.keys.includes(row.key))?.login;
+    return login ? [login] : row.review_targets;
+  };
+  const reviewersFor = (row: CalmRow, options: ReviewerOptions | null) => {
+    const selected = chosen.get(row.key) ?? suggestion(row);
+    const candidates = options?.find((option) => option.key === row.key)?.candidates;
+    return [...new Set(selected)]
+      .filter((login) =>
+        options === null || candidates?.some((candidate) => candidate.login === login),
+      )
+      .slice(0, 10);
+  };
+  const loadCandidates = () => {
+    if (!pending.current) {
+      setLoad({ kind: "loading" });
+      pending.current = rpc
+        .call("reviewers_get", { keys: prs.map((pr) => pr.row.key) })
+        .then(
+          (options) => {
+            setLoad({ kind: "ready", rows: options });
+            return options;
+          },
+          (cause) => {
+            pending.current = null;
+            setLoad({ kind: "error", message: message(cause) });
+            throw cause;
+          },
+        );
+    }
+    return pending.current;
+  };
+  const options = load.kind === "ready" ? load.rows : null;
+  const sendable = prs.filter((pr) =>
+    !sent.has(pr.row.key) && reviewersFor(pr.row, options).length,
+  );
+  const send = async (rows: CalmRow[]) => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const options = await loadCandidates();
+      const requests = rows.filter((row) => !sent.has(row.key)).flatMap((row) => {
+        const reviewers = reviewersFor(row, options);
+        return reviewers.length ? [{ key: row.key, reviewers }] : [];
+      });
+      if (!requests.length) return;
+      const result = await rpc.call("reviewers_request", { requests });
+      setSent((current) => new Set([...current, ...result.sent]));
+      refetch();
+      setNotice(
+        `${result.sent.length} review ${result.sent.length === 1 ? "request" : "requests"} sent.${result.skipped.length ? ` ${result.skipped.map((skip) => {
+          const row = rows.find((row) => row.key === skip.key);
+          return `${row ? `${row.title} #${row.number}` : skip.key}: ${skip.reason}`;
+        }).join(" · ")}` : ""}`,
+      );
+    } catch (cause) {
+      setError(message(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <EffortGroup
       title="One click"
@@ -459,45 +369,131 @@ function OneClick({
       effort="~2 min"
       action={
         <CalmButton
-          onClick={() =>
-            onPick(
-              prs.map((pr) => pr.row),
-              null,
-            )
-          }
+          onClick={() => void send(sendable.map((pr) => pr.row))}
+          disabled={busy || !sendable.length}
         >
-          Send all
+          {busy ? "Sending…" : `Send ${sendable.length}`}
         </CalmButton>
       }
     >
-      {groups.map((batch, index) => (
-        <button
-          key={`${batch.login}:${index}`}
-          type="button"
-          className="calm-person-row"
-          onClick={() =>
-            onPick(
-              batch.prs.map((pr) => pr.row),
-              batch.login,
-            )
-          }
-        >
-          <span className="calm-dot-column">
-            <SizeDot lines={30} tone="amber" />
-          </span>
-          <span className="calm-person-name">
-            {batch.name ? `Ask ${batch.name} to review` : "Pick reviewers"}
-          </span>
-          <span className="calm-person-dots amber">
-            {batch.prs.map((pr) => (
-              <i
-                key={pr.row.key}
-                title={`#${pr.row.number}: ${pr.row.title}`}
-              />
-            ))}
-          </span>
-        </button>
+      {groups.map((batch) => (
+        <div key={batch.login ?? "pick"}>
+          <p className="calm-reviewer-heading calm-muted">
+            {batch.login ? `Suggested: ${batch.name ?? batch.login}` : "Pick reviewers"}
+          </p>
+          <ul>
+            {batch.prs.map(({ row }) => {
+              const option = options?.find((option) => option.key === row.key);
+              const selected = reviewersFor(row, options);
+              const ineligible = load.kind === "ready"
+                ? suggestion(row).filter((login) =>
+                    !option?.candidates.some((candidate) => candidate.login === login),
+                  )
+                : [];
+              const disabled = busy || sent.has(row.key);
+              const label = `${row.title} #${row.number}`;
+              return (
+                <li key={row.key} className="calm-pr" data-pr-key={row.key}>
+                  <div className="calm-row">
+                    <span className="calm-dot-column">
+                      <SizeDot lines={row.size.lines} tone="amber" />
+                    </span>
+                    <div className="calm-row-content">
+                      <div className="calm-row-line">
+                        <UrlLink href={row.url} className="calm-title calm-reviewer-link">
+                          {row.title} <span className="calm-muted">#{row.number}</span>
+                        </UrlLink>
+                      </div>
+                      <p className="calm-muted">{row.repo}</p>
+                      <div className="calm-reviewer-actions">
+                        <Popover
+                          onOpenChange={(open) => {
+                            if (open && load.kind !== "ready") void loadCandidates().catch(() => {});
+                          }}
+                        >
+                          <PopoverTrigger
+                            data-prs-agent-local=""
+                            className="calm-button calm-reviewer-trigger"
+                            aria-label={`Choose reviewers for ${label}`}
+                            disabled={disabled}
+                          >
+                            {load.kind === "loading" ? "Loading reviewers…" :
+                              load.kind === "error" ? "Reviewers unavailable" :
+                                selected.join(", ") || "Choose reviewers"}
+                            <span aria-hidden>⌄</span>
+                          </PopoverTrigger>
+                          <PopoverContent
+                            className="calm-reviewer-choices"
+                            align="start"
+                            sideOffset={4}
+                          >
+                            <PopoverTitle>Reviewers for {label}</PopoverTitle>
+                            {load.kind === "idle" || load.kind === "loading" ? (
+                              <p role="status">Loading eligible reviewers…</p>
+                            ) : load.kind === "error" ? (
+                              <p role="alert">{load.message}</p>
+                            ) : (
+                              <>
+                                {option?.note ? <p className="calm-muted">{option.note}</p> : null}
+                                {!option?.candidates.length ? (
+                                  <p>No eligible reviewers are available.</p>
+                                ) : (
+                                  <CheckboxGroup
+                                    data-prs-agent-local=""
+                                    aria-label={`Reviewer selection for ${label}`}
+                                    value={selected}
+                                    disabled={disabled}
+                                    onValueChange={(next, details) => {
+                                      if (next.length > 10) details.cancel();
+                                      else
+                                        setChosen((current) => new Map(current).set(row.key, next));
+                                    }}
+                                  >
+                                    {option.candidates.map((candidate) => (
+                                      <label key={candidate.login}>
+                                        <Checkbox
+                                          data-prs-agent-local=""
+                                          aria-label={`${candidate.login} for ${label}`}
+                                          value={candidate.login}
+                                          className="calm-checkbox"
+                                          disabled={selected.length >= 10 && !selected.includes(candidate.login)}
+                                        >
+                                          <CheckboxIndicator aria-hidden>✓</CheckboxIndicator>
+                                        </Checkbox>
+                                        {candidate.login}
+                                        <span className="calm-muted">
+                                          {candidate.owned ? "CODEOWNER · " : ""}{candidate.load} waiting
+                                        </span>
+                                      </label>
+                                    ))}
+                                  </CheckboxGroup>
+                                )}
+                                <p className="calm-muted">Choose up to 10 reviewers.</p>
+                              </>
+                            )}
+                          </PopoverContent>
+                        </Popover>
+                        <CalmButton
+                          aria-label={`Send review request for ${label}`}
+                          onClick={() => void send([row])}
+                          disabled={disabled || !selected.length}
+                        >
+                          {sent.has(row.key) ? "sent" : "Send"}
+                        </CalmButton>
+                      </div>
+                      {ineligible.length ? (
+                        <p className="calm-muted">Suggested reviewers not eligible: {ineligible.join(", ")}</p>
+                      ) : null}
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       ))}
+      {notice ? <p role="status">{notice}</p> : null}
+      {error ? <p role="alert" className="text-red">{error}</p> : null}
     </EffortGroup>
   );
 }
@@ -613,10 +609,6 @@ export function Board({ subPath }: { subPath?: string }) {
   const [stopOverride, setStopOverride] = useState<Stop | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [picker, setPicker] = useState<{
-    rows: CalmRow[];
-    login: string | null;
-  } | null>(null);
   const { organization, setOrganization } = useOrganization();
   const changeOrganization = useCallback(
     (next: string | null) => {
@@ -626,7 +618,6 @@ export function Board({ subPath }: { subPath?: string }) {
       setExpanded(null);
       setReviewExpanded(null);
       setReviewTarget(null);
-      setPicker(null);
       setNotice(null);
     },
     [setOrganization],
@@ -1103,9 +1094,10 @@ export function Board({ subPath }: { subPath?: string }) {
                       <ul>{questionRows}</ul>
                     </EffortGroup>
                     <OneClick
+                      key={`${organization}:${group("one-click").map((pr) => pr.row.key).join(",")}`}
                       prs={group("one-click")}
                       view={view}
-                      onPick={(rows, login) => setPicker({ rows, login })}
+                      refetch={refetch}
                     />
                     <EffortGroup
                       title="Small fixes for an agent"
@@ -1365,14 +1357,6 @@ export function Board({ subPath }: { subPath?: string }) {
               <small>{selection.length - 100} outside this request</small>
             ) : null}
           </div>
-        ) : null}
-        {picker ? (
-          <ReviewerPicker
-            rows={picker.rows}
-            login={picker.login}
-            onClose={() => setPicker(null)}
-            refetch={refetch}
-          />
         ) : null}
       </Tabs>
     </div>

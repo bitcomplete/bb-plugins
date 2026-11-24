@@ -8,6 +8,7 @@ import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "@ui-sdk/react
 import { Button } from "@ui-sdk/react/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@ui-sdk/react/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@ui-sdk/react/select";
+import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@ui-sdk/react/popover";
 import { z } from "zod";
 import { disposePrsUiAgentBridge, usePrsUiAgentBridge } from "./ui-agent-bridge";
 
@@ -350,4 +351,41 @@ it("changes only a directly marked organization Select using canonical refs and 
   expect(await tool("act", { panelId: id, ref: refOf(initial, "Read-only organization"), action: "setValue", args: ["parsley-health"] })).toMatchObject({ ok: false, code: "action_unavailable" });
   expect(saveModel).not.toHaveBeenCalled();
   expect(readOnlyChanged).not.toHaveBeenCalled();
+});
+
+it("opens local reviewer popovers and changes their choices without exposing send actions", async () => {
+  const send = vi.fn();
+  function ReviewerPanel() {
+    const { rootRef, panelId } = usePrsUiAgentBridge();
+    return <div ref={rootRef} data-testid="Reviewer panel" data-prs-agent-panel={panelId}>
+      <Popover>
+        <PopoverTrigger data-prs-agent-local="" aria-label="Choose reviewers for Change 1 #1">dev-one</PopoverTrigger>
+        <PopoverContent>
+          <PopoverTitle>Reviewers for Change 1 #1</PopoverTitle>
+          <CheckboxGroup data-prs-agent-local="" aria-label="Reviewer selection for Change 1 #1" defaultValue={["dev-one"]}>
+            <Checkbox data-prs-agent-local="" aria-label="dev-one for Change 1 #1" value="dev-one" />
+            <Checkbox data-prs-agent-local="" aria-label="dev-two for Change 1 #1" value="dev-two" />
+          </CheckboxGroup>
+          <Button onClick={send}>Send review request for Change 1 #1</Button>
+        </PopoverContent>
+      </Popover>
+      <Popover>
+        <PopoverTrigger aria-label="Unmarked popup">Other</PopoverTrigger>
+        <PopoverContent><PopoverTitle>Private popup</PopoverTitle></PopoverContent>
+      </Popover>
+    </div>;
+  }
+  const view = render(<ReviewerPanel />);
+  const id = panelId(view.getByTestId("Reviewer panel"));
+  const initial = await state(id);
+  const selector = refOf(initial, "Choose reviewers for Change 1 #1");
+  expect(initial.components.find((entry) => entry.ref === selector)).toMatchObject({ actions: ["setOpen"] });
+  expect(await tool("act", { panelId: id, ref: selector, action: "setOpen", args: [true] })).toMatchObject({ ok: true });
+  const opened = await state(id);
+  expect(opened.components.find((entry) => entry.label === "dev-one for Change 1 #1")).toMatchObject({ checked: true });
+  expect(await tool("act", { panelId: id, ref: refOf(opened, "dev-two for Change 1 #1"), action: "setChecked", args: [true] })).toMatchObject({ ok: true });
+  expect((await state(id)).components.find((entry) => entry.label === "dev-two for Change 1 #1")).toMatchObject({ checked: true });
+  expect(opened.components.find((entry) => entry.label === "Send review request for Change 1 #1")).toMatchObject({ actions: [] });
+  expect(await tool("act", { panelId: id, ref: refOf(opened, "Unmarked popup"), action: "setOpen", args: [true] })).toMatchObject({ ok: false, code: "action_unavailable" });
+  expect(send).not.toHaveBeenCalled();
 });
