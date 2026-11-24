@@ -102,8 +102,15 @@ export const roleOpsSchema = z
     dependabot: z.union([z.literal("all"), z.array(dependabotRepoSchema).max(200)]).optional(),
     /** Pull requests this role's server adopts by shape, under a playbook, with no label (BB-164). */
     pulls: z.array(pullWatchSchema).max(50).default([]),
-    /** The Linear team whose backlog this role's steward watches (BB-332); the backlog binding (a later Stage 1 PR) enforces one holder per team. */
-    backlog: z.object({ team: teamKey }).strict().optional(),
+    /**
+     * The backlog this role's steward watches (BB-332, BB-395): a Linear team
+     * (`team`) or one or more GitHub repos (`repos`), never both and never
+     * neither. `team` folds to upper case; a repo is kept as GitHub spells it.
+     * The backlog binding (a later Stage 1 PR) enforces one holder per team.
+     */
+    backlog: z
+      .union([z.object({ team: teamKey }).strict(), z.object({ repos: z.array(dependabotRepoSchema).min(1).max(50) }).strict()])
+      .optional(),
   })
   .strict();
 export type RoleOps = z.infer<typeof roleOpsSchema>;
@@ -198,8 +205,9 @@ const rolesFileV2RawSchema = z
  * The merge of a holder's role definitions, in the order the holder lists
  * them. List fields are unioned; `context` and `team` take the first defined
  * value (a disagreement is a `check` problem, never a runtime change);
- * `backlog` takes the first defined value too, and the backlog binding (a
- * later Stage 1 PR) adds its own conflict and one-holder checks;
+ * `backlog` takes the first defined value too (a Linear `team` or GitHub
+ * `repos`, never both), and the backlog binding (a later Stage 1 PR) adds its
+ * own conflict and one-holder checks;
  * `dependabot: "all"` wins over an explicit list.
  */
 function mergeRoleOps(defs: readonly RoleOps[]): RoleOps {

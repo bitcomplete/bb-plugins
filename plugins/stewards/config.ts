@@ -415,15 +415,18 @@ export type TicketWatch = z.infer<typeof ticketWatchSchema>;
 export const ticketWatchId = (watch: Pick<TicketWatch, "playbook">): string => `${watch.playbook}@ticket`;
 
 /**
- * The backlog steward's block (BB-334): the Linear team whose whole open
- * backlog is reported, and the limits the report uses. `team` is optional;
- * the role's `backlog.team` decides which binding exists, and a `team` here
- * that names a different team is one `check` problem, never a silent pick.
- * Every number is a positive integer; the defaults are the design's.
+ * The backlog steward's block (BB-334, BB-395): the Linear team or GitHub
+ * repos whose whole open backlog is reported, and the limits the report uses.
+ * `team` and `repos` are optional; the role's `backlog` decides which bindings
+ * exist, and a `team` here that names a different team is one `check` problem,
+ * never a silent pick. Every number is a positive integer; the defaults are
+ * the design's.
  */
 export const backlogSchema = z
   .object({
     team: teamKey.optional(),
+    /** GitHub repos whose whole open backlog is reported (BB-395); the GitHub read lands in A2. */
+    repos: z.array(z.string().trim().regex(REPO_NAME, "a repo such as acme/web")).max(50).optional(),
     /** Stage 3's Todo + In Progress ceiling. */
     wipLimit: z.number().int().positive().max(1000).default(5),
     /** A ticket untouched for this long is stale. */
@@ -690,12 +693,19 @@ export const playbookNameFor = (project: ProjectFile, kind: BindingKind): string
 export const opsTargets = (project: ProjectFile): OpsTarget[] => project.ops.targets;
 
 /**
- * The backlog targets a server's role watches (BB-334): one per declared
- * `backlog.team`. It reads the role's parsed shape; roles.ts itself is not
- * changed, and the role's team is what decides which binding exists.
+ * The backlog targets a server's role watches (BB-334, BB-395): one Linear
+ * target per declared `backlog.team`, and one GitHub target per declared
+ * `backlog.repos` entry. It reads the role's parsed shape; roles.ts itself is
+ * not changed, and the role's team or repos decide which bindings exist.
  */
-export const roleBacklogTargets = (role: { ops?: { backlog?: { team: string } } } | null | undefined): BacklogTarget[] =>
-  role?.ops?.backlog === undefined ? [] : [{ kind: "backlog", team: role.ops.backlog.team }];
+export const roleBacklogTargets = (role: { ops?: { backlog?: { team?: string; repos?: string[] } } } | null | undefined): BacklogTarget[] => {
+  const backlog = role?.ops?.backlog;
+  if (backlog === undefined) return [];
+  const targets: BacklogTarget[] = [];
+  if (backlog.team !== undefined) targets.push({ kind: "backlog", source: "linear", unit: backlog.team });
+  for (const repo of backlog.repos ?? []) targets.push({ kind: "backlog", source: "github", unit: repo });
+  return targets;
+};
 
 /** The k8s namespaces to watch, which are read with kubectl. */
 export const k8sTargets = (project: ProjectFile): K8sTarget[] => project.ops.targets.filter((t): t is K8sTarget => t.kind === "k8s-namespace");

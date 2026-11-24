@@ -18,11 +18,16 @@ export type DependabotTarget = { kind: "dependabot"; repo: string };
 export type SentryTarget = { kind: "sentry-project"; org: string; project: string };
 /** A Kubernetes namespace watched for Prometheus Alertmanager alerts, read with no token through the plugin's Alertmanager URL (alertmanager.ts). */
 export type AlertmanagerTarget = { kind: "alertmanager"; namespace: string };
-/** A Linear team's whole open backlog, read through `sourceBacklog` (BB-334); read-only. */
-export type BacklogTarget = { kind: "backlog"; team: string };
+/**
+ * A Linear team's or GitHub repo's whole open backlog, read through
+ * `sourceBacklog` (BB-334, BB-395); read-only. `unit` is the Linear team key
+ * or the GitHub `owner/repo`. A GitHub target parses and configures today but
+ * is not read until the source supports it (BB-395's A2).
+ */
+export type BacklogTarget = { kind: "backlog"; source: "linear" | "github"; unit: string };
 export type OpsTarget = K8sTarget | DependabotTarget | SentryTarget | AlertmanagerTarget | BacklogTarget;
 
-/** The binding's entity id and key for a target: "k8s-namespace/web-production", "dependabot/acme/web", "sentry-project/acme/web", "alertmanager/web-production" or "backlog/BB". */
+/** The binding's entity id and key for a target: "k8s-namespace/web-production", "dependabot/acme/web", "sentry-project/acme/web", "alertmanager/web-production", "backlog/BB" or "backlog/github/acme/web". */
 export const opsTargetKey = (t: OpsTarget): string =>
   t.kind === "k8s-namespace"
     ? `${t.kind}/${t.name}`
@@ -31,7 +36,9 @@ export const opsTargetKey = (t: OpsTarget): string =>
       : t.kind === "dependabot"
         ? `${t.kind}/${t.repo}`
         : t.kind === "backlog"
-          ? `${t.kind}/${t.team}`
+          ? t.source === "github"
+            ? `${t.kind}/github/${t.unit}`
+            : `${t.kind}/${t.unit}`
           : `${t.kind}/${t.org}/${t.project}`;
 
 /** A Kubernetes namespace name, as the Alertmanager target's id: an RFC 1123 label. */
@@ -47,8 +54,12 @@ export function parseOpsTargetKey(key: string): OpsTarget | null {
   if (dep !== null) return { kind: "dependabot", repo: dep[2]! };
   const alertmanager = /^(alertmanager)\/([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$/u.exec(key);
   if (alertmanager !== null) return { kind: "alertmanager", namespace: alertmanager[2]! };
+  // The GitHub form is parsed first: its unit carries a slash, so the
+  // team-only pattern below can never swallow it. Team keys stay upper-cased.
+  const backlogGithub = /^(backlog)\/github\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/u.exec(key);
+  if (backlogGithub !== null) return { kind: "backlog", source: "github", unit: backlogGithub[2]! };
   const backlog = /^(backlog)\/([A-Za-z][A-Za-z0-9]*)$/u.exec(key);
-  if (backlog !== null) return { kind: "backlog", team: backlog[2]!.toUpperCase() };
+  if (backlog !== null) return { kind: "backlog", source: "linear", unit: backlog[2]!.toUpperCase() };
   const sentry = /^(sentry-project)\/([a-z0-9][a-z0-9._-]*)\/([a-z0-9][a-z0-9._-]*)$/u.exec(key);
   return sentry === null ? null : { kind: "sentry-project", org: sentry[2]!, project: sentry[3]! };
 }

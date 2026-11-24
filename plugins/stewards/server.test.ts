@@ -13236,6 +13236,22 @@ describe("the backlog watch (BB-334)", () => {
     expect(check.lines.filter((l) => l.startsWith("problem:") && l.includes("backlog.team"))).toEqual(["problem: stewards/project.json: backlog.team is OPS but no role watches that team (BB); they must name the same team"]);
   });
 
+  it("accepts a GitHub backlog role, raises no problem and does no GitHub work (BB-395)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"] } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
+    // A valid GitHub role is not a problem: no backlog line, and the strict
+    // project block parses.
+    expect(check.lines.filter((l) => l.startsWith("problem:") && l.includes("backlog"))).toEqual([]);
+    // No binding is created for a GitHub target, so no read and no digest.
+    expect(t.hooks.store.openOfKind("p1", "ops").filter((b) => b.entityId.startsWith("backlog/"))).toEqual([]);
+    expect(t.rpcCalls.filter((c) => c.pluginId === "linear" && c.method === "sourceBacklog")).toEqual([]);
+  });
+
   it("puts the backlog in the project steward's digest and snapshots the ids after the send (BB-334)", async () => {
     const t = await setup();
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["BB"] }, backlog: { staleDays: 14 } });

@@ -24,6 +24,15 @@ describe("targets", () => {
     expect(parseOpsTargetKey("alertmanager/web-production")).toEqual(alertmanager);
     expect(parseOpsTargetKey("alertmanager/Bad-Name")).toBeNull();
     expect(parseOpsTargetKey("alertmanager")).toBeNull();
+    // A Linear backlog keeps its `backlog/<TEAM>` key, byte for byte (BB-334).
+    const backlog = { kind: "backlog", source: "linear", unit: "BB" } as const;
+    expect(opsTargetKey(backlog)).toBe("backlog/BB");
+    expect(parseOpsTargetKey("backlog/BB")).toEqual(backlog);
+    // A GitHub backlog is `backlog/github/<owner>/<repo>` (BB-395).
+    const github = { kind: "backlog", source: "github", unit: "acme/web" } as const;
+    expect(opsTargetKey(github)).toBe("backlog/github/acme/web");
+    expect(parseOpsTargetKey("backlog/github/acme/web")).toEqual(github);
+    expect(parseOpsTargetKey("backlog/github/acme")).toBeNull();
   });
 });
 
