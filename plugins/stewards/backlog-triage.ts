@@ -98,6 +98,13 @@ export type TriageTicket = {
   key: string;
   /** The team key the ticket lives in, as the snapshot reports it. */
   unit: string;
+  /**
+   * The entity's kind as the source reports it (`issue` or `pull`). Optional
+   * and defaulting to `issue`. GitHub keys a pull request as `owner/repo#N`
+   * too, so a key that names a pull request must be refused rather than
+   * labelled and commented on (BB-397); Linear snapshots are always issues.
+   */
+  kind?: string;
   labels: string[];
   /** Linear's priority label as the snapshot carries it ("High", "No priority"), or null. */
   priority: string | null;
@@ -218,6 +225,11 @@ export function decideTriage(input: {
   for (const field of FORBIDDEN_TRIAGE_FIELDS) {
     if (Object.prototype.hasOwnProperty.call(params, field)) return refuse(`a triage write may not carry ${field}; it only adds labels, relations, priority and a comment`);
   }
+
+  // GitHub keys a pull request as `owner/repo#N`, the same shape as an issue,
+  // so a key that names a pull request is refused here before any write. The
+  // backlog steward manages issues, not pull requests (Stage 4 design).
+  if ((ticket.kind ?? "issue") !== "issue") return refuse(`${ticket.key} is a ${ticket.kind}; the backlog steward triages issues only`);
 
   // GitHub has no issue priority and no issue relations, so a plan that asks
   // for either is refused here, before any write reaches the source. It is a

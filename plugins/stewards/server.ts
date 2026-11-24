@@ -13302,6 +13302,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const ticket: TriageTicket = {
             key: entity.key,
             unit: entity.unit,
+            kind: entity.kind,
             labels: entity.labels,
             priority: entity.priority,
             state: entity.state,

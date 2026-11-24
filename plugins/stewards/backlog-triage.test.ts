@@ -275,6 +275,10 @@ describe("the GitHub triage path (BB-397)", () => {
     expect(reason(githubDecide({ ticket: githubTicket({ labels: ["bb-managed"], assignees: ["jane"] }) }))).toMatch(/adopted/u);
   });
 
+  it("refuses a pull request key, which is spelled owner/repo#N like an issue", () => {
+    expect(reason(githubDecide({ ticket: githubTicket({ kind: "pull" }) }))).toMatch(/issues only/u);
+  });
+
   it("keeps the comment budget and the one-open-question rule", () => {
     const question = entry({ kind: "comment", detail: { kind: "question" }, at: NOW - DAY });
     expect(reason(githubDecide({ params: githubParams({ comment: "Again?" }), ledger: [question] }))).toMatch(/budget/u);

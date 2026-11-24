@@ -13864,6 +13864,19 @@ Watch the repository's whole open backlog.`;
     expect((await adoption.t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bb-managed"] }, "thr_github_backlog")).text).toMatch(/adoption label/u);
     expect(adoption.t.linearWrites).toEqual([]);
   });
+
+  it("refuses a pull-request key, records the refusal and makes no write RPC", async () => {
+    const { t } = await triagingGithub();
+    // A pull request is keyed owner/repo#N like an issue; the backlog steward
+    // manages issues only.
+    t.entities.set("acme/web#7", pull());
+    const result = await t.tool("backlog_triage", { key: "acme/web#7", addLabels: ["bug"] }, "thr_github_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/issues only/u);
+    expect(t.linearWrites).toEqual([]);
+    expect(t.rpcCalls.filter((c) => c.method === "sourceUpdateIssue" || c.method === "sourceComment")).toEqual([]);
+    expect(t.hooks.store.backlogWrites("p1", { team: "acme/web" })).toEqual([expect.objectContaining({ outcome: "refused", kind: "triage", issueKey: "acme/web#7" })]);
+  });
 });
 
 describe("the backlog promotion write (BB-385)", () => {
