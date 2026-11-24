@@ -4,7 +4,7 @@
 // function that talks to the network takes its fetch as an argument, and no
 // token appears in anything this module returns or throws.
 import { z } from "zod";
-import { DEPENDABOT_SEVERITIES, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS, signedBy, type AdoptableEntity, type CompareStatus, type DependabotAlert, type DependabotSeverity, type EntitySnapshot, type SearchIssue, type WorkflowRunInfo } from "./source-contract.js";
+import { DEPENDABOT_SEVERITIES, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS, signedBy, type AdoptableEntity, type BacklogIssue, type CompareStatus, type DependabotAlert, type DependabotSeverity, type EntitySnapshot, type SearchIssue, type WorkflowRunInfo } from "./source-contract.js";
 
 export const GITHUB_URL = "https://github.com";
 export const GITHUB_API_URL = "https://api.github.com";
@@ -552,7 +552,11 @@ export function parseSnapshot(payload: unknown, relationsUnread = false): Entity
     const issue = { ...snapshot, state: node.state.toLowerCase() === "closed" ? target.state : statusLabel(target.labels) ?? "open", linkedPulls: linkedPullsOf(node) };
     // An unread relation is not read: leave parent and children as none, and
     // mark it so stewards keeps the binding's existing nesting (BB-244).
-    return relationsUnread ? { ...issue, relationsUnread: true } : { ...issue, ...relationsOf(node, read.repo) };
+    // A successfully-read GitHub issue carries `blockedBy: []`: GitHub has no
+    // dependency relation, so there can be none. An unread relation leaves it
+    // absent, so a caller that needs the fact still refuses rather than
+    // assumes (BB-396, BB-385).
+    return relationsUnread ? { ...issue, relationsUnread: true } : { ...issue, blockedBy: [], ...relationsOf(node, read.repo) };
   }
   const merged = node.merged === true;
   const draft = node.isDraft === true;
@@ -763,6 +767,87 @@ export function parseOpenIssues(payload: unknown): { viewer: string | null; enti
     }),
     next: page.pageInfo.hasNextPage ? (page.pageInfo.endCursor ?? null) : null,
   };
+}
+
+/**
+ * One page of a repository's whole open backlog (BB-396): every open issue,
+ * unlabelled and unassigned included, oldest created first. GitHub's `issues`
+ * connection excludes pull requests, so none are read; the parser also drops
+ * a node GitHub marks as a pull request, defensively.
+ */
+export const BACKLOG_ISSUES_QUERY = `query($owner: String!, $name: String!, $first: Int!, $after: String) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner
+  issues(states: OPEN, first: $first, after: $after, orderBy: { field: CREATED_AT, direction: ASC }) { pageInfo { hasNextPage endCursor }
+    nodes { __typename number title state stateReason createdAt updatedAt author ${ACTOR} labels(first: 50) { nodes { name } } assignees(first: 50) { nodes { login } } } } } }`;
+
+const backlogIssuesPayload = z.object({
+  data: z
+    .object({
+      viewer: actor,
+      repository: z
+        .object({
+          nameWithOwner: z.string(),
+          issues: z.object({
+            pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullish() }),
+            nodes: z.array(
+              z.object({
+                __typename: z.string().optional(),
+                number: z.number(),
+                title: z.string().nullish(),
+                state: z.string().nullish(),
+                stateReason: z.string().nullish(),
+                createdAt: z.string().nullish(),
+                updatedAt: z.string().nullish(),
+                author: actor,
+                labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(),
+                assignees: z.object({ nodes: z.array(z.object({ login: z.string() })) }).nullish(),
+              }),
+            ),
+          }),
+        })
+        .nullable(),
+    })
+    .nullable(),
+});
+
+/**
+ * One page as the contract's backlog issues, the state its one status label or
+ * `open`; null when the repository is not there or not visible. GitHub has no
+ * priority, estimate or state type, so those are null, never invented.
+ */
+export function parseBacklogIssues(payload: unknown): { issues: BacklogIssue[]; next: string | null } | null {
+  const errors = graphqlErrors(payload);
+  const parsed = backlogIssuesPayload.safeParse(payload);
+  if (!parsed.success) throw new Error(errors.length > 0 ? `GitHub: ${errors.join("; ")}` : "GitHub answered without data");
+  if (errors.length > 0 && errorTypes(payload).some((t) => t !== "NOT_FOUND")) throw new Error(`GitHub: ${errors.join("; ")}`);
+  const repository = parsed.data.data?.repository ?? null;
+  if (repository === null) return null;
+  const repo = repository.nameWithOwner;
+  const page = repository.issues;
+  const issues: BacklogIssue[] = [];
+  for (const n of page.nodes) {
+    // The `issues` connection excludes pull requests; drop one anyway when the
+    // read ever marks it as such, so a pull request never counts as backlog.
+    if (n.__typename !== undefined && n.__typename !== "Issue") continue;
+    const labels = (n.labels?.nodes ?? []).map((l) => l.name).sort();
+    // The query is open-only, so a closed issue should not appear; a read that
+    // returns one anyway carries its closed state, never a stale status label.
+    const closed = (n.state ?? "").toUpperCase() === "CLOSED";
+    issues.push({
+      id: `${repo}#${n.number}`,
+      key: `${repo}#${n.number}`,
+      title: n.title ?? null,
+      state: closed ? (n.stateReason ? `closed (${lower(n.stateReason)})` : "closed") : statusLabel(labels) ?? "open",
+      stateType: null,
+      unit: repo,
+      labels,
+      assignees: (n.assignees?.nodes ?? []).map((a) => a.login),
+      priority: null,
+      estimate: null,
+      createdAt: n.createdAt ?? null,
+      updatedAt: n.updatedAt ?? null,
+    });
+  }
+  return { issues, next: page.pageInfo.hasNextPage ? (page.pageInfo.endCursor ?? null) : null };
 }
 
 /** Issues matching a body term in one repository, closed included, for stewards' dedup. */
