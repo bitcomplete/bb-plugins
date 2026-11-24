@@ -225,8 +225,7 @@ describe("the GitHub promotion path (BB-398)", () => {
 
   it("reads the GitHub backlog state as an open issue with no status label", () => {
     expect(isBacklogState(githubIssue({ state: "open" }), "github")).toBe(true);
-    expect(isBacklogState(githubIssue({ state: "status:backlog" }), "github")).toBe(true);
-    expect(isBacklogState(githubIssue({ state: "open", labels: ["status:backlog"] }), "github")).toBe(true);
+    expect(isBacklogState(githubIssue({ state: "status:backlog" }), "github")).toBe(false);
     expect(isBacklogState(githubIssue({ state: "status:todo" }), "github")).toBe(false);
     expect(isBacklogState(githubIssue({ state: "status:in-progress" }), "github")).toBe(false);
     expect(isBacklogState(githubIssue({ state: "status:in-review" }), "github")).toBe(false);

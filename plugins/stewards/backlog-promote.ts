@@ -38,8 +38,6 @@ export const PROMOTE_GITHUB_STATE = "status:todo";
 /** The GitHub status labels the WIP ceiling counts: the playbook's todo and build phases. */
 export const PROMOTE_GITHUB_TODO_LABEL = "status:todo";
 export const PROMOTE_GITHUB_IN_PROGRESS_LABEL = "status:in-progress";
-/** The GitHub backlog state beyond the playbook's `open`: an issue carrying a `status:backlog` label. */
-export const PROMOTE_GITHUB_BACKLOG_LABEL = "status:backlog";
 
 /** The priority order the owner sets by hand; anything else (unset, unknown) ranks last. */
 const PRIORITY_RANK: Record<string, number> = { urgent: 0, high: 1, medium: 2, low: 3 };
@@ -129,15 +127,11 @@ export function isTodoOrInProgress(issue: BacklogPromoteIssue, source: Source = 
 
 /**
  * Whether an issue sits in the watched unit's Backlog state. On GitHub that is
- * the `open` state (an issue with no status label), the state the
- * `github-issues` playbook's `open` phase covers, or an issue carrying a
- * `status:backlog` label.
+ * the `open` state, an issue with no status label, which the `github-issues`
+ * playbook's `open` phase covers.
  */
 export function isBacklogState(issue: BacklogPromoteIssue, source: Source = "linear"): boolean {
-  if (source === "github") {
-    if (issue.state.trim().toLowerCase() === "open") return true;
-    return githubHasStatus(issue, [PROMOTE_GITHUB_BACKLOG_LABEL]);
-  }
+  if (source === "github") return issue.state.trim().toLowerCase() === "open";
   const type = (issue.stateType ?? "").trim().toLowerCase();
   if (type === "backlog") return true;
   return issue.state.trim().toLowerCase() === "backlog";
