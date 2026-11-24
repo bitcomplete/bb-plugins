@@ -4542,50 +4542,51 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       changes: Change[],
       grace: string[],
       wakes: string[],
-    ): Promise<void> {
+    ): Promise<boolean> {
       const pullRef = lc(pull.key);
       // Every reason not to fire clears the grace for this pull, so the one-look
       // wait is measured over a run of eligible looks, not one broken by a
-      // worker, a red check or a draft.
+      // worker, a red check or a draft. The boolean is the status line's input:
+      // true only while the whole eligibility holds.
       const clearGrace = (): void => {
         for (let i = grace.length - 1; i >= 0; i--) if (grace[i].startsWith(`${pullRef}#`)) grace.splice(i, 1);
       };
       if (g.missing !== "no reviewer round yet" || !g.checksGreen || pull.pull?.draft === true) {
         clearGrace();
-        return;
+        return false;
       }
       if (assessWorker(store.workers(b.id)).reason !== null) {
         clearGrace();
-        return;
+        return false;
       }
       const workerIds = store.workers(b.id).map((w) => w.threadId);
       if (workerIds.length > 0) {
         const descendants = await descendantsOfMany(workerIds);
-        if (descendants === null) return; // Unknown: neither fires nor consumes the grace.
+        if (descendants === null) return false; // Unknown: neither fires nor claims the status.
         if ([...descendants.values()].some((ids) => ids.length > 0)) {
           clearGrace();
-          return;
+          return false;
         }
         // A parentless reviewer (BB-323) is not a descendant; `reviewersOf`
         // finds it, and a failed listing is unknown, so neither fires.
         for (const id of workerIds) {
           const reviewers = await reviewersOf(id);
-          if (reviewers === null) return;
+          if (reviewers === null) return false;
           if (reviewers.length > 0) {
             clearGrace();
-            return;
+            return false;
           }
         }
       }
       const ref = `${pullRef}#${g.headSha ?? ""}`;
       if (wakes.some((x) => x === ref)) {
         clearGrace();
-        return;
+        return true;
       }
       if (!grace.includes(ref)) {
         clearGrace();
         grace.push(ref);
-        return;
+        return true;
       }
       const short = (g.headSha ?? "").slice(0, 7);
       changes.push({
@@ -4594,6 +4595,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       clearGrace();
       wakes.push(ref);
+      return true;
     }
 
     /**
@@ -5577,17 +5579,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     function decline(b: Binding, code: NonActionCode, detail: string | null = null): void {
       store.recordNonAction(b.id, code, detail, now());
-    }
-
-    /**
-     * BB-392: whether the binding's stored assessment says its only unmet gate
-     * piece is the reviewer round, so the Stewards page's status line names it
-     * instead of a plain wait. Reads the assessment the reconcile already
-     * stored; no GitHub call.
-     */
-    function reviewerRoundMissing(b: Binding): boolean {
-      const gate = store.assessment(b.id)?.gate as { missing?: string | null } | null | undefined;
-      return gate?.missing === "no reviewer round yet";
     }
 
     async function reconcileOnce(bindingId: string, force: WakeReason | null): Promise<void> {
@@ -9774,10 +9765,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const stackedOnMe: string[] = [];
       const recoveredPulls = [...b.stackedRecovered];
       const recoveredBefore = new Set(recoveredPulls.map((k) => lc(k)));
-      // BB-392: the missing-reviewer-round wake's one-look grace and its
-      // once-per-head record, read and written across this look's pulls.
+      // BB-392: the missing-reviewer-round wake's one-look grace, its
+      // once-per-head record and whether the look found the binding eligible
+      // for the status line, read and written across this look's pulls.
       const reviewerRoundGrace = [...b.reviewerRoundGrace];
       const reviewerRoundWakes = [...b.reviewerRoundWakes];
+      let reviewerRoundMissing = false;
       // BB-322: the gate for a pull request from the assessment this reconcile
       // just computed, so the approval sync reads the one assessment and never
       // falls back to its own `prGate`. A pull request the assessment does not
@@ -10058,7 +10051,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         } else {
           store.closeNeedByKey(b.id, "merge", url, `The gate is not met: ${g.missing ?? "unknown"}.`);
-          if (!foreignOwner) await maybeWakeMissingReviewerRound(b, pull, g, changes, reviewerRoundGrace, reviewerRoundWakes);
+          if (!foreignOwner && (await maybeWakeMissingReviewerRound(b, pull, g, changes, reviewerRoundGrace, reviewerRoundWakes))) reviewerRoundMissing = true;
           decline(b, "gate-not-met", pull.key);
         }
       }
@@ -10093,6 +10086,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (nextReviewerRoundWakes.length !== b.reviewerRoundWakes.length || nextReviewerRoundWakes.some((k, i) => k !== b.reviewerRoundWakes[i])) {
         b = store.patch(b.id, { reviewerRoundWakes: nextReviewerRoundWakes });
       }
+      if (b.reviewerRoundMissing !== reviewerRoundMissing) b = store.patch(b.id, { reviewerRoundMissing });
       if (approvalRaised) await wakeProject(b.projectId, `an owner-reviewed pull request from ${b.entityKey}`, { digestDue: false });
       // BB-231: a gate item filed this look may cover an open route-`user`
       // escalation or question; ask the project steward once, per new item.
@@ -11745,7 +11739,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
-              reviewerRoundMissing: reviewerRoundMissing(b),
+              reviewerRoundMissing: b.reviewerRoundMissing,
               wakeFailure: b.wakeFailure,
               priority: b.priority,
               ...presentationHold(b),
@@ -11886,7 +11880,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
-              reviewerRoundMissing: reviewerRoundMissing(b),
+              reviewerRoundMissing: b.reviewerRoundMissing,
               wakeFailure: b.wakeFailure,
               priority: b.priority,
               ...presentationHold(b),
@@ -12006,7 +12000,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               holdStack: b.holdStack,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
-              reviewerRoundMissing: reviewerRoundMissing(b),
+              reviewerRoundMissing: b.reviewerRoundMissing,
               wakeFailure: b.wakeFailure,
               needsUser: needsUser.has(b.id),
               stuck: stuck.has(b.id),

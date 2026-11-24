@@ -8254,11 +8254,35 @@ describe("needs you items", () => {
     });
 
     it("names the missing reviewer round in the status line, not a plain wait", async () => {
+      const sidebarFlag = async (t: Awaited<ReturnType<typeof withPull>>) => {
+        const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; reviewerRoundMissing?: boolean }> };
+        return sidebar.bindings.find((b) => b.key === "ENG-12")?.reviewerRoundMissing;
+      };
       const t = await withPull([]);
-      const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; reviewerRoundMissing?: boolean }> };
-      expect(sidebar.bindings.find((b) => b.key === "ENG-12")?.reviewerRoundMissing).toBe(true);
+      expect(await sidebarFlag(t)).toBe(true);
       const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; reviewerRoundMissing?: boolean }> } };
       expect(board.board.stewards.find((s) => s.key === "ENG-12")?.reviewerRoundMissing).toBe(true);
+      // Red checks are not the eligible state: the status flag is false.
+      t.entities.set("acme/web#7", pull({}, { checks: { state: "failure", failing: ["ci"] } }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(await sidebarFlag(t)).toBe(false);
+    });
+
+    it("does not name the missing reviewer round while a reviewer is live", async () => {
+      const t = await withPull([]);
+      const sidebarFlag = async () => {
+        const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; reviewerRoundMissing?: boolean }> };
+        return sidebar.bindings.find((b) => b.key === "ENG-12")?.reviewerRoundMissing;
+      };
+      expect(await sidebarFlag()).toBe(true);
+      const b = t.binding();
+      t.hooks.store.addWorker("thr_w1", b.id, "ENG-12: Implement");
+      t.hooks.store.setWorker("thr_w1", "finished", "Spawned the reviewer.");
+      await t.createdReviewer("thr_r1", "thr_w1", "Review round 1");
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(await sidebarFlag()).toBe(false);
     });
   });
 
