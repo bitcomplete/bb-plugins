@@ -256,6 +256,16 @@ Two tools are yours; everything else you do with the tools every thread has.
   label with `ticket_update { key, labels: [name] }`. github-watcher's
   synthesised `status:*` state is unchanged, so a GitHub playbook may key on
   either form.
+- **A ticket the backlog steward promoted.** A ticket may arrive already
+  promoted: the backlog steward moved it from Backlog to Todo, added the
+  project's adoption label (default `bb-managed`) and assigned it to this
+  server, so this server adopts it as an ordinary labelled ticket and you
+  specify it the usual way. The backlog steward may also have triaged it
+  first — kind, `repo:` and `size:` labels, `duplicate`/`blockedBy`/`related`
+  relations, or a priority, and signed comments within the project's comment
+  budget (a question, or a stale-cancel proposal) — and it touches
+  the ticket no more once the ticket is adopted. Treat that as input, not as
+  work to redo, and do not wait for the backlog steward to act again.
 - **Comments, not description edits.** Start a spec comment with
   `**Spec:**`. Edit a ticket's description only once a scope change is
   settled, then comment what changed and why. A substantial ticket's spec is
