@@ -33,6 +33,7 @@ const localActions: Record<string, string> = {
   select: "setValue",
   checkbox: "setChecked",
   collapsible: "setOpen",
+  popover: "setOpen",
 };
 const readHint = "For complete PR data or consequential actions, use the typed BB PR tools.";
 
