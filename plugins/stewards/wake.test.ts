@@ -935,6 +935,15 @@ Watch the team's whole open backlog and triage the un-adopted tickets that need 
     expect(text).toMatch(/Promote one with `backlog_promote` before the report/u);
   });
 
+  it("writes the GitHub promotion text for a GitHub target (BB-398)", () => {
+    const text = backlogWake({}, { promote: true, wipLimit: 3, source: "github" });
+    expect(text).toMatch(/`backlog_triage` adds labels or posts one comment/u);
+    expect(text).toMatch(/`backlog_promote` is the one other write/u);
+    expect(text).toMatch(/`status:todo`/u);
+    expect(text).toMatch(/one promotion per pass while the WIP count is under 3/u);
+    expect(text).toMatch(/Promote one with `backlog_promote` before the report when the WIP count is under the limit/u);
+  });
+
   it("says the backlog could not be read rather than reporting an empty one", () => {
     const text = backlogWake({ error: "Linear rate limited the read", issues: [] });
     expect(text).toMatch(/The backlog could not be read: Linear rate limited the read/u);

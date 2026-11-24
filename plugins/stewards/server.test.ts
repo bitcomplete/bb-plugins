@@ -13271,7 +13271,7 @@ Watch the repository's whole open backlog.`;
     expect(t.rpcCalls.filter((c) => c.pluginId === "linear" && c.method === "sourceBacklog")).toEqual([]);
   });
 
-  it("offers a GitHub backlog steward triage but not promotion, and refuses a GitHub promotion (BB-397)", async () => {
+  it("offers a GitHub backlog steward triage and promotion, reading the backlog through the github source (BB-397/BB-398)", async () => {
     const t = await setup();
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"], triage: true, promote: true } });
     t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"] } });
@@ -13284,16 +13284,18 @@ Watch the repository's whole open backlog.`;
     t.hooks.store.patch(binding.id, { threadId: "thr_github_backlog" });
     t.threads.set("thr_github_backlog", { status: "idle", archivedAt: null });
     const config = await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id: "thr_github_backlog", title: null, parentThreadId: null, sourceThreadId: null } }));
-    // Triage is offered with the flag on; promotion stays Linear-only.
-    expect(config.tools.map((x) => x.name)).toEqual(["backlog_triage", "ticket_read", "ticket_search", "steward_report", "steward_update"]);
+    // Both writes are offered with their flags on, and the prompt is source-aware.
+    expect(config.tools.map((x) => x.name)).toEqual(["backlog_triage", "backlog_promote", "ticket_read", "ticket_search", "steward_report", "steward_update"]);
     expect(config.instructions).toMatch(/`backlog_triage` adds labels or posts one comment/u);
-    expect(config.instructions).not.toMatch(/`backlog_promote` is your one promotion write/u);
-    // A direct promotion refuses before any read or write reaches either source.
+    expect(config.instructions).toMatch(/`backlog_promote` is your one promotion write/u);
+    expect(config.instructions).toMatch(/status:todo/u);
+    // A direct promotion reads the backlog through the github source, never linear.
     t.rpcCalls.length = 0;
     const promote = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(t.rpcCalls.some((c) => c.pluginId === "github-watcher" && c.method === "sourceBacklog")).toBe(true);
+    expect(t.rpcCalls.filter((c) => c.pluginId === "linear" && c.method === "sourceBacklog")).toEqual([]);
+    // No entity was registered, so the candidate read fails closed.
     expect(promote.error).toBe(true);
-    expect(promote.text).toMatch(/Linear-only/u);
-    expect(t.rpcCalls.filter((c) => c.method === "sourceUpdateIssue" || c.method === "sourceComment" || c.method === "sourceBacklog")).toEqual([]);
   });
 
   it("puts a GitHub backlog in the digest's one Backlog section (BB-396)", async () => {
@@ -14052,6 +14054,155 @@ describe("the backlog promotion write (BB-385)", () => {
     const project = t.spawns.find((s) => s.title === "Acme project steward")!.id;
     const digest = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
     expect(digest).toContain("- Promoted: BB-1");
+  });
+
+  it("makes no GitHub source call", async () => {
+    const { t } = await promoting({ promote: true });
+    const result = await t.tool("backlog_promote", {}, "thr_backlog");
+    expect(result.error).toBe(false);
+    expect(t.rpcCalls.filter((c) => c.pluginId === "github-watcher" && ["sourceBacklog", "sourceSnapshot", "sourceUpdateIssue"].includes(c.method))).toEqual([]);
+  });
+});
+
+describe("the GitHub backlog promotion write (BB-398)", () => {
+  const GITHUB_BACKLOG_WATCH = `---
+name: backlog
+kind: ops
+source: github
+may: []
+models:
+  steward: claude/claude-sonnet-5-5/medium
+requeue-default: 1d
+---
+
+Watch the repository's whole open backlog.`;
+
+  const githubBacklogIssue = (over: Record<string, unknown> = {}) => ({ id: "acme/web#1", key: "acme/web#1", title: "Fix login", state: "open", stateType: null, unit: "acme/web", labels: [], assignees: [], priority: null, estimate: null, createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z", ...over });
+
+  /** A GitHub backlog role and its steward thread, and the un-adopted issue the tool reads. */
+  async function promotingGithub(options: { promote?: boolean; block?: Record<string, unknown>; backlog?: Array<Record<string, unknown>>; tickets?: Array<{ key: string; over?: Partial<EntitySnapshot> }> } = {}) {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"], triage: true, promote: options.promote ?? true, ...(options.block ?? {}) } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[playbookPath("backlog")] = GITHUB_BACKLOG_WATCH;
+    t.setBacklog(options.backlog ?? [githubBacklogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/github/acme/web")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_github_backlog" });
+    t.threads.set("thr_github_backlog", { status: "idle", archivedAt: null });
+    for (const ticket of options.tickets ?? [{ key: "acme/web#1" }]) {
+      t.entities.set(ticket.key, githubIssue({ id: ticket.key, key: ticket.key, unit: "acme/web", state: "open", stateType: null, labels: [], assignees: [], priority: null, blockedBy: [], description: "Users cannot log in.", ...(ticket.over ?? {}) }));
+    }
+    return { t, binding };
+  }
+
+  const tools = async (t: Awaited<ReturnType<typeof setup>>, id: string) => (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id, title: null, parentThreadId: null, sourceThreadId: null } }))).tools.map((x) => x.name);
+
+  it("is offered only when backlog.promote is true, and absent writes nothing", async () => {
+    const readTools = ["backlog_triage", "ticket_read", "ticket_search", "steward_report", "steward_update"];
+    const off = await promotingGithub({ promote: false });
+    expect(await tools(off.t, "thr_github_backlog")).toEqual(readTools);
+    const refused = await off.t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(refused.error).toBe(true);
+    expect(off.t.linearWrites).toEqual([]);
+
+    const on = await promotingGithub({ promote: true });
+    expect(await tools(on.t, "thr_github_backlog")).toEqual(["backlog_triage", "backlog_promote", "ticket_read", "ticket_search", "steward_report", "steward_update"]);
+  });
+
+  it("promotes the top-ordered eligible open issue with exactly status:todo, the adoption label and this server's login, through the github source", async () => {
+    const { t } = await promotingGithub({ backlog: [githubBacklogIssue({ key: "acme/web#2", createdAt: "2026-10-09T00:00:00Z" }), githubBacklogIssue({ id: "acme/web#1", key: "acme/web#1", createdAt: "2026-10-01T00:00:00Z" })], tickets: [{ key: "acme/web#1" }, { key: "acme/web#2", over: { createdAt: "2026-10-09T00:00:00Z" } }] });
+    const result = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(result.error).toBe(false);
+    expect(result.text).toMatch(/Promoted acme\/web#1/u);
+    const write = t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!;
+    expect(write.input).toEqual({ key: "acme/web#1", state: "status:todo", addLabels: ["bb-managed"], assignee: "me" });
+    // The write goes through the github-watcher source, never linear.
+    expect(t.rpcCalls.some((c) => c.pluginId === "github-watcher" && c.method === "sourceUpdateIssue")).toBe(true);
+    expect(t.rpcCalls.filter((c) => c.pluginId === "linear" && ["sourceBacklog", "sourceSnapshot", "sourceUpdateIssue"].includes(c.method))).toEqual([]);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "acme/web" });
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ outcome: "accepted", kind: "promote", issueKey: "acme/web#1", detail: { state: "status:todo", addLabels: ["bb-managed"], assignee: "me" } });
+  });
+
+  it("refuses at the GitHub WIP limit, counting status labels and adopted open issues, and writes nothing", async () => {
+    const { t } = await promotingGithub({
+      block: { wipLimit: 2 },
+      backlog: [githubBacklogIssue({ id: "acme/web#1", key: "acme/web#1", state: "status:todo", labels: ["status:todo"] }), githubBacklogIssue({ id: "acme/web#2", key: "acme/web#2", state: "open", labels: ["bb-managed"], assignees: ["jane"] }), githubBacklogIssue({ id: "acme/web#3", key: "acme/web#3" })],
+      tickets: [{ key: "acme/web#3" }],
+    });
+    const result = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/WIP full/u);
+    expect(t.linearWrites).toEqual([]);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "acme/web" });
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({ outcome: "refused", kind: "promote", reason: "WIP full" });
+  });
+
+  it("fails closed when the issue read does not report blockers", async () => {
+    const { t } = await promotingGithub({ tickets: [{ key: "acme/web#1", over: { blockedBy: undefined } }] });
+    const result = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/did not report its blockers/u);
+    expect(t.linearWrites).toEqual([]);
+    expect(t.hooks.store.backlogWrites("p1", { team: "acme/web" })[0]).toMatchObject({ outcome: "refused", kind: "promote" });
+  });
+
+  it("never promotes an already-adopted issue and writes nothing", async () => {
+    const { t } = await promotingGithub({ backlog: [githubBacklogIssue({ state: "open", labels: ["bb-managed"], assignees: ["jane"] })] });
+    const result = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/no eligible candidate/u);
+    expect(t.linearWrites).toEqual([]);
+  });
+
+  it("fails closed when the backlog is unsupported, errored or truncated, or a candidate cannot be read", async () => {
+    const unsupported = await promotingGithub();
+    unsupported.t.setBacklogUnsupported(true);
+    const u = await unsupported.t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(u.error).toBe(true);
+    expect(u.text).toMatch(/the github source does not support sourceBacklog/u);
+    expect(unsupported.t.linearWrites).toEqual([]);
+
+    const errored = await promotingGithub();
+    errored.t.setBacklogError("GitHub rate limited the read");
+    const e = await errored.t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(e.error).toBe(true);
+    expect(e.text).toMatch(/could not be read/u);
+    expect(errored.t.linearWrites).toEqual([]);
+
+    const truncated = await promotingGithub();
+    truncated.t.setBacklogTruncated(true);
+    const result = await truncated.t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/truncated/u);
+    expect(truncated.t.linearWrites).toEqual([]);
+
+    const candidate = await promotingGithub();
+    candidate.t.setSnapshotError("acme/web#1", true);
+    const unreadable = await candidate.t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(unreadable.error).toBe(true);
+    expect(candidate.t.linearWrites).toEqual([]);
+  });
+
+  it("promotes at most one issue per pass, and re-reads backlog.promote on every call", async () => {
+    const { t } = await promotingGithub({ backlog: [githubBacklogIssue({ key: "acme/web#1" }), githubBacklogIssue({ id: "acme/web#2", key: "acme/web#2" })], tickets: [{ key: "acme/web#1" }, { key: "acme/web#2" }] });
+    const first = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(first.error).toBe(false);
+    const second = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(second.error).toBe(true);
+    expect(second.text).toMatch(/already promoted one ticket this pass/u);
+    expect(t.linearWrites.filter((w) => w.method === "sourceUpdateIssue")).toHaveLength(1);
+
+    // Turning the flag off refuses at once, before any read.
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"], triage: true, promote: false } });
+    t.hooks.forgetConfigs();
+    const off = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(off.error).toBe(true);
+    expect(off.text).toMatch(/promote is off/u);
   });
 });
 
