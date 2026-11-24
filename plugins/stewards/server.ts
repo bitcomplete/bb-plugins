@@ -3887,7 +3887,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b.kind !== "ticket") return { observed: { entity, pulls: [], at: now() }, complete: true };
       const keys = linkedPullKeys(entity);
       const pulls = await linkedPulls(entity, b.lastSnapshot);
-      return { observed: { entity, pulls, at: now() }, complete: pulls.length >= keys.length };
+      let complete = pulls.length >= keys.length;
+      // BB-394: a handed pull request is observed even when the ticket's
+      // timeline does not link it, exactly as the reconcile reads it (BB-386),
+      // so a need sync after a report sees an adopted pull without waiting for
+      // the next reconcile. A handed read that fails leaves the look
+      // incomplete, as a linked one does.
+      for (const h of store.pullHandoffsTo(b.id)) {
+        if (pulls.some((p) => lc(p.key) === lc(h.pullKey))) continue;
+        try {
+          const pull = await snapshot("github", h.pullKey);
+          if (pull !== null && pull.kind === "pull") pulls.push(pull);
+          else complete = false;
+        } catch (error) {
+          complete = false;
+          bb.log.warn(`stewards: could not read ${h.pullKey}, handed to ${b.entityKey}: ${errorMessage(error)}`);
+        }
+      }
+      return { observed: { entity, pulls, at: now() }, complete };
     }
 
     /**
@@ -9479,6 +9496,64 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-394: adopt an unobserved pull request to `b` when its steward
+     * explicitly files an `approve-pr` or `merge` need for it. The five guards
+     * are the adoption rule: a project repo, this server's author, no handoff
+     * to another binding, no other open binding owning it, and still open. A
+     * guard that fails returns the refusal to file instead of adopting; a
+     * successful adoption is the BB-386 handoff, so the lane, the gate and who
+     * approves are unchanged.
+     */
+    async function adoptUnobservedPull(
+      b: Binding,
+      kind: "approve-pr" | "merge",
+      url: string,
+      config: ProjectConfig | null,
+    ): Promise<{ pull: EntitySnapshot } | { refusal: string }> {
+      const forPull = `${kind} for ${url === "" ? "the pull request" : url} not filed:`;
+      const wayOut = "The project steward can move it with steward_update { binding, adoptPull }, or raise an escalation.";
+      // Only a ticket binding observes a handed pull request (reconcile and
+      // freshObserved both read `pullHandoffsTo` under `kind === "ticket"`), so
+      // a `pr`/`review` binding that adopted one would hold a handoff nothing
+      // ever reads and block the real ticket's claim on it.
+      if (b.kind !== "ticket") {
+        return { refusal: `${forPull} only a ticket binding adopts a pull request, and ${b.entityKey} is a ${b.kind} binding. ${wayOut}` };
+      }
+      const ref = parsePullRef(url);
+      if (config === null || ref === null) return { refusal: `${forPull} the pull request has not been observed yet. ${wayOut}` };
+      if (!config.repos.some((r) => lc(r) === lc(ref.repo))) {
+        return { refusal: `${forPull} ${ref.repo} is not in a project repo. ${wayOut}` };
+      }
+      const pullKey = `${ref.repo}#${ref.number}`;
+      const pull = await snapshot("github", pullKey).catch(() => null);
+      if (pull === null || pull.kind !== "pull") {
+        return { refusal: `${forPull} the pull request has not been observed yet. ${wayOut}` };
+      }
+      if (pull.pull === null || pull.pull.merged === true || lc(pull.state) === "closed" || lc(pull.state) === "merged") {
+        return { refusal: `${forPull} ${pullKey} is closed. ${wayOut}` };
+      }
+      const login = config.githubLogin;
+      if (login === null || pull.author === null || lc(pull.author) !== lc(login)) {
+        return { refusal: `${forPull} ${pullKey} was not authored by this server. ${wayOut}` };
+      }
+      const handoff = store.pullHandoff(pullKey);
+      if (handoff !== null && handoff.toBindingId !== b.id) {
+        const target = store.binding(handoff.toBindingId);
+        return { refusal: `${forPull} ${pullKey} is handed to ${target?.entityKey ?? handoff.toBindingId}. ${wayOut}` };
+      }
+      for (const other of store.open(b.projectId)) {
+        if (other.id === b.id) continue;
+        const own = other.lastSnapshot === null ? new Set<string>() : await ownPullKeys(other, store.workers(other.id), other.lastSnapshot);
+        if (pullBelongsToTicket(other, pull, own)) {
+          return { refusal: `${forPull} ${pullKey} is owned by ${other.entityKey}. ${wayOut}` };
+        }
+      }
+      store.handOffPull(pullKey, b.id, null);
+      scheduleReconcile(b.id);
+      return { pull };
+    }
+
+    /**
      * The schedule wake's pull request facts (BB-89): how many of a binding's
      * linked pull requests are open and how many merged, and whether its
      * steward has reported that no more are coming. Facts only; the wake draws
@@ -14042,6 +14117,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // guarded this way, and filing one the gate cannot hold would be
           // closed again by syncNeeds in this same call, silently.
           const refused: string[] = [];
+          // BB-394: a pull request this report self-adopted, named in the reply
+          // so the steward knows the move happened.
+          const adoptedNotes: string[] = [];
           let mergeFiled = false;
           // BB-253: the gate items this report files itself (`approve-spec`,
           // `approve-pr`, `merge`) are filed before `syncNeedsFresh` runs, so
@@ -14063,13 +14141,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (n.kind === "approve-pr" || n.kind === "merge") {
               const url = n.url ?? n.worker ?? b.url ?? "";
               const wanted = lc(url);
-              const pull = b.lastSnapshot === null ? undefined : observedPulls(b, b.lastSnapshot).find((p) => [p.url, p.key, p.id].some((v) => v !== null && lc(v) === wanted));
+              let pull = b.lastSnapshot === null ? undefined : observedPulls(b, b.lastSnapshot).find((p) => [p.url, p.key, p.id].some((v) => v !== null && lc(v) === wanted));
+              // BB-394: a steward's explicit filing for a pull request its
+              // binding does not observe adopts it through the BB-386 handoff
+              // when the guards hold, instead of refusing with a message that
+              // points at the review loop when the real cause is the missing
+              // timeline link. The guards are the adoption rule and the refusal
+              // names the one that failed.
+              if (pull === undefined) {
+                const adopted = await adoptUnobservedPull(b, n.kind, url, config);
+                if ("refusal" in adopted) {
+                  refused.push(adopted.refusal);
+                  continue;
+                }
+                pull = adopted.pull;
+                adoptedNotes.push(`${adopted.pull.key} was not observed and is now ${b.entityKey}'s.`);
+              }
               // The decide list places the pull request, so a steward cannot
               // file the user's item for the project steward's lane (BB-51).
-              const gate = pull === undefined ? null : assessedGate(store, b, pull, now(), config?.file.bigDecisions ?? []);
-              const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
+              const gate = assessedGate(store, b, pull, now(), config?.file.bigDecisions ?? []);
+              const holdable = n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet;
               if (!holdable) {
-                refused.push(`${n.kind} for ${url === "" ? "the pull request" : url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
+                refused.push(`${n.kind} for ${url === "" ? "the pull request" : url} not filed: ${gate.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
                 continue;
               }
             }
@@ -14096,6 +14189,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // resolve. A steward that wants a worker to keep going wakes it
           // instead of filing the item.
           if (mergeFiled) await stopWorkers(b);
+          const adoptedNote = adoptedNotes.length === 0 ? "" : ` ${adoptedNotes.join(" ")}`;
           const refusalNote = refused.length === 0 ? "" : ` ${refused.join(" ")}`;
           if (playbook !== null && b.lastSnapshot !== null) await syncNeedsFresh(b, playbook);
           // BB-349: a report whose actor is `user` no longer auto-files a
@@ -14114,7 +14208,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             actor === "user" && !hasUserItem
               ? " You named the user as the next actor but filed nothing for them. Naming the user is not itself an item: file a real one (approve-pr, merge, approve-spec) or raise an escalation, and it appears on the Stewards page."
               : "";
-          const filingNote = `${refusalNote}${userNote}`;
+          const filingNote = `${adoptedNote}${refusalNote}${userNote}`;
           // BB-154: the mark and the requeue-only run, over the report's final
           // set of sources (an escalation this turn raised, a need it filed, a
           // gate item syncNeeds filed, a worker it started).

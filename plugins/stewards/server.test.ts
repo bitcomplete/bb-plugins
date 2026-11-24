@@ -2640,6 +2640,120 @@ describe("a binding never ends with open work (BB-386)", () => {
     expect(adopted.text).toMatch(/not opened by this server's GitHub login/u);
   });
 
+  /** ENG-12 open, and acme/web#7 open, server-authored and linked to no ticket (BB-394). */
+  async function unlinkedPullWorld(over: Partial<EntitySnapshot> = {}, pullOver: Partial<NonNullable<EntitySnapshot["pull"]>> = {}) {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    t.entities.set(
+      "acme/web#7",
+      pull(
+        { id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane", ...over },
+        { head: "bb/eng-12-retry", base: "release", checks: { state: "success", failing: [] }, ...pullOver },
+      ),
+    );
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    return { ...t, b, url: "https://github.com/acme/web/pull/7" };
+  }
+
+  const approvedNoReview = [comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" })];
+
+  it("self-adopts an unobserved pull request when its steward files merge for it (BB-394)", async () => {
+    const t = await unlinkedPullWorld({ comments: approvedNoReview });
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Merging.", nextAction: "Wait", actor: "steward", needs: [{ kind: "merge", url: t.url, what: "Merge acme/web#7" }] }, t.b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toMatchObject({ toBindingId: t.b.id });
+    expect(t.hooks.store.openNeeds(t.b.id).some((n) => n.kind === "merge" && n.url === t.url)).toBe(true);
+    expect(report.text).toMatch(/acme\/web#7 was not observed and is now ENG-12's/u);
+  });
+
+  it("self-adopts an unobserved pull request when its steward files approve-pr for it (BB-394)", async () => {
+    const t = await unlinkedPullWorld({ comments: [comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" })] });
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Asking for approval.", nextAction: "Wait", actor: "steward", needs: [{ kind: "approve-pr", url: t.url, what: "Approve acme/web#7 on GitHub" }] }, t.b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toMatchObject({ toBindingId: t.b.id });
+    expect(t.hooks.store.openNeeds(t.b.id).some((n) => n.kind === "approve-pr" && n.url === t.url)).toBe(true);
+  });
+
+  it("adopts an unobserved pull request but keeps the review-loop refusal when the gate has no approving marker (BB-394)", async () => {
+    const t = await unlinkedPullWorld();
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Asking for approval.", nextAction: "Wait", actor: "steward", needs: [{ kind: "approve-pr", url: t.url, what: "Approve acme/web#7 on GitHub" }] }, t.b.threadId!);
+    expect(report.error).toBe(false);
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toMatchObject({ toBindingId: t.b.id });
+    expect(report.text).toMatch(/no reviewer round yet/u);
+    expect(report.text).toMatch(/worker must run the build-tickets review loop first/u);
+    expect(report.text).not.toMatch(/not in a project repo|was not authored by this server|is owned by|is handed to|is closed/u);
+  });
+
+  it("refuses to self-adopt a pull request outside a project repo, naming the guard (BB-394)", async () => {
+    const t = await unlinkedPullWorld();
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Merging.", nextAction: "Wait", actor: "steward", needs: [{ kind: "merge", url: "https://github.com/other/repo/pull/9", what: "Merge other/repo#9" }] }, t.b.threadId!);
+    expect(report.error).toBe(false);
+    expect(report.text).toMatch(/other\/repo is not in a project repo/u);
+    expect(report.text).toMatch(/steward_update \{ binding, adoptPull \}/u);
+    expect(report.text).not.toMatch(/build-tickets review loop/u);
+    expect(t.hooks.store.pullHandoff("other/repo#9")).toBeNull();
+  });
+
+  it("refuses to self-adopt a pull request this server did not author, naming the guard (BB-394)", async () => {
+    const t = await unlinkedPullWorld({ author: "sam", comments: approvedNoReview });
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Merging.", nextAction: "Wait", actor: "steward", needs: [{ kind: "merge", url: t.url, what: "Merge acme/web#7" }] }, t.b.threadId!);
+    expect(report.error).toBe(false);
+    expect(report.text).toMatch(/was not authored by this server/u);
+    expect(report.text).toMatch(/steward_update \{ binding, adoptPull \}/u);
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toBeNull();
+  });
+
+  it("refuses to self-adopt a pull request another open binding owns, naming the guard (BB-394)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Progress", stateType: "started" }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane" }, { head: "bb/eng-13-retry", base: "release", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const b = t.hooks.store.find("ENG-12")!;
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Merging.", nextAction: "Wait", actor: "steward", needs: [{ kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7" }] }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(report.text).toMatch(/is owned by ENG-13/u);
+    expect(report.text).toMatch(/steward_update \{ binding, adoptPull \}/u);
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toBeNull();
+  });
+
+  it("refuses to self-adopt a pull request handed to another binding, naming the guard (BB-394)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Progress", stateType: "started" }));
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login", author: "jane" }, { head: "bb/eng-13-retry", base: "release", checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const b12 = t.hooks.store.find("ENG-12")!;
+    const b13 = t.hooks.store.find("ENG-13")!;
+    t.hooks.store.handOffPull("acme/web#7", b13.id, null);
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Merging.", nextAction: "Wait", actor: "steward", needs: [{ kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7" }] }, b12.threadId!);
+    expect(report.error).toBe(false);
+    expect(report.text).toMatch(/is handed to ENG-13/u);
+    expect(report.text).toMatch(/steward_update \{ binding, adoptPull \}/u);
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toMatchObject({ toBindingId: b13.id });
+  });
+
+  it("refuses to self-adopt a closed pull request, naming the guard (BB-394)", async () => {
+    const t = await unlinkedPullWorld({ state: "closed" });
+    const report = await t.tool("steward_report", { phase: "In Progress", summary: "Merging.", nextAction: "Wait", actor: "steward", needs: [{ kind: "merge", url: t.url, what: "Merge acme/web#7" }] }, t.b.threadId!);
+    expect(report.error).toBe(false);
+    expect(report.text).toMatch(/is closed/u);
+    expect(report.text).toMatch(/steward_update \{ binding, adoptPull \}/u);
+    expect(t.hooks.store.pullHandoff("acme/web#7")).toBeNull();
+  });
+
+  it("sees a handed pull request in the need sync without waiting for a reconcile (BB-394 freshObserved)", async () => {
+    const t = await handoffWorld();
+    const handed = await t.tool("steward_report", { phase: "In Progress", summary: "Handing off.", nextAction: "Wait", actor: "steward", handOff: { pull: "acme/web#7", to: "ENG-13" } }, t.a.threadId!);
+    expect(handed.error).toBe(false);
+    // No ring of uuid-13: only freshObserved, the report's need sync, can see #7.
+    await t.tool("steward_report", { phase: "In Progress", summary: "Continuing.", nextAction: "Wait", actor: "steward" }, t.b.threadId!);
+    expect(t.hooks.store.openNeeds(t.b.id).some((n) => n.kind === "merge" && n.url === t.url)).toBe(true);
+  });
+
   it("does not re-home a teammate's pull request that merely names the ticket", async () => {
     const t = await setup();
     const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
@@ -3989,6 +4103,24 @@ describe("role-owned pull watches (BB-164)", () => {
     const list = await t.harness.behavior.runCli(["list", "--project", "p1"]);
     expect(list.stdout).toMatch(/adopted by sync-prs@acme\/web/);
     expect(list.stdout).toMatch(/role ops/);
+  });
+
+  it("refuses to self-adopt a pull request from a non-ticket binding, naming the guard (BB-394)", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roleWithWatch(watch);
+    t.files[playbookPath("sync-prs")] = SYNC_PRS;
+    t.entities.set("acme/web#7", syncPr());
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("pr");
+    // A second, unlinked server-authored PR with an approving marker: a ticket
+    // binding would adopt it, but a `pr` binding never observes a handed pull.
+    t.entities.set("acme/web#8", syncPr({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", comments: [comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" })] }, { head: "update-acme-prod-yaml-2", checks: { state: "success", failing: [] } }));
+    const report = await t.tool("steward_report", { phase: "open", summary: "Merging.", nextAction: "Wait", actor: "steward", needs: [{ kind: "merge", url: "https://github.com/acme/web/pull/8", what: "Merge acme/web#8" }] }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(report.text).toMatch(/only a ticket binding adopts a pull request/u);
+    expect(report.text).toMatch(/steward_update \{ binding, adoptPull \}/u);
+    expect(t.hooks.store.pullHandoff("acme/web#8")).toBeNull();
   });
 
   it("adopts a title/branch watch from the sweep's permissive list, not only from a doorbell", async () => {
@@ -14093,6 +14225,20 @@ describe("deployment watching (BB-53)", () => {
     expect(prompt).toMatch(/### Deployment \(acme\/web production\)/u);
     expect(prompt).toMatch(/The pinned PLUGIN_REF contains the merge commit\./u);
     expect(prompt).toMatch(/Awaiting deployment: acme\/web#7/u);
+  });
+
+  it("records a deployment watch for an adopted (handed) merged pull request like a linked one (BB-394)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = deploymentPlaybook();
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress" }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    // Not linked and not handed yet: the merge is unobserved, so no watch.
+    expect(b.deployments["acme/web#7"]).toBeUndefined();
+    t.hooks.store.handOffPull("acme/web#7", b.id, null);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", repo: "acme/web", environment: "production" });
   });
 
   // BB-260: a merge whose matching rule is live-at-merge is recorded
