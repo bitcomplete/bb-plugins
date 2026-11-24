@@ -4105,6 +4105,24 @@ describe("role-owned pull watches (BB-164)", () => {
     expect(list.stdout).toMatch(/role ops/);
   });
 
+  it("refuses to self-adopt a pull request from a non-ticket binding, naming the guard (BB-394)", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roleWithWatch(watch);
+    t.files[playbookPath("sync-prs")] = SYNC_PRS;
+    t.entities.set("acme/web#7", syncPr());
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("pr");
+    // A second, unlinked server-authored PR with an approving marker: a ticket
+    // binding would adopt it, but a `pr` binding never observes a handed pull.
+    t.entities.set("acme/web#8", syncPr({ id: "acme/web#8", key: "acme/web#8", url: "https://github.com/acme/web/pull/8", comments: [comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" })] }, { head: "update-acme-prod-yaml-2", checks: { state: "success", failing: [] } }));
+    const report = await t.tool("steward_report", { phase: "open", summary: "Merging.", nextAction: "Wait", actor: "steward", needs: [{ kind: "merge", url: "https://github.com/acme/web/pull/8", what: "Merge acme/web#8" }] }, b.threadId!);
+    expect(report.error).toBe(false);
+    expect(report.text).toMatch(/only a ticket binding adopts a pull request/u);
+    expect(report.text).toMatch(/steward_update \{ binding, adoptPull \}/u);
+    expect(t.hooks.store.pullHandoff("acme/web#8")).toBeNull();
+  });
+
   it("adopts a title/branch watch from the sweep's permissive list, not only from a doorbell", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[ROLES_FILE] = roleWithWatch(watch);

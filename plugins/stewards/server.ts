@@ -9512,6 +9512,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     ): Promise<{ pull: EntitySnapshot } | { refusal: string }> {
       const forPull = `${kind} for ${url === "" ? "the pull request" : url} not filed:`;
       const wayOut = "The project steward can move it with steward_update { binding, adoptPull }, or raise an escalation.";
+      // Only a ticket binding observes a handed pull request (reconcile and
+      // freshObserved both read `pullHandoffsTo` under `kind === "ticket"`), so
+      // a `pr`/`review` binding that adopted one would hold a handoff nothing
+      // ever reads and block the real ticket's claim on it.
+      if (b.kind !== "ticket") {
+        return { refusal: `${forPull} only a ticket binding adopts a pull request, and ${b.entityKey} is a ${b.kind} binding. ${wayOut}` };
+      }
       const ref = parsePullRef(url);
       if (config === null || ref === null) return { refusal: `${forPull} the pull request has not been observed yet. ${wayOut}` };
       if (!config.repos.some((r) => lc(r) === lc(ref.repo))) {
