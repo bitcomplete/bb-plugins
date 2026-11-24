@@ -5,7 +5,7 @@
 // through the source contract. Keeping the limits here is the point: the
 // playbook says them, but the plugin enforces them.
 import { z } from "zod";
-import { signedBy, type SnapshotComment } from "./source-contract.js";
+import { signedBy, type SnapshotComment, type Source } from "./source-contract.js";
 
 /** The kind labels a triage write may add, exactly. */
 export const BACKLOG_TRIAGE_KINDS = ["bug", "feature", "chore"] as const;
@@ -111,8 +111,15 @@ export type TriageTicket = {
 /** The project's backlog limits and the fixed labels no write may touch. */
 export type TriageConfig = {
   triage: boolean;
-  /** The team the binding watches. */
+  /** The unit the binding watches: a Linear team key, or a GitHub `owner/repo`. */
   team: string;
+  /**
+   * The backlog source the target reads and writes through (BB-397). Optional
+   * and defaulting to `linear`, so the Linear call sites and tests are
+   * unchanged. GitHub has no issue priority and no issue relations, so a plan
+   * that asks for either is refused before any write.
+   */
+  source?: Source;
   commentsPerWeek: number;
   staleDays: number;
   /** The project's adoption label (project.label). */
@@ -212,10 +219,26 @@ export function decideTriage(input: {
     if (Object.prototype.hasOwnProperty.call(params, field)) return refuse(`a triage write may not carry ${field}; it only adds labels, relations, priority and a comment`);
   }
 
-  // The binding watches one team: a ticket in another team is never touched,
-  // even when it is visible to the same Linear user.
+  // GitHub has no issue priority and no issue relations, so a plan that asks
+  // for either is refused here, before any write reaches the source. It is a
+  // refusal, not a silent drop: the caller records it in the ledger.
+  const source = config.source ?? "linear";
+  if (source !== "linear") {
+    if (params.priority !== undefined) return refuse(`${ticket.key} is on a GitHub backlog; GitHub issues have no priority, so the priority write is refused`);
+    if ((params.relations ?? []).length > 0) return refuse(`${ticket.key} is on a GitHub backlog; GitHub issues have no relations, so the relation write is refused`);
+  }
+
+  // The binding watches one unit: a ticket in another team or repository is
+  // never touched, even when it is visible to the same user. The comparison is
+  // case-insensitive for both a Linear team key and a GitHub owner/repo.
   if (ticket.unit.trim().toUpperCase() !== config.team.trim().toUpperCase()) {
     return refuse(`${ticket.key} is in ${ticket.unit}, not the watched team ${config.team}`);
+  }
+
+  // GitHub has no state type, so a closed issue is caught by its state rather
+  // than Linear's completed/canceled types. A closed issue is never triaged.
+  if (source === "github" && ticket.state.trim().toLowerCase().startsWith("closed")) {
+    return refuse(`${ticket.key} is ${ticket.state}; only open issues are triaged`);
   }
 
   // The target must be un-adopted: nothing bound, nothing in an adopted state,
