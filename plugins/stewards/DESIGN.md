@@ -470,7 +470,8 @@ Plugin code. No model turn.
    says. BB-389: a parked finish stays a quiet note even when the steward's
    own `waitingOn` or typed `worker` wait named the worker — the park is not
    over, so there is no hand-off prompt; the steward is woken by the worker's
-   resume or by the pull request changing. And a
+   resume or by the pull request changing, and a binding following through
+   still hears the worker as before. And a
    terminal state the steward's own last report already named ends the
    binding from the mechanical tier, with the wrap-up written from that
    report and no wrap-up wake; a terminal state someone else set still wakes.

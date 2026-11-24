@@ -10538,10 +10538,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // the owner or a build is a quiet note. Only a question, a gone thread
         // or a lost hand-off makes the turn due; a failed turn comes through
         // thread.failed and wakes on its own. A binding following through is
-        // waiting on this worker's result, so its finish is news — unless the
-        // worker parked, which is the quiet note above. BB-329: a final message
-        // that merely says "error" is a plain finish.
-        const needsSteward = finished !== null && (workerQuestion(result) !== null || (!parked && followingThrough(finished)) || handOff);
+        // waiting on this worker's result, so its finish is news — and that is
+        // unchanged by a park, which only drops the loud hand-off wording.
+        // BB-329: a final message that merely says "error" is a plain finish.
+        const needsSteward = finished !== null && (workerQuestion(result) !== null || followingThrough(finished) || handOff);
         if (finished !== null && finished.endedAt === null) store.note(finished.id, workerFinishNote(worker.title, result, handOff, worker.parkedWaitingOn), !needsSteward);
         await closeRequesterNeed(thread.id);
         // Its turn is over: the reviewers it read (or started and then waited

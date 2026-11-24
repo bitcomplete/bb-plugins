@@ -2304,6 +2304,24 @@ describe("terminal states and follow-through", () => {
     expect(t.archives()).toEqual(["thr_w1", t.steward]);
   });
 
+  it("still wakes a follow-through binding when its worker parks, with the quiet park note (BB-389)", async () => {
+    const t = await working();
+    await t.done();
+    await t.report({ followThrough: "thr_w1 is watching the deploy." });
+    await t.idle(t.steward);
+    const before = t.sends.length;
+    await t.tool("worker_park", { waitingOn: "the deploy" }, "thr_w1");
+    await t.idle("thr_w1", "Deploy 1206 is rolling out; waiting on it.");
+    // Follow-through is its own reason to wake, so the park only drops the
+    // hand-off wording: the note says the worker parked and does not tell the
+    // steward not to re-wait.
+    expect(t.sends).toHaveLength(before + 1);
+    const wake = t.sends.at(-1)!;
+    expect(wake.threadId).toBe(t.steward);
+    expect(wake.text).toMatch(/It parked, waiting on the deploy/u);
+    expect(wake.text).not.toMatch(/Do not re-wait on this worker/u);
+  });
+
   it("ends a follow-through that runs out, stopping its workers and telling the project steward", async () => {
     const t = await working();
     await t.done();
