@@ -192,7 +192,7 @@ describe("the worker-busy predicates: workerInFlight vs runningWorkerReason", ()
 // ---------------------------------------------------------------------------
 
 describe("the liveness and stuck predicates", () => {
-  const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
+  const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, parkedWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
   it("pins hasLiveWakeSource: every tracked source, and a free-text wait is not one", () => {
     expect(hasLiveWakeSource(noSources)).toBe(false);

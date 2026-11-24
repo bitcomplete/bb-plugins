@@ -63,6 +63,8 @@ export interface SidebarWorker {
   title: string;
   /** The plugin's own worker status, so the running count is of running workers. */
   status: string;
+  /** The worker's `worker_park` note, or null; a parked worker is not a lost hand-off (BB-389). */
+  parkedWaitingOn: string | null;
 }
 
 export interface SidebarEnded {
@@ -288,7 +290,7 @@ export interface EffortStatus {
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
   wakeFailure?: string | null;
   /** The binding's workers, so a wait on a finished one reads as a lost hand-off (BB-152). */
-  workers?: readonly { threadId: string; title: string; status: string }[];
+  workers?: readonly { threadId: string; title: string; status: string; parkedWaitingOn?: string | null }[];
 }
 
 /** Whether a worker or reviewer thread is running: the binding is in flight, not quiet. */
@@ -415,10 +417,13 @@ export function reportWaitsOnWorker(waitingOn: string | null, wait: Wait | null 
  */
 export function waitingOnNamesFinishedWorker(
   waitingOn: string | null,
-  workers: readonly { threadId: string; title: string; status: string }[],
+  workers: readonly { threadId: string; title: string; status: string; parkedWaitingOn?: string | null }[],
   wait: Wait | null | undefined = null,
 ): boolean {
-  return workers.some((w) => w.status !== "running" && reportWaitsOnWorker(waitingOn, wait, w));
+  // BB-389: a parked worker is not over. Its park says the wait continues, so
+  // it is not a lost hand-off; a plainly finished, failed or stopped worker
+  // still is (BB-152).
+  return workers.some((w) => w.status !== "running" && (w.parkedWaitingOn ?? null) === null && reportWaitsOnWorker(waitingOn, wait, w));
 }
 
 /**

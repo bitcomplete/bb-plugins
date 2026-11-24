@@ -525,7 +525,7 @@ function noWakeSourceLines(binding: Binding): string[] {
   const lines = [
     "**Waiting with no wake source.** Nothing the plugin tracks will deliver this wait" +
       (wait === null ? "" : ` (${JSON.stringify(wait)})`) +
-      ": no hold behind anything, no merge hold, no deployment watch in merged/deploying, no running worker, no open escalation or need, and no pull-request watch. Name what will — a binding to hold behind, a pull request, a deployment target, a worker — or, if nothing can, the condition is your own to re-examine.",
+      ": no hold behind anything, no merge hold, no deployment watch in merged/deploying, no running or parked worker, no open escalation or need, and no pull-request watch. Name what will — a binding to hold behind, a pull request, a deployment target, a worker — or, if nothing can, the condition is your own to re-examine.",
   ];
   const failed = Object.values(binding.deployments)
     .filter((w) => w.state === "failed")
@@ -549,7 +549,7 @@ export function noWakeSourceReportSentence(waitingOn: string | null, openKeys: r
     .map((key) => `${key} is an open binding in this project; hold behind it with \`steward_update { hold, behind: [${JSON.stringify(key)}] }\` so its finish wakes you.`)
     .join(" ");
   return (
-    `Nothing the plugin tracks will deliver this wait${wait}: no hold behind anything, no merge hold, no deployment watch in merged/deploying, no running worker, no open escalation or need, and no pull-request watch. ` +
+    `Nothing the plugin tracks will deliver this wait${wait}: no hold behind anything, no merge hold, no deployment watch in merged/deploying, no running or parked worker, no open escalation or need, and no pull-request watch. ` +
     "Name what will in this turn — a binding to hold behind (`steward_update { hold, behind }`), a typed `wait` (`binding`, `pull`, `review`, `deployment`, `worker`, `person`), or a dated `until` — before ending the turn." +
     (named === "" ? "" : ` ${named}`)
   );

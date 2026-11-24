@@ -2304,6 +2304,24 @@ describe("terminal states and follow-through", () => {
     expect(t.archives()).toEqual(["thr_w1", t.steward]);
   });
 
+  it("still wakes a follow-through binding when its worker parks, with the quiet park note (BB-389)", async () => {
+    const t = await working();
+    await t.done();
+    await t.report({ followThrough: "thr_w1 is watching the deploy." });
+    await t.idle(t.steward);
+    const before = t.sends.length;
+    await t.tool("worker_park", { waitingOn: "the deploy" }, "thr_w1");
+    await t.idle("thr_w1", "Deploy 1206 is rolling out; waiting on it.");
+    // Follow-through is its own reason to wake, so the park only drops the
+    // hand-off wording: the note says the worker parked and does not tell the
+    // steward not to re-wait.
+    expect(t.sends).toHaveLength(before + 1);
+    const wake = t.sends.at(-1)!;
+    expect(wake.threadId).toBe(t.steward);
+    expect(wake.text).toMatch(/It parked, waiting on the deploy/u);
+    expect(wake.text).not.toMatch(/Do not re-wait on this worker/u);
+  });
+
   it("ends a follow-through that runs out, stopping its workers and telling the project steward", async () => {
     const t = await working();
     await t.done();
@@ -14866,6 +14884,29 @@ describe("a steward idle in an active stage (BB-83)", () => {
     expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
   });
 
+  it("keeps a parked finish quiet even when the steward was waiting on the worker (BB-389)", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // The steward is waiting on this worker, which parks on CI.
+    await t.tool("steward_report", { phase: "In Progress", summary: "Worker on CI.", nextAction: "Wait for CI", actor: "other", waitingOn: "worker thr_w1 (CI)" }, steward);
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.tool("worker_park", { waitingOn: "CI on acme/web#7" }, "thr_w1");
+    const before = t.sends.length;
+    await t.idle("thr_w1", "Pushed; waiting on CI.");
+    // BB-389: the park is a quiet note, never the loud hand-off prompt, and no
+    // turn starts. The steward is woken by the resume or the PR changing.
+    expect(t.sends).toHaveLength(before);
+    const pending = t.hooks.store.open("p1")[0]!.pending;
+    expect(pending).toMatchObject([{ quiet: true }]);
+    expect(pending[0]!.text).toBe('Worker "ENG-12: Implement" finished its turn. It parked, waiting on CI on acme/web#7. Its final message: Pushed; waiting on CI.');
+    expect(pending[0]!.text).not.toMatch(/while you were waiting on it/u);
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ status: "finished", parkedWaitingOn: "CI on acme/web#7" });
+  });
+
   it("wakes once after the grace, and not again after the steward reports", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
@@ -16501,9 +16542,9 @@ describe("a typed wait (BB-333)", () => {
   // BB-266: a ticket with a gate-met own pull, a parked `finished` worker and a
   // second open own pull, waiting on the plugin auto-merge. The typed ref is
   // the own gate-met pull, so it is recorded as external (reference_is_self).
-  // BB-333 PR 3: the stored flag is now the derived stall, so the external wait
-  // stalls despite the second open own pull.
-  it("pins the BB-266 fixture: the external wait stalls despite the second open own pull", async () => {
+  // BB-389: the parked worker and the second open own pull are live sources, so
+  // the non-live external wait does not stall.
+  it("pins the BB-266 fixture: the external wait does not stall beside the parked worker and open pull", async () => {
     const t = await setup();
     t.entities.set(
       "uuid-12",
@@ -16527,9 +16568,10 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "the plugin auto-merge", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "acme/web#7" });
-    // BB-375: only a reconcile writes the column now.
+    // BB-375: only a reconcile writes the column now. BB-389: the parked worker
+    // and the second open own pull are live, so the column stays false.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
   });
 
   // bb-plugins#294: a `pr` binding's own open pull with a free-text wait. The
@@ -16551,9 +16593,9 @@ describe("a typed wait (BB-333)", () => {
 
   // prod#422 / BCP-157: a ticket waiting on the owner's approval, with no
   // open approve-pr item, beside an open linked pull. The person ref is not an
-  // open page item, so it is recorded as external. BB-333 PR 3: the stored flag
-  // is now the derived stall, so the external wait stalls despite the open pull.
-  it("pins the prod#422/BCP-157 fixture: the external wait stalls despite the open pull watch", async () => {
+  // open page item, so it is recorded as external. BB-389: the open pull watch
+  // is live, so the non-live external wait does not stall.
+  it("pins the prod#422/BCP-157 fixture: the external wait does not stall beside the open pull watch", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }));
@@ -16564,9 +16606,10 @@ describe("a typed wait (BB-333)", () => {
     const report = await t.tool("steward_report", { ...base, waitingOn: "GitHub approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
     expect(report.error).toBe(false);
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "external", ref: "need_approve" });
-    // BB-375: only a reconcile writes the column now.
+    // BB-375: only a reconcile writes the column now. BB-389: the open pull
+    // watch is live, so the column stays false.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
   });
 
   // prod#430 / BCP-160: a ticket waiting on a foreign pull's checks, not
@@ -16601,7 +16644,7 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     return { t, steward: t.spawns[1]!.id, b: t.hooks.store.find("ENG-12")! };
   }
 
-  it("derives the BB-266 fixture: the external wait stalls despite the second open own pull", async () => {
+  it("derives the BB-266 fixture: the external wait does not stall beside the parked worker and open pull", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }, { key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }] }));
     t.entities.set("acme/web#7", pull({ comments: [noReview] }, { checks: { state: "success", failing: [] } }));
@@ -16613,9 +16656,10 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     const b = t.hooks.store.find("ENG-12")!;
     await t.tool("steward_report", { ...base, waitingOn: "the plugin auto-merge", wait: { kind: "pull", ref: "acme/web#7" } }, b.threadId!);
     await t.hooks.reconcilePass("p1");
-    // BB-333 PR 3: the stored flag is the derived stall, so it now agrees.
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
-    expect(derived(t, b.id)).toMatchObject({ stalled: true, waitLive: false });
+    // BB-389: the parked worker and the second open own pull are live, so the
+    // stored flag and the derived stall agree on false.
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(derived(t, b.id)).toMatchObject({ stalled: false, waitLive: false });
     // The shadow's divergence table stopped being written: the flag and the
     // derivation agree by construction.
     expect(t.hooks.store.divergences({ bindingId: b.id, surface: "noWakeSource" })).toHaveLength(0);
@@ -16631,7 +16675,7 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     expect(derived(t, b.id)).toMatchObject({ stalled: true, waitLive: false });
   });
 
-  it("derives the prod#422/BCP-157 fixture: the closed person wait stalls despite the open pull watch", async () => {
+  it("derives the prod#422/BCP-157 fixture: the external person wait does not stall beside the open pull watch", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
     t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }));
@@ -16639,8 +16683,10 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     const b = t.hooks.store.find("ENG-12")!;
     await t.tool("steward_report", { ...base, waitingOn: "GitHub approval of acme/web#7", wait: { kind: "person", ref: "need_approve" } }, b.threadId!);
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(true);
-    expect(derived(t, b.id)).toMatchObject({ stalled: true, waitLive: false });
+    // BB-389: the open pull watch is live, so the external person wait does not
+    // stall.
+    expect(t.hooks.store.find("ENG-12")!.noWakeSource).toBe(false);
+    expect(derived(t, b.id)).toMatchObject({ stalled: false, waitLive: false });
   });
 
   it("derives the prod#430/BCP-160 fixture: the leased foreign pull is live", async () => {

@@ -258,7 +258,10 @@ export function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
       return key !== null && Object.values(input.binding.deployments).some((w) => lc(w.key) === key && (w.state === "merged" || w.state === "deploying"));
     }
     case "worker":
-      return input.workers.some((w) => w.threadId === wait.ref && w.status === "running");
+      // BB-389: a parked worker is still waiting, so a `worker` wait naming it
+      // is live until its next turn clears the park. A plainly finished, failed
+      // or stopped worker is not.
+      return input.workers.some((w) => w.threadId === wait.ref && (w.status === "running" || (w.status === "finished" && w.parkedWaitingOn !== null)));
     case "binding":
       return input.hasOpenBinding?.(wait.ref) ?? false;
     case "date":
@@ -357,7 +360,10 @@ export function assess(input: AssessmentInput, composed?: ComposedAssessment): A
       // the idle wake; a stalled or external one does not (BB-333).
       idle: wait !== null && waitLive === true ? false : idleBase,
       stuck: stuckDue(binding, playbook, [...escalations], now) !== null,
-      stalled: wait === null ? observedStall(binding, live, now) : waitLive !== true && !dateAhead,
+      // BB-389: the typed wait may add liveness but never removes it. A binding
+      // with any live structured source is not stalled whatever the wait says;
+      // only a non-live wait (or none) can stall.
+      stalled: wait === null ? observedStall(binding, live, now) : !live && waitLive !== true && !dateAhead,
       reportedNoWakeSource: binding.noWakeSource,
       overdue: overdueMs !== null,
       overdueMs,

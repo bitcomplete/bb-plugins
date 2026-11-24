@@ -467,7 +467,11 @@ Plugin code. No model turn.
    the worker, since it waits on that result). BB-329: a worker says it is
    waiting with the `worker_park` tool, not with prose; a finish without that
    call is a plain finish, archived like any other, whatever its final text
-   says. And a
+   says. BB-389: a parked finish stays a quiet note even when the steward's
+   own `waitingOn` or typed `worker` wait named the worker — the park is not
+   over, so there is no hand-off prompt; the steward is woken by the worker's
+   resume or by the pull request changing, and a binding following through
+   still hears the worker as before. And a
    terminal state the steward's own last report already named ends the
    binding from the mechanical tier, with the wrap-up written from that
    report and no wrap-up wake; a terminal state someone else set still wakes.
@@ -696,7 +700,10 @@ decide-list mark and the recorded project approvals the `approvals.ts` path
 omits), the worker state (an explicit `parked`, distinct from `running`) and
 the liveness (wake source, idle, stall from the observable rows, not the
 stored `noWakeSource` flag, which only a reconcile writes, for every binding
-kind, an ops binding included (BB-375). `compare`
+kind, an ops binding included (BB-375). BB-333 made the stored typed `wait`
+the source of liveness, judged by its kind; BB-389 made it additive: a live
+structured source is never overridden by a non-live wait, and a parked worker
+is itself a source. `compare`
 runs the predicates the assessment will replace and returns every
 disagreement.
 - `reconcile.ts` calls it on every binding inside a try/catch that can never
@@ -1945,11 +1952,12 @@ it reads after the red phrases and ahead of the other quiet ones); `held behind
 running` counting only workers whose worker-table status is `running` (a busy
 steward or reviewer with no running worker falls through, rather than reading
 `0 workers running`); the lost hand-off when `waitingOn` names a finished
-worker or a loud hand-off note is pending (BB-152); `worker finished, next look
-<time>` when the binding has a pending quiet worker-finish note and no running
-worker (BB-83 — the status summary a finished worker left behind must not keep
-the row, and the time is the binding's `requeueAt`); a dated wait as
-`waiting on <text> until <date>` (BB-247); the newest deployment watch's state
+worker or a loud hand-off note is pending (BB-152 — a parked worker is not
+finished, so a wait naming it is not a lost hand-off, BB-389); `worker
+finished, next look <time>` when the binding has a pending quiet worker-finish
+note and no running worker (BB-83 — the status summary a finished worker left
+behind must not keep the row, and the time is the binding's `requeueAt`); a
+dated wait as `waiting on <text> until <date>` (BB-247); the newest deployment watch's state
 (`deploying`, `deployed`, `deploy failed`), ahead of the free-text `nextAction`
 whatever the actor (BB-86); the status `nextAction` verbatim, with `the other
 party` standing in for an `other` actor that has no report (an external wait is

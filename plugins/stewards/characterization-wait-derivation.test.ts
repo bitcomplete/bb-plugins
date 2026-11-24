@@ -25,7 +25,7 @@ const tickets: Playbook = (() => {
   return p.value;
 })();
 
-const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
+const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, parkedWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
 /** A second open own pull request, so the binding-shaped fixture is not a lone PR (BB-291). */
 const secondOpenPull = pull({ key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }, { headSha: "bbbbbbb2" });
@@ -125,9 +125,10 @@ describe("typedWaitLive: the deployment, worker, binding and person kinds", () =
     expect(waitLive({ kind: "deployment", ref: "acme/web#9" })).toBe(false);
   });
 
-  it("worker: live only while the named worker is running", () => {
+  it("worker: live while the named worker is running or parked (BB-389), not once plainly finished", () => {
     expect(waitLive({ kind: "worker", ref: "thr_w1" }, { workers: [{ threadId: "thr_w1", status: "running" } as never] })).toBe(true);
-    expect(waitLive({ kind: "worker", ref: "thr_w1" }, { workers: [parkedWorker({ threadId: "thr_w1" })] })).toBe(false);
+    expect(waitLive({ kind: "worker", ref: "thr_w1" }, { workers: [parkedWorker({ threadId: "thr_w1" })] })).toBe(true);
+    expect(waitLive({ kind: "worker", ref: "thr_w1" }, { workers: [parkedWorker({ threadId: "thr_w1", parkedWaitingOn: null })] })).toBe(false);
     expect(waitLive({ kind: "worker", ref: "thr_w1" })).toBe(false);
   });
 
