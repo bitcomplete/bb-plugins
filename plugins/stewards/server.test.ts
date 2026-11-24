@@ -13271,6 +13271,35 @@ Watch the repository's whole open backlog.`;
     expect(t.rpcCalls.filter((c) => c.pluginId === "linear" && c.method === "sourceBacklog")).toEqual([]);
   });
 
+  it("offers a GitHub backlog steward no triage or promotion, and refuses a direct call (BB-396)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"], triage: true, promote: true } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[playbookPath("backlog")] = GITHUB_BACKLOG_WATCH;
+    t.setBacklog([backlogIssue({ id: "acme/web#1", key: "acme/web#1", unit: "acme/web", state: "open", stateType: null })]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/github/acme/web")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_github_backlog" });
+    t.threads.set("thr_github_backlog", { status: "idle", archivedAt: null });
+    const config = await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id: "thr_github_backlog", title: null, parentThreadId: null, sourceThreadId: null } }));
+    // Neither Linear-only write tool is offered, even with both flags on.
+    expect(config.tools.map((x) => x.name)).toEqual(["ticket_read", "ticket_search", "steward_report", "steward_update"]);
+    expect(config.instructions).toMatch(/read-only/u);
+    expect(config.instructions).not.toMatch(/`backlog_triage` adds labels/u);
+    expect(config.instructions).not.toMatch(/`backlog_promote` is your one promotion write/u);
+    // A direct call refuses before any read or write reaches either source.
+    t.rpcCalls.length = 0;
+    const triage = await t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bug"] }, "thr_github_backlog");
+    const promote = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(triage.error).toBe(true);
+    expect(triage.text).toMatch(/Linear-only/u);
+    expect(promote.error).toBe(true);
+    expect(promote.text).toMatch(/Linear-only/u);
+    expect(t.rpcCalls.filter((c) => c.method === "sourceUpdateIssue" || c.method === "sourceComment" || c.method === "sourceBacklog")).toEqual([]);
+  });
+
   it("puts a GitHub backlog in the digest's one Backlog section (BB-396)", async () => {
     const t = await setup();
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"] } });

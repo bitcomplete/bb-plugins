@@ -12963,8 +12963,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // offered to a backlog thread. The tool re-reads the flag itself, so
         // turning it off refuses at once even before the selection refreshes.
         const backlogBlock = configs.get(b.projectId)?.value?.file.backlog;
-        const backlogTriage = target?.kind === "backlog" && backlogBlock?.triage === true;
-        const backlogPromote = target?.kind === "backlog" && backlogBlock?.promote === true;
+        // BB-396: triage writes and promotion are Linear-only, so a GitHub
+        // backlog steward is read-only. Neither tool is offered, and the prompt
+        // says so, rather than inviting a tool that can only fail.
+        const linearBacklog = target?.kind === "backlog" && target.source === "linear";
+        const backlogTriage = linearBacklog && backlogBlock?.triage === true;
+        const backlogPromote = linearBacklog && backlogBlock?.promote === true;
         if (target?.kind === "backlog") {
           const backlogWrites = ["steward_report", "steward_update", ...(backlogTriage ? ["backlog_triage"] : []), ...(backlogPromote ? ["backlog_promote"] : []), "ticket_read", "ticket_search"];
           return {
@@ -12973,12 +12977,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             instructions:
               `You are the backlog steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
               "The plugin reads the target (a Linear team or a GitHub repository) for you and every wake carries the whole open backlog. You never edit a description, start a worker, cancel or close a ticket. " +
-              (backlogTriage
-                ? "`backlog_triage` adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
-                : "The backlog is read-only for triage on this project: `backlog.triage` is off. ") +
-              (backlogPromote
-                ? "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit; the plugin picks the ticket, so a key that is not the top-ordered eligible one is ignored. "
-                : "No promotion is offered: `backlog.promote` is off. ") +
+              (target.source !== "linear"
+                ? "This is a GitHub backlog, so it is read-only: triage writes and promotion are Linear-only, and neither `backlog_triage` nor `backlog_promote` is offered. "
+                : (backlogTriage
+                    ? "`backlog_triage` adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
+                    : "The backlog is read-only for triage on this project: `backlog.triage` is off. ") +
+                  (backlogPromote
+                    ? "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit; the plugin picks the ticket, so a key that is not the top-ordered eligible one is ignored. "
+                    : "No promotion is offered: `backlog.promote` is off. ")) +
               "`ticket_read` and `ticket_search` are reads only. End every turn you were woken for with steward_report. Read the stewards skill for the protocol.",
           };
         }
@@ -13255,6 +13261,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (binding === null || target === null || target.kind !== "backlog") {
           return toolError(new Error("backlog_triage is for a backlog steward's thread; this thread is not one."));
         }
+        // BB-396: triage is a Linear write; a GitHub backlog is read-only, and
+        // the refusal happens before any read or ledger write.
+        if (target.source !== "linear") return toolError(new Error("backlog_triage is Linear-only; a GitHub backlog is read-only."));
         const projectId = binding.projectId;
         const team = target.unit;
         const record = (outcome: "accepted" | "refused", kind: BacklogWrite["kind"], detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
@@ -13385,6 +13394,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (binding === null || target === null || target.kind !== "backlog") {
           return toolError(new Error("backlog_promote is for a backlog steward's thread; this thread is not one."));
         }
+        // BB-396: promotion is a Linear write; a GitHub backlog is read-only,
+        // and the refusal happens before any read or ledger write.
+        if (target.source !== "linear") return toolError(new Error("backlog_promote is Linear-only; a GitHub backlog is read-only."));
         const projectId = binding.projectId;
         const team = target.unit;
         const record = (outcome: "accepted" | "refused", detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
