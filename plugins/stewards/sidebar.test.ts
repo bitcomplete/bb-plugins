@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, compareMonitors, deploymentPhrase, effortHasUnread, effortPhrase, effortSection, effortState, effortTitle, endReasonPhrase, endedEffort, hasUnread, isBusy, isUnread, type SidebarChild, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, compareMonitors, deploymentPhrase, effortHasUnread, effortPhrase, effortSection, effortState, effortTitle, endReasonPhrase, endedEffort, hasUnread, isBusy, isUnread, waitingOnNamesFinishedWorker, type SidebarChild, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
 
 const thread = (over: Partial<SidebarLiveThread> & { id: string }): SidebarLiveThread => ({
   projectId: "p1",
@@ -92,7 +92,7 @@ describe("stewards sidebar grouping", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_steward" }), thread({ id: "thr_worker" })],
-      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }] })] })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running", parkedWaitingOn: null }] })] })],
     });
     expect(tabs[0]!.efforts).toHaveLength(1);
     expect(tabs[0]!.efforts[0]!.children).toMatchObject([{ threadId: "thr_worker", role: "worker" }]);
@@ -117,7 +117,7 @@ describe("stewards sidebar grouping", () => {
       data: [
         data({
           projectId: "p1",
-          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }] })],
+          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running", parkedWaitingOn: null }] })],
         }),
       ],
     });
@@ -339,7 +339,7 @@ describe("stewards sidebar grouping", () => {
             binding({ key: "acme/sentry", threadId: "thr_ops_blocked", kind: "ops", stage: null, waitingOn: "a rotation" }),
             binding({ key: "acme/ns", threadId: "thr_ops_you", kind: "ops", stage: null, needsUser: true }),
             binding({ key: "ENG-1", threadId: "thr_ticket_wait", status: { actor: "other", nextAction: "an author push", at: 1 } }),
-            binding({ key: "acme/web#728", threadId: "thr_review_wait", kind: "review", status: { actor: "other", nextAction: "an author push", at: 1 }, workers: [{ threadId: "thr_worker", title: "Review", status: "running" }] }),
+            binding({ key: "acme/web#728", threadId: "thr_review_wait", kind: "review", status: { actor: "other", nextAction: "an author push", at: 1 }, workers: [{ threadId: "thr_worker", title: "Review", status: "running", parkedWaitingOn: null }] }),
           ],
         }),
       ],
@@ -552,7 +552,7 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "w2", noWakeSource: true, deployment: "deployed", statusNextAction: "the vendor" }))).toBe("waiting, no wake source");
     // Red outranks a running worker and a lost hand-off.
     expect(effortPhrase(effort({ key: "w3", noWakeSource: true, runningWorkers: 1 }))).toBe("waiting, no wake source");
-    const finished = [{ threadId: "thr_w", title: "Implement", status: "finished" }];
+    const finished = [{ threadId: "thr_w", title: "Implement", status: "finished", parkedWaitingOn: null }];
     expect(effortPhrase(effort({ key: "w4", noWakeSource: true, waitingOn: "Implement", workers: finished }))).toBe("waiting, no wake source");
     // Unmarked still reads the next action verbatim.
     expect(effortPhrase(effort({ key: "w5", waitingOn: "the vendor", statusNextAction: "the vendor" }))).toBe("the vendor");
@@ -588,7 +588,7 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
 
   it("reads a wait on a finished worker as a lost hand-off, not a plain finish (BB-152)", () => {
     const now = Date.parse("2026-10-14T15:00:00Z");
-    const finished = { threadId: "thr_w1", title: "ENG-12: Implement", status: "finished" };
+    const finished = { threadId: "thr_w1", title: "ENG-12: Implement", status: "finished", parkedWaitingOn: null };
     const finish = { text: 'Worker "ENG-12: Implement" finished its turn. Its final message: I posted the gate.', quiet: true };
     // `waitingOn` names the finished worker's thread id: a lost hand-off, with
     // the next look, where a plain finish would read "worker finished".
@@ -604,6 +604,23 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     // A typed `worker` wait (BB-333) with no free-text waitingOn is the same lost hand-off.
     expect(effortPhrase(effort({ key: "e", wait: { kind: "worker", ref: "thr_w1" }, workers: [finished], pending: [finish] }), now)).toBe("hand-off lost: worker finished");
     expect(effortPhrase(effort({ key: "f", wait: { kind: "worker", ref: "thr_w1" }, workers: [{ ...finished, status: "running" }], pending: [finish] }), now)).toBe("worker finished");
+  });
+
+  // BB-389: a parked worker is not over, so a wait naming it is not a lost
+  // hand-off. The park is a quiet wait, and the row is never Blocked.
+  it("does not read a parked worker as a lost hand-off (BB-389)", () => {
+    const now = Date.parse("2026-10-14T15:00:00Z");
+    const parked = { threadId: "thr_w1", title: "ENG-12: Implement", status: "finished", parkedWaitingOn: "the reviewer" };
+    const finish = { text: 'Worker "ENG-12: Implement" finished its turn. It parked, waiting on the reviewer.', quiet: true };
+    // The free-text and typed waits both skip the parked worker, so the quiet
+    // finish reads instead of the loud hand-off.
+    expect(effortPhrase(effort({ key: "a", waitingOn: "worker thr_w1 (merge)", workers: [parked], pending: [finish] }), now)).toBe("worker finished");
+    expect(effortPhrase(effort({ key: "b", wait: { kind: "worker", ref: "thr_w1" }, workers: [parked], pending: [finish] }), now)).toBe("worker finished");
+    expect(waitingOnNamesFinishedWorker("worker thr_w1", [parked])).toBe(false);
+    // A typed worker wait with no pending note files the row as Waiting, and
+    // either way it is not Blocked.
+    expect(effortSection(effort({ key: "c", kind: "ticket", state: "quiet", wait: { kind: "worker", ref: "thr_w1" }, workers: [parked] }), now)).toBe("waiting");
+    expect(effortState(effort({ key: "d", kind: "ticket", waitingOn: "worker thr_w1", workers: [parked] }))).not.toBe("blocked");
   });
 
   it("phrases a deployment watch's state", () => {
@@ -627,7 +644,7 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
       data: [
         data({
           projectId: "p1",
-          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", waitingOn: "worker thr_w1 (merge)", workers: [{ threadId: "thr_w1", title: "Implement", status: "finished" }] })],
+          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", waitingOn: "worker thr_w1 (merge)", workers: [{ threadId: "thr_w1", title: "Implement", status: "finished", parkedWaitingOn: null }] })],
         }),
       ],
     });
@@ -643,7 +660,7 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
       data: [
         data({
           projectId: "p1",
-          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", waitingOn: "worker thr_w1 (merge)", workers: [{ threadId: "thr_w1", title: "Implement", status: "running" }] })],
+          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", waitingOn: "worker thr_w1 (merge)", workers: [{ threadId: "thr_w1", title: "Implement", status: "running", parkedWaitingOn: null }] })],
         }),
       ],
     });
@@ -659,7 +676,7 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
           projectId: "p1",
           bindings: [
             binding({ key: "ENG-1", threadId: "thr_you", needsUser: true }),
-            binding({ key: "ENG-2", threadId: "thr_run", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
+            binding({ key: "ENG-2", threadId: "thr_run", workers: [{ threadId: "thr_w", title: "w", status: "running", parkedWaitingOn: null }] }),
             binding({ key: "acme/web", threadId: "thr_ops", kind: "ops", stage: null }),
           ],
         }),
@@ -770,7 +787,7 @@ describe("stewards sidebar Waiting section (BB-348)", () => {
   });
 
   it("demotes a waiting parent to In flight when a nested child is live, and only then", () => {
-    const build = (child: { workers?: { threadId: string; title: string; status: string }[]; waitingOn?: string | null; waitingUntil?: number | null; needsUser?: boolean }) =>
+    const build = (child: { workers?: { threadId: string; title: string; status: string; parkedWaitingOn: string | null }[]; waitingOn?: string | null; waitingUntil?: number | null; needsUser?: boolean }) =>
       buildSidebar({
         projects: [project({ id: "p1" })],
         threads: [thread({ id: "thr_parent", displayTitle: "ENG-1: Parent work" }), thread({ id: "thr_child" })],
@@ -787,7 +804,7 @@ describe("stewards sidebar Waiting section (BB-348)", () => {
       })[0]!;
     // A running nested child demotes the parent to In flight; the child keeps
     // its own section.
-    const running = build({ workers: [{ threadId: "thr_w", title: "w", status: "running" }] });
+    const running = build({ workers: [{ threadId: "thr_w", title: "w", status: "running", parkedWaitingOn: null }] });
     expect(running.waiting).toHaveLength(0);
     expect(running.efforts.map((e) => e.key)).toEqual(["ENG-1"]);
     expect(running.efforts[0]!.nested[0]!.section).toBe("inflight");
@@ -903,7 +920,7 @@ describe("stewards sidebar structural sharing (BB-95)", () => {
   const baseInput = () => ({
     projects: [project({ id: "p1" })],
     threads: [thread({ id: "thr_steward" }), thread({ id: "thr_worker", parentThreadId: "thr_steward" })],
-    data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }] })] })],
+    data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running", parkedWaitingOn: null }] })] })],
     now: 0,
   });
 

@@ -8,6 +8,7 @@ const noSources: WakeSourceInput = {
   holdStack: [],
   deployments: {},
   runningWorkers: 0,
+  parkedWorkers: 0,
   openEscalations: 0,
   openNeeds: 0,
   pullRequestWatch: false,
@@ -51,6 +52,12 @@ describe("a binding's live wake sources (BB-154)", () => {
     expect(hasLiveWakeSource(watch({ openEscalations: 1 }))).toBe(true);
     expect(hasLiveWakeSource(watch({ openNeeds: 1 }))).toBe(true);
     expect(hasLiveWakeSource(watch({ pullRequestWatch: true }))).toBe(true);
+  });
+
+  // BB-389: a parked worker is still waiting, so it is a live source; the
+  // parked worker's resume, or the pull request it waits on, wakes the binding.
+  it("is true for a parked worker (BB-389)", () => {
+    expect(hasLiveWakeSource(watch({ parkedWorkers: 1 }))).toBe(true);
   });
 
   // BB-285: an open pull request is not a wake source for a `pr`/`review`

@@ -1073,7 +1073,7 @@ export const rpcContract = defineRpcContract({
           requeueAt: z.number().nullable(),
           advancedAt: z.number().nullable(),
           /** The binding's live workers: running, finished, or ended within the last hour (BB-100). */
-          workers: z.array(z.object({ threadId: z.string(), title: z.string(), status: z.string() })),
+          workers: z.array(z.object({ threadId: z.string(), title: z.string(), status: z.string(), /** The worker's `worker_park` note, or null; a parked worker is not a lost hand-off (BB-389). */ parkedWaitingOn: z.string().nullable() })),
           /**
            * Retained as an optional output for one release so a client built
            * from the previous image tolerates its absence across a restart;
@@ -3964,13 +3964,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** The structured sources that will wake a binding, as the report path reads them (BB-154). */
     function wakeSourcesFor(b: Binding, ownPulls: ReadonlySet<string>): WakeSourceInput {
+      // One worker read for both counts, so BB-389 adds no store read.
+      const workers = store.workers(b.id);
       return {
         hold: b.hold,
         holdBehind: b.holdBehind,
         mergeBehind: b.mergeBehind,
         holdStack: b.holdStack,
         deployments: b.deployments,
-        runningWorkers: store.workers(b.id).filter((w) => w.status === "running").length,
+        runningWorkers: workers.filter((w) => w.status === "running").length,
+        // BB-389: a parked worker is a live source too. Its next turn clears the
+        // park and wakes the binding, and the thing it waits on (a review, a
+        // build) changes the pull request the binding watches.
+        parkedWorkers: workers.filter((w) => w.status === "finished" && w.parkedWaitingOn !== null).length,
         openEscalations: store.openEscalations(b.id).length,
         openNeeds: store.openNeeds(b.id).length,
         pullRequestWatch: pullWatch(b, ownPulls),
@@ -10523,14 +10529,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // regex on its final text. A plain finish is done; a parked one is
         // kept unarchived for its next turn.
         const parked = worker.parkedWaitingOn !== null;
+        // BB-389: a worker that ends its turn parked is not over — its park is
+        // a quiet note ("parked, waiting on X"), never the loud hand-off, and
+        // the steward is woken by its resume or by the pull request changing.
+        // A plain (non-parked) finish keeps BB-152's hand-off.
+        const handOff = waitedOn && !parked;
         // BB-52 rule 3: a worker that ends its turn parked on its reviewer,
         // the owner or a build is a quiet note. Only a question, a gone thread
         // or a lost hand-off makes the turn due; a failed turn comes through
         // thread.failed and wakes on its own. A binding following through is
-        // waiting on this worker's result, so its finish is news. BB-329: a
-        // final message that merely says "error" is a plain finish.
-        const needsSteward = finished !== null && (workerQuestion(result) !== null || followingThrough(finished) || waitedOn);
-        if (finished !== null && finished.endedAt === null) store.note(finished.id, workerFinishNote(worker.title, result, waitedOn, worker.parkedWaitingOn), !needsSteward);
+        // waiting on this worker's result, so its finish is news — unless the
+        // worker parked, which is the quiet note above. BB-329: a final message
+        // that merely says "error" is a plain finish.
+        const needsSteward = finished !== null && (workerQuestion(result) !== null || (!parked && followingThrough(finished)) || handOff);
+        if (finished !== null && finished.endedAt === null) store.note(finished.id, workerFinishNote(worker.title, result, handOff, worker.parkedWaitingOn), !needsSteward);
         await closeRequesterNeed(thread.id);
         // Its turn is over: the reviewers it read (or started and then waited
         // on) have had their round consumed (BB-47).
@@ -11871,7 +11883,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const bindings = open.map((b) => {
             const workers = (workersByBinding.get(b.id) ?? [])
               .filter((w) => w.status === "running" || w.status === "finished" || (w.endedAt !== null && w.endedAt >= liveSince))
-              .map((w) => ({ threadId: w.threadId, title: w.title, status: w.status }));
+              .map((w) => ({ threadId: w.threadId, title: w.title, status: w.status, parkedWaitingOn: w.parkedWaitingOn }));
             // The newest deployment watch, whatever its state (BB-76); the row shows `merged` as deploying too.
             const newestDeployment = Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null;
             return {
@@ -14066,7 +14078,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               bindingId: b.id,
               kind: "stall",
               question: `${b.entityKey} has woken by requeue ${count} time${count === 1 ? "" : "s"} with the same wait (${JSON.stringify(waitText)}), first reported ${iso(firstAt)}, and nothing the plugin tracks will deliver it.`,
-              context: `The steward's waitingOn is free text and no structured source is live on the binding: no open holdBehind, no merge hold, no deployment watch in merged/deploying, no running worker, no open escalation or need, no pull-request watch. It will keep waking by requeue alone.`,
+              context: `The steward's waitingOn is free text and no structured source is live on the binding: no open holdBehind, no merge hold, no deployment watch in merged/deploying, no running or parked worker, no open escalation or need, no pull-request watch. It will keep waking by requeue alone.`,
               meanwhile: "Waiting: the steward keeps reporting the same wait and is woken only by another requeue.",
               route: "project",
               recommendation: null,

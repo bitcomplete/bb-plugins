@@ -32,6 +32,12 @@ export type WakeSourceInput = {
   deployments: Deployments;
   /** The binding's running workers. */
   runningWorkers: number;
+  /**
+   * The binding's parked workers (BB-389): a `finished` worker that called
+   * `worker_park` and is kept unarchived until its next turn. Its resume or the
+   * thing it waits on will wake the binding, so it is a live source.
+   */
+  parkedWorkers: number;
   /** Open escalations on the binding. */
   openEscalations: number;
   /** Open "needs you" items on the binding. */
@@ -44,8 +50,8 @@ export type WakeSourceInput = {
  * Whether anything the plugin tracks will wake this binding. The list is the
  * one in the ticket's criterion 1: an open `holdBehind` entry, an open
  * `mergeBehind` entry (BB-256), a deployment watch in `merged`/`deploying`, a
- * running worker, an open escalation or need, or a pull-request watch. A
- * free-text `waitingOn` is not on it.
+ * running worker, a parked worker (BB-389), an open escalation or need, or a
+ * pull-request watch. A free-text `waitingOn` is not on it.
  */
 export function hasLiveWakeSource(s: WakeSourceInput): boolean {
   return (
@@ -53,6 +59,7 @@ export function hasLiveWakeSource(s: WakeSourceInput): boolean {
     s.mergeBehind.length > 0 ||
     Object.values(s.deployments).some((d) => d.state === "merged" || d.state === "deploying") ||
     s.runningWorkers > 0 ||
+    s.parkedWorkers > 0 ||
     s.openEscalations > 0 ||
     s.openNeeds > 0 ||
     s.pullRequestWatch

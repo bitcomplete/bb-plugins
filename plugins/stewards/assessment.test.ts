@@ -32,7 +32,7 @@ const projectApprovalMarker = (id: string) => comment({ id, author: "trotterdyla
 // The owner's unsigned approval, as the Stewards page posts it (BB-279).
 const ownerUnsignedApproval = comment({ id: "oa", author: "jane", body: `Approved ${head} from the Stewards page`, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
 
-const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
+const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, parkedWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
 /** A gate-met own pull request (no-review, green) plus the reviewer marker. */
 const gateMetPull = (key: string, url: string) => pull({ key, url, comments: [noReviewMarker] }, { headSha: head, ...green });
@@ -83,8 +83,10 @@ function input(over: Partial<AssessmentInput> = {}): AssessmentInput {
 /**
  * BB-266: a gate-met own pull request, a parked `finished` worker, and (unless
  * `secondOpen` says the test is about its absence) a second open own pull
- * request. `sources` is the report path's, with no tracked source, so the
- * parked worker is not a wake source.
+ * request. `sources` is the report path's input shape; the fixture passes it
+ * without the parked worker so `compare` still pins the BB-292
+ * `hasLiveWakeSource` divergence. The report path itself counts the parked
+ * worker since BB-389 (`wakeSourcesFor`), so the row cannot fire in production.
  */
 function bb266(secondOpen: boolean): AssessmentInput {
   const first = gateMetPull("acme/web#7", "https://github.com/acme/web/pull/7");
@@ -358,10 +360,13 @@ describe("the shadow assessment: the typed wait (BB-333)", () => {
     expect(a.liveness.idle).toBe(false);
   });
 
-  it("derives a stalled external wait even when an unrelated source is live", () => {
+  // BB-389: the typed wait may add liveness but never removes it. An external
+  // (or otherwise non-live) wait beside a live structured source is not stalled.
+  it("does not stall a non-live external wait while a structured source is live", () => {
     const a = assess(withWait({ kind: "external", ref: "the vendor" }, { sources: { ...noSources, pullRequestWatch: true } }));
     expect(a.liveness.waitLive).toBe(false);
-    expect(a.liveness.stalled).toBe(true);
+    expect(a.liveness.live).toBe(true);
+    expect(a.liveness.stalled).toBe(false);
   });
 
   it("derives a review wait live only until the review is given", () => {
@@ -378,10 +383,14 @@ describe("the shadow assessment: the typed wait (BB-333)", () => {
     expect(a.liveness.waitLive).toBe(true);
   });
 
-  it("derives a worker wait live only while the worker runs", () => {
+  it("derives a worker wait live while the worker runs or is parked", () => {
     const running = assess(withWait({ kind: "worker", ref: "thr_w1" }, { workers: [{ threadId: "thr_w1", status: "running" } as never] }));
     expect(running.liveness.waitLive).toBe(true);
-    const finished = assess(withWait({ kind: "worker", ref: "thr_w1" }, { workers: [parkedWorker({ threadId: "thr_w1" })] }));
+    // BB-389: a parked worker is still waiting, so the wait is live.
+    const parked = assess(withWait({ kind: "worker", ref: "thr_w1" }, { workers: [parkedWorker({ threadId: "thr_w1" })] }));
+    expect(parked.liveness.waitLive).toBe(true);
+    // A plainly finished worker (no park) is over, so the wait is not live.
+    const finished = assess(withWait({ kind: "worker", ref: "thr_w1" }, { workers: [parkedWorker({ threadId: "thr_w1", parkedWaitingOn: null })] }));
     expect(finished.liveness.waitLive).toBe(false);
   });
 
@@ -429,6 +438,54 @@ describe("the shadow assessment: the typed wait (BB-333)", () => {
     expect(a.liveness.idle).toBe(false);
     // The parked-worker surface still compares the consumer's idle.
     expect(compare(i, a).find((x) => x.surface === "idleInActiveStage")).toMatchObject({ old: "idle", new: "parked" });
+  });
+});
+
+// BB-389: a typed wait may add liveness but never removes it. Each row is one
+// healthy wait from the ticket's table that read `waiting, no wake source`
+// because a non-live typed wait (or a parked worker) overrode the live source.
+// The ticket's five rows all have a typed `external` wait or none at all.
+describe("BB-389: a live structured source is never overridden by a typed wait", () => {
+  const external: NonNullable<AssessmentInput["binding"]["wait"]> = { kind: "external", ref: "thr_vyvrsvpt9r" };
+  const withWait = (over: Partial<AssessmentInput>) => assess(input({ binding: binding({ wait: external }), ...over }));
+
+  it("row 1: an open schedule escalation is live with an external wait", () => {
+    const a = withWait({ sources: { ...noSources, openEscalations: 1 } });
+    expect(a.liveness.waitLive).toBe(false);
+    expect(a.liveness.live).toBe(true);
+    expect(a.liveness.stalled).toBe(false);
+  });
+
+  it("row 2: a parked worker is live with an external wait", () => {
+    const a = withWait({ sources: { ...noSources, parkedWorkers: 1 } });
+    expect(a.liveness.live).toBe(true);
+    expect(a.liveness.stalled).toBe(false);
+  });
+
+  it("row 3: a pull-request watch is live with an external wait (checks on the PR)", () => {
+    const a = withWait({ sources: { ...noSources, pullRequestWatch: true } });
+    expect(a.liveness.stalled).toBe(false);
+  });
+
+  it("row 4: the reviewer's pull-request watch is live with an external wait (a stored reviewer thread)", () => {
+    const a = withWait({ sources: { ...noSources, pullRequestWatch: true } });
+    expect(a.liveness.stalled).toBe(false);
+  });
+
+  it("row 5: an open approval escalation and approve-pr need are live with an external wait", () => {
+    const a = withWait({ sources: { ...noSources, openEscalations: 1, openNeeds: 1 } });
+    expect(a.liveness.stalled).toBe(false);
+  });
+
+  // The BB-154 true positive is unchanged: a free-text or `external` wait with
+  // no live source still flags.
+  it("still flags a non-live external wait with no structured source", () => {
+    const a = withWait({ sources: { ...noSources } });
+    expect(a.liveness.waitLive).toBe(false);
+    expect(a.liveness.live).toBe(false);
+    expect(a.liveness.stalled).toBe(true);
+    const freeText = assess(input({ binding: binding({ status: status("the vendor") }) }));
+    expect(freeText.liveness.stalled).toBe(true);
   });
 });
 

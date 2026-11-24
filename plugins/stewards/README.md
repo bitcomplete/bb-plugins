@@ -146,9 +146,10 @@ install on a stock bb: one repository, no Linear, no hooks service.
   binding's worker threads' branches, or a worker named its URL — and quiets
   three more causes: a state move between the build and review stages, a
   worker turn ending parked with `worker_park` (only a question or a gone
-  thread wakes), and a terminal state the steward's own last report already
-  named (the binding ends from the mechanical tier). A foreign pull request
-  wakes on its link and keeps its activity actionable. Everything not
+  thread wakes; a parked finish is a quiet note even when the steward's own
+  `waitingOn` named the worker, BB-389), and a terminal state the steward's
+  own last report already named (the binding ends from the mechanical tier).
+  A foreign pull request wakes on its link and keeps its activity actionable. Everything not
   actionable is kept as a quiet note and shown in "What changed" at the next
   turn something else makes due, and `bb stewards show` lists it as a pending
   note.
@@ -508,17 +509,20 @@ install on a stock bb: one repository, no Linear, no hooks service.
 - **A wait with no wake source (BB-154).** A steward's free-text `waitingOn`
   can name something the plugin never delivers, so the binding wakes only by
   requeue. On every reconcile the plugin asks whether any structured source is
-  live on the binding: an open `holdBehind`, a deployment watch in
-  `merged`/`deploying`, a running worker, an open escalation or need, or a
-  pull-request watch. With none, the binding is marked `noWakeSource`: its
-  row reads `waiting, no wake source`, `bb stewards list`/`show` say so, and
-  the next wake carries one paragraph telling the steward to name what will
-  deliver the wait (a binding to hold behind, a pull request, a deployment
-  target, a worker) or re-examine it. The reconcile is the column's only
-  writer (BB-375), for every binding kind including ops: a `steward_report`
-  derives the same sentence for its reply in the turn the wait is set, so the
-  steward can act then, but stores nothing. The mark clears when a source
-  appears or the wait is cleared.
+  live on the binding: an open `holdBehind` or stack-wait, a merge hold, a
+  deployment watch in `merged`/`deploying`, a running or parked worker
+  (BB-389), an open escalation or need, or a pull-request watch. A typed
+  `wait` (BB-333) may add liveness but never removes it (BB-389): a binding
+  with any live source is not marked, whatever the wait says, and a wait the
+  plugin cannot deliver no longer masks a source that can. With none, the
+  binding is marked `noWakeSource`: its row reads `waiting, no wake source`,
+  `bb stewards list`/`show` say so, and the next wake carries one paragraph
+  telling the steward to name what will deliver the wait (a binding to hold
+  behind, a pull request, a deployment target, a worker) or re-examine it.
+  The reconcile is the column's only writer (BB-375), for every binding kind
+  including ops: a `steward_report` derives the same sentence for its reply in
+  the turn the wait is set, so the steward can act then, but stores nothing.
+  The mark clears when a source appears or the wait is cleared.
   Separately, the plugin counts consecutive wakes
   whose reason was `requeue` and whose report ended with the same trimmed
   `waitingOn`; at two (one plugin constant, not a `project.json` key) it
@@ -616,11 +620,12 @@ thread button (BB-184, BB-198).
 entity key in bold and the title on line one; the kind (`ticket`, `pull
 request`, `review`, `ops`), the entity's phase when it has one, and the status
 phrase on line two (first match wins: `needs you`, a hold,
-`stuck`, `N worker(s) running`, a lost hand-off, a quiet worker finish,
-`waiting, no wake source`, the deployment state, then the report's
-`nextAction` verbatim). A free-text `waitingOn` is a plain line on the effort
-card, never a block or a phrase prefix (BB-109). A row that needs you adds its prompt and one-click actions
-under line two, in the same row. The glyph is one of four, in precedence order
+`stuck`, `N worker(s) running`, a lost hand-off (a parked worker is not one,
+BB-389), a quiet worker finish, `waiting, no wake source`, the deployment
+state, then the report's `nextAction` verbatim). A free-text `waitingOn` is a
+plain line on the effort card, never a block or a phrase prefix (BB-109). A
+row that needs you adds its prompt and one-click actions under line two, in
+the same row. The glyph is one of four, in precedence order
 `you › blocked › running › quiet`: a solid yellow dot when it waits on you, an
 empty red ring when blocked, a blue ring that pulses slowly while a worker or
 reviewer runs (CSS only, off under `prefers-reduced-motion`), and an empty grey
