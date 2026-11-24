@@ -511,6 +511,17 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "m" }))).toBe("no report yet");
   });
 
+  // BB-392: a gate whose only missing piece is the reviewer round reads as that
+  // wait, not the free-text nextAction a steward left behind.
+  it("names the missing reviewer round instead of a plain wait (BB-392)", () => {
+    expect(effortPhrase(effort({ key: "rr", reviewerRoundMissing: true, statusNextAction: "waiting for the plugin to merge it" }))).toBe("waiting on the reviewer round (none started)");
+    // A running worker still reads the count, so a just-green build is not relabelled.
+    expect(effortPhrase(effort({ key: "rr2", reviewerRoundMissing: true, runningWorkers: 1 }))).toBe("1 worker running");
+    // The lost hand-off is louder than the reviewer-round wait.
+    const finished = [{ threadId: "thr_w", title: "Implement", status: "finished", parkedWaitingOn: null }];
+    expect(effortPhrase(effort({ key: "rr3", reviewerRoundMissing: true, waitingOn: "Implement", workers: finished }))).toBe("hand-off lost: worker finished");
+  });
+
   // BB-351: a live wait past its kind's budget reads red (Blocked) with its
   // own `, overdue <duration>` phrase; a live wait within budget stays grey in
   // Waiting.

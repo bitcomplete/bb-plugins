@@ -954,7 +954,17 @@ export const REHOME_MARK_MIGRATIONS = [
    )`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS, ...REHOME_MARK_MIGRATIONS];
+// BB-392: the missing-reviewer-round wake's one-look grace and its once-per-head
+// record. `reviewer_round_grace` holds the `pull#sha` seen ready on the previous
+// look (empty for a new head); `reviewer_round_wakes` holds the `pull#sha`
+// already woken about. Append-only and defaulted: an old row reads as no grace
+// and no wake, so the first look after an upgrade arms and the second fires.
+export const REVIEWER_ROUND_WAKE_MIGRATIONS = [
+  `ALTER TABLE bindings ADD COLUMN reviewer_round_grace TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE bindings ADD COLUMN reviewer_round_wakes TEXT NOT NULL DEFAULT '[]'`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS, ...REHOME_MARK_MIGRATIONS, ...REVIEWER_ROUND_WAKE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1137,6 +1147,14 @@ export type Binding = {
   stackedPulls: string[];
   /** Stacked pull requests already woken about after closing unmerged with their base branch gone (BB-287), so the recovery wake is once per pull request. */
   stackedRecovered: string[];
+  /**
+   * BB-392: the `pull#sha` observed ready for the missing-reviewer-round wake on
+   * the previous look but not yet woken about, so the wake waits one look after
+   * the checks turn green. A new head replaces the pull's entry.
+   */
+  reviewerRoundGrace: string[];
+  /** BB-392: the `pull#sha` already woken about (no reviewer round and no worker running), so the wake fires once per head. */
+  reviewerRoundWakes: string[];
   /** Entity keys of the bindings whose open pull request this hold waits for (a stack-wait, BB-215): it lifts when every one has opened a pull request, not when they merge. */
   holdStack: string[];
   /** Entity keys the project steward was last asked to schedule this binding against; asked again only for a new one. */
@@ -1270,6 +1288,8 @@ function rowToBinding(r: BindingRow): Binding {
     retargetPulls: json(z.array(z.string()), str("retarget_pulls"), []),
     stackedPulls: json(z.array(z.string()), str("stacked_pulls"), []),
     stackedRecovered: json(z.array(z.string()), str("stacked_recovered"), []),
+    reviewerRoundGrace: json(z.array(z.string()), str("reviewer_round_grace"), []),
+    reviewerRoundWakes: json(z.array(z.string()), str("reviewer_round_wakes"), []),
     holdStack: json(z.array(z.string()), str("hold_stack"), []),
     scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
     clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
@@ -1353,6 +1373,8 @@ const COLUMNS = {
   retargetPulls: "retarget_pulls",
   stackedPulls: "stacked_pulls",
   stackedRecovered: "stacked_recovered",
+  reviewerRoundGrace: "reviewer_round_grace",
+  reviewerRoundWakes: "reviewer_round_wakes",
   holdStack: "hold_stack",
   scheduleAsked: "schedule_asked",
   clearedToStart: "cleared_to_start",

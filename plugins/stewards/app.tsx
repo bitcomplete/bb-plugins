@@ -672,6 +672,7 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     pending: s.pending,
     requeueAt: s.requeueAt,
     noWakeSource: s.noWakeSource,
+    reviewerRoundMissing: s.reviewerRoundMissing ?? false,
     wakeFailure: s.wakeFailure,
   };
 }
@@ -1322,6 +1323,7 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     pending: s.pending,
     requeueAt: s.requeueAt,
     noWakeSource: s.noWakeSource,
+    reviewerRoundMissing: s.reviewerRoundMissing ?? false,
     wakeFailure: s.wakeFailure,
   };
 }

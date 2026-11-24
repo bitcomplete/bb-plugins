@@ -773,6 +773,8 @@ export const rpcContract = defineRpcContract({
               nonActions: nonActionsSchema,
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
+              /** BB-392: the only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
+              reviewerRoundMissing: z.boolean().optional(),
               /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
               wakeFailure: z.string().nullable(),
               priority: z.string().nullable(),
@@ -937,6 +939,8 @@ export const rpcContract = defineRpcContract({
               nonActions: nonActionsSchema,
               /** Waiting with nothing the plugin tracks to wake it (BB-154). */
               noWakeSource: z.boolean(),
+              /** BB-392: the only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
+              reviewerRoundMissing: z.boolean().optional(),
               /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
               wakeFailure: z.string().nullable(),
               priority: z.string().nullable(),
@@ -1056,6 +1060,8 @@ export const rpcContract = defineRpcContract({
           nonActions: nonActionsSchema,
           /** Waiting with nothing the plugin tracks to wake it (BB-154). */
           noWakeSource: z.boolean(),
+          /** BB-392: the only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
+          reviewerRoundMissing: z.boolean().optional(),
           /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
           wakeFailure: z.string().nullable(),
           needsUser: z.boolean(),
@@ -4520,6 +4526,77 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-392: the safety net for a pull request whose gate is missing only the
+     * reviewer round. When the pull request is open and not a draft, its checks
+     * are green, no `bb-review` marker exists for any head, no worker of the
+     * binding is mid-turn and no reviewer thread is live, the steward is woken
+     * once per head sha to start the review round. The wake waits one look
+     * (`grace`) after the state is first seen, so a build that has just gone
+     * green is not interrupted. A listing that cannot be read is "unknown": it
+     * does not fire, the fail-safe against a double spawn.
+     */
+    async function maybeWakeMissingReviewerRound(
+      b: Binding,
+      pull: EntitySnapshot,
+      g: { missing: string | null; checksGreen: boolean; headSha: string | null },
+      changes: Change[],
+      grace: string[],
+      wakes: string[],
+    ): Promise<void> {
+      const pullRef = lc(pull.key);
+      // Every reason not to fire clears the grace for this pull, so the one-look
+      // wait is measured over a run of eligible looks, not one broken by a
+      // worker, a red check or a draft.
+      const clearGrace = (): void => {
+        for (let i = grace.length - 1; i >= 0; i--) if (grace[i].startsWith(`${pullRef}#`)) grace.splice(i, 1);
+      };
+      if (g.missing !== "no reviewer round yet" || !g.checksGreen || pull.pull?.draft === true) {
+        clearGrace();
+        return;
+      }
+      if (assessWorker(store.workers(b.id)).reason !== null) {
+        clearGrace();
+        return;
+      }
+      const workerIds = store.workers(b.id).map((w) => w.threadId);
+      if (workerIds.length > 0) {
+        const descendants = await descendantsOfMany(workerIds);
+        if (descendants === null) return; // Unknown: neither fires nor consumes the grace.
+        if ([...descendants.values()].some((ids) => ids.length > 0)) {
+          clearGrace();
+          return;
+        }
+        // A parentless reviewer (BB-323) is not a descendant; `reviewersOf`
+        // finds it, and a failed listing is unknown, so neither fires.
+        for (const id of workerIds) {
+          const reviewers = await reviewersOf(id);
+          if (reviewers === null) return;
+          if (reviewers.length > 0) {
+            clearGrace();
+            return;
+          }
+        }
+      }
+      const ref = `${pullRef}#${g.headSha ?? ""}`;
+      if (wakes.some((x) => x === ref)) {
+        clearGrace();
+        return;
+      }
+      if (!grace.includes(ref)) {
+        clearGrace();
+        grace.push(ref);
+        return;
+      }
+      const short = (g.headSha ?? "").slice(0, 7);
+      changes.push({
+        text: `No reviewer round on ${pull.key}${short === "" ? "" : ` at ${short}`}: the checks are green and no worker is running, but no bb-review marker exists for any head. Start a worker for the review round (build-tickets spawns its own reviewer).`,
+        actionable: true,
+      });
+      clearGrace();
+      wakes.push(ref);
+    }
+
+    /**
      * Archive a reviewer whose round is consumed. A worker's turn ending means
      * it has read the verdict (or ended the turn that spawned the reviewer to
      * wait); a reviewer still running is left alone, so the newest round is
@@ -5500,6 +5577,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     function decline(b: Binding, code: NonActionCode, detail: string | null = null): void {
       store.recordNonAction(b.id, code, detail, now());
+    }
+
+    /**
+     * BB-392: whether the binding's stored assessment says its only unmet gate
+     * piece is the reviewer round, so the Stewards page's status line names it
+     * instead of a plain wait. Reads the assessment the reconcile already
+     * stored; no GitHub call.
+     */
+    function reviewerRoundMissing(b: Binding): boolean {
+      const gate = store.assessment(b.id)?.gate as { missing?: string | null } | null | undefined;
+      return gate?.missing === "no reviewer round yet";
     }
 
     async function reconcileOnce(bindingId: string, force: WakeReason | null): Promise<void> {
@@ -9686,6 +9774,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const stackedOnMe: string[] = [];
       const recoveredPulls = [...b.stackedRecovered];
       const recoveredBefore = new Set(recoveredPulls.map((k) => lc(k)));
+      // BB-392: the missing-reviewer-round wake's one-look grace and its
+      // once-per-head record, read and written across this look's pulls.
+      const reviewerRoundGrace = [...b.reviewerRoundGrace];
+      const reviewerRoundWakes = [...b.reviewerRoundWakes];
       // BB-322: the gate for a pull request from the assessment this reconcile
       // just computed, so the approval sync reads the one assessment and never
       // falls back to its own `prGate`. A pull request the assessment does not
@@ -9966,6 +10058,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         } else {
           store.closeNeedByKey(b.id, "merge", url, `The gate is not met: ${g.missing ?? "unknown"}.`);
+          if (!foreignOwner) await maybeWakeMissingReviewerRound(b, pull, g, changes, reviewerRoundGrace, reviewerRoundWakes);
           decline(b, "gate-not-met", pull.key);
         }
       }
@@ -9990,6 +10083,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const nextRecoveredPulls = recoveredPulls.slice(-20);
       if (nextRecoveredPulls.length !== b.stackedRecovered.length || nextRecoveredPulls.some((k, i) => k !== b.stackedRecovered[i])) {
         b = store.patch(b.id, { stackedRecovered: nextRecoveredPulls });
+      }
+      // BB-392: keep the missing-reviewer-round grace and the once-per-head record.
+      const nextReviewerRoundGrace = reviewerRoundGrace.slice(-20);
+      if (nextReviewerRoundGrace.length !== b.reviewerRoundGrace.length || nextReviewerRoundGrace.some((k, i) => k !== b.reviewerRoundGrace[i])) {
+        b = store.patch(b.id, { reviewerRoundGrace: nextReviewerRoundGrace });
+      }
+      const nextReviewerRoundWakes = reviewerRoundWakes.slice(-20);
+      if (nextReviewerRoundWakes.length !== b.reviewerRoundWakes.length || nextReviewerRoundWakes.some((k, i) => k !== b.reviewerRoundWakes[i])) {
+        b = store.patch(b.id, { reviewerRoundWakes: nextReviewerRoundWakes });
       }
       if (approvalRaised) await wakeProject(b.projectId, `an owner-reviewed pull request from ${b.entityKey}`, { digestDue: false });
       // BB-231: a gate item filed this look may cover an open route-`user`
@@ -11643,6 +11745,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
+              reviewerRoundMissing: reviewerRoundMissing(b),
               wakeFailure: b.wakeFailure,
               priority: b.priority,
               ...presentationHold(b),
@@ -11783,6 +11886,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
+              reviewerRoundMissing: reviewerRoundMissing(b),
               wakeFailure: b.wakeFailure,
               priority: b.priority,
               ...presentationHold(b),
@@ -11902,6 +12006,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               holdStack: b.holdStack,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
+              reviewerRoundMissing: reviewerRoundMissing(b),
               wakeFailure: b.wakeFailure,
               needsUser: needsUser.has(b.id),
               stuck: stuck.has(b.id),
