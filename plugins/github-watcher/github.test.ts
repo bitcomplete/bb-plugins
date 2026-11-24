@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { labelAlreadyExists, labelPath, parseCompare, parseDefaultBranch, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseMergeBaseIsDefaultTip, parseOpenIssues, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSearchIssues, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, statusLabel, TARGET_QUERY, TARGET_QUERY_BASE } from "./github.js";
+import { labelAlreadyExists, labelPath, parseBacklogIssues, parseCompare, parseDefaultBranch, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseMergeBaseIsDefaultTip, parseOpenIssues, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSearchIssues, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, statusLabel, TARGET_QUERY, TARGET_QUERY_BASE } from "./github.js";
 import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
@@ -366,6 +366,65 @@ describe("an issue as a stewards entity (BB-233)", () => {
       { id: "Acme/Gadgets#9", key: "Acme/Gadgets#9", title: "Other repo", description: "Fingerprint: abc123", state: "open", stateType: null, unit: "Acme/Gadgets", assignee: null },
     ]);
     expect(() => parseSearchIssues({ data: null, errors: [{ type: "RATE_LIMITED", message: "slow down" }] })).toThrow(/slow down/u);
+  });
+});
+
+// BB-396: a repository's whole open backlog, as the contract's backlog issues.
+describe("GitHub backlog issues (BB-396)", () => {
+  const backlogPage = (nodes: Array<Record<string, unknown>>, next: string | null = null) => ({
+    data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", issues: { pageInfo: { hasNextPage: next !== null, endCursor: next }, nodes } } },
+  });
+  const backlogNode = (over: Record<string, unknown> = {}) => ({
+    __typename: "Issue",
+    number: 4,
+    title: "Fix login",
+    state: "OPEN",
+    stateReason: null,
+    createdAt: "2026-10-01T00:00:00Z",
+    updatedAt: "2026-10-02T00:00:00Z",
+    author: { login: "jane" },
+    labels: { nodes: [{ name: "bug" }, { name: "status:todo" }] },
+    assignees: { nodes: [{ login: "dylan" }] },
+    ...over,
+  });
+
+  it("reads a page as the contract's backlog issues, the state a status label or open, with nulls GitHub cannot fill", () => {
+    const out = parseBacklogIssues(backlogPage([backlogNode()]))!;
+    expect(out.next).toBeNull();
+    expect(out.issues).toEqual([
+      {
+        id: "Acme/Widgets#4",
+        key: "Acme/Widgets#4",
+        title: "Fix login",
+        state: "status:todo",
+        stateType: null,
+        unit: "Acme/Widgets",
+        labels: ["bug", "status:todo"],
+        assignees: ["dylan"],
+        priority: null,
+        estimate: null,
+        createdAt: "2026-10-01T00:00:00Z",
+        updatedAt: "2026-10-02T00:00:00Z",
+      },
+    ]);
+    // A closed issue read despite the open-only query keeps its closed state.
+    expect(parseBacklogIssues(backlogPage([backlogNode({ number: 5, state: "CLOSED", stateReason: "COMPLETED" })]))!.issues[0]!.state).toBe("closed (completed)");
+  });
+
+  it("keeps the next cursor, drops a pull request node, and answers null for a repository it cannot see", () => {
+    const paged = parseBacklogIssues(backlogPage([backlogNode(), { __typename: "PullRequest", number: 9, title: "A PR", state: "OPEN", labels: { nodes: [] } }], "Y3Vy"))!;
+    expect(paged.next).toBe("Y3Vy");
+    expect(paged.issues.map((i) => i.key)).toEqual(["Acme/Widgets#4"]);
+    expect(parseBacklogIssues({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] })).toBeNull();
+  });
+
+  it("throws on a read error rather than answering an empty backlog", () => {
+    expect(() => parseBacklogIssues({ data: null, errors: [{ type: "RATE_LIMITED", message: "slow down" }] })).toThrow(/slow down/u);
+  });
+
+  it("a successfully-read issue carries blockedBy: [] and an unread relation does not (BB-385)", () => {
+    expect(parseSnapshot(issue())!.blockedBy).toEqual([]);
+    expect(parseSnapshot(issue(), true)!.blockedBy).toBeUndefined();
   });
 });
 

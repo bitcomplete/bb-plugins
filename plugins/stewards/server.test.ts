@@ -13158,6 +13158,19 @@ describe("the backlog watch (BB-334)", () => {
     ...over,
   });
 
+  /** A backlog playbook for the GitHub backlog tests. */
+  const GITHUB_BACKLOG_WATCH = `---
+name: backlog
+kind: ops
+source: github
+may: []
+models:
+  steward: claude/claude-sonnet-5-5/medium
+requeue-default: 1d
+---
+
+Watch the repository's whole open backlog.`;
+
   /** A project with one backlog role, one ops playbook and one read of team BB. */
   async function watching(options: { roleTeam?: string; projectTeam?: string; noBlock?: boolean; issues?: Array<Record<string, unknown>> } = {}) {
     const t = await setup();
@@ -13236,20 +13249,89 @@ describe("the backlog watch (BB-334)", () => {
     expect(check.lines.filter((l) => l.startsWith("problem:") && l.includes("backlog.team"))).toEqual(["problem: stewards/project.json: backlog.team is OPS but no role watches that team (BB); they must name the same team"]);
   });
 
-  it("accepts a GitHub backlog role, raises no problem and does no GitHub work (BB-395)", async () => {
+  it("reads a GitHub backlog role through the github source, not linear (BB-396)", async () => {
     const t = await setup();
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"] } });
     t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"] } });
     t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[playbookPath("backlog")] = GITHUB_BACKLOG_WATCH;
+    t.setBacklog([backlogIssue({ id: "acme/web#1", key: "acme/web#1", unit: "acme/web", state: "open", stateType: null })]);
     await t.hooks.sweep();
     await t.flush();
     const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
     // A valid GitHub role is not a problem: no backlog line, and the strict
     // project block parses.
     expect(check.lines.filter((l) => l.startsWith("problem:") && l.includes("backlog"))).toEqual([]);
-    // No binding is created for a GitHub target, so no read and no digest.
-    expect(t.hooks.store.openOfKind("p1", "ops").filter((b) => b.entityId.startsWith("backlog/"))).toEqual([]);
+    // The GitHub target has its own binding and its own look, read through the
+    // github-watcher source.
+    const binding = t.hooks.store.byEntity("ops", "backlog/github/acme/web");
+    expect(binding).toMatchObject({ kind: "ops", entityKey: "backlog/github/acme/web", title: "Backlog watch: acme/web", threadId: expect.any(String), endedAt: null });
+    expect(t.hooks.store.binding(binding!.id)!.backlogLook).toMatchObject({ team: "acme/web", error: null, unsupported: false, issues: [expect.objectContaining({ key: "acme/web#1" })] });
+    expect(t.rpcCalls.some((c) => c.pluginId === "github-watcher" && c.method === "sourceBacklog")).toBe(true);
     expect(t.rpcCalls.filter((c) => c.pluginId === "linear" && c.method === "sourceBacklog")).toEqual([]);
+  });
+
+  it("offers a GitHub backlog steward no triage or promotion, and refuses a direct call (BB-396)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"], triage: true, promote: true } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[playbookPath("backlog")] = GITHUB_BACKLOG_WATCH;
+    t.setBacklog([backlogIssue({ id: "acme/web#1", key: "acme/web#1", unit: "acme/web", state: "open", stateType: null })]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/github/acme/web")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_github_backlog" });
+    t.threads.set("thr_github_backlog", { status: "idle", archivedAt: null });
+    const config = await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id: "thr_github_backlog", title: null, parentThreadId: null, sourceThreadId: null } }));
+    // Neither Linear-only write tool is offered, even with both flags on.
+    expect(config.tools.map((x) => x.name)).toEqual(["ticket_read", "ticket_search", "steward_report", "steward_update"]);
+    expect(config.instructions).toMatch(/read-only/u);
+    expect(config.instructions).not.toMatch(/`backlog_triage` adds labels/u);
+    expect(config.instructions).not.toMatch(/`backlog_promote` is your one promotion write/u);
+    // A direct call refuses before any read or write reaches either source.
+    t.rpcCalls.length = 0;
+    const triage = await t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bug"] }, "thr_github_backlog");
+    const promote = await t.tool("backlog_promote", {}, "thr_github_backlog");
+    expect(triage.error).toBe(true);
+    expect(triage.text).toMatch(/Linear-only/u);
+    expect(promote.error).toBe(true);
+    expect(promote.text).toMatch(/Linear-only/u);
+    expect(t.rpcCalls.filter((c) => c.method === "sourceUpdateIssue" || c.method === "sourceComment" || c.method === "sourceBacklog")).toEqual([]);
+  });
+
+  it("puts a GitHub backlog in the digest's one Backlog section (BB-396)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"] } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog", "projectSteward"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[playbookPath("backlog")] = GITHUB_BACKLOG_WATCH;
+    t.setBacklog([backlogIssue({ id: "acme/web#1", key: "acme/web#1", unit: "acme/web", state: "open", stateType: null })]);
+    await t.hooks.sweep();
+    await t.flush();
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const project = t.spawns[0]!.id;
+    const digest = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    // One heading, not a separate GitHub section.
+    expect(digest.match(/### Backlog/gu)).toHaveLength(1);
+    expect(digest).toContain("- acme/web: 1 open");
+  });
+
+  it("wakes a GitHub backlog binding on a GitHub issue doorbell for its repository (BB-396)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"] } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[playbookPath("backlog")] = GITHUB_BACKLOG_WATCH;
+    t.setBacklog([backlogIssue({ id: "acme/web#1", key: "acme/web#1", unit: "acme/web", state: "open", stateType: null })]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/github/acme/web")!;
+    const before = t.hooks.store.binding(binding.id)!.backlogLook!.at;
+    t.advance(60_000);
+    await t.ring("github", "acme/web#1");
+    expect(t.hooks.store.binding(binding.id)!.backlogLook!.at).toBeGreaterThan(before);
   });
 
   it("puts the backlog in the project steward's digest and snapshots the ids after the send (BB-334)", async () => {

@@ -40,7 +40,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, pullList: [] as unknown[], pullListStatus: 200, pullListMessage: "Forbidden", pullListRetryAfter: "120", openIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", issueCreates: [] as Array<{ repo: string; body: Record<string, unknown> }>, issuePatches: [] as Array<{ repo: string; number: number; body: Record<string, unknown> }>, commentCreates: [] as Array<{ repo: string; number: number; body: string }>, subIssueLinks: [] as Array<{ repo: string; parent: number; body: unknown }>, issueCreateStatus: 201, issueCreateMessage: "Validation Failed", issueCreateNumber: 124, subIssueStatus: 200, subIssueMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, rejectSubIssues: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, pullList: [] as unknown[], pullListStatus: 200, pullListMessage: "Forbidden", pullListRetryAfter: "120", openIssues: [] as Array<Record<string, unknown>>, backlogIssues: [] as Array<Record<string, unknown>>, searchIssues: [] as Array<Record<string, unknown>>, labels: { "acme/widgets": ["bb-managed"] } as Record<string, string[]>, labelCreates: [] as string[], labelCreateStatus: 201, labelCreateMessage: "Validation Failed", issueCreates: [] as Array<{ repo: string; body: Record<string, unknown> }>, issuePatches: [] as Array<{ repo: string; number: number; body: Record<string, unknown> }>, commentCreates: [] as Array<{ repo: string; number: number; body: string }>, subIssueLinks: [] as Array<{ repo: string; parent: number; body: unknown }>, issueCreateStatus: 201, issueCreateMessage: "Validation Failed", issueCreateNumber: 124, subIssueStatus: 200, subIssueMessage: "Validation Failed", dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", dependencyGraph: 1 as number | null, dependencyGraphFail: false, deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string>, compareBases: {} as Record<string, { base: string; mergeBase: string }>, defaultBranch: "main" };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -174,7 +174,19 @@ function fakeGitHub() {
       return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: has ? { name: String(v.label) } : null } } });
     }
     if (body.query.includes("pullRequests(")) return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: state.openPulls } } } });
-    if (body.query.includes("issues(")) return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: state.openIssues } } } });
+    if (body.query.includes("issues(")) {
+      // The backlog read (BB-396) has no `labels` variable and pages through
+      // state.backlogIssues by a numeric offset cursor; the adoptable read is
+      // label-scoped and serves state.openIssues.
+      if ((body.variables as { labels?: unknown }).labels === undefined) {
+        const first = Number(body.variables.first ?? 100);
+        const start = body.variables.after === null || body.variables.after === undefined ? 0 : Number(body.variables.after);
+        const nodes = state.backlogIssues.slice(start, start + first);
+        const next = start + first < state.backlogIssues.length ? String(start + first) : null;
+        return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", issues: { pageInfo: { hasNextPage: next !== null, endCursor: next }, nodes } } } });
+      }
+      return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: state.openIssues } } } });
+    }
     if (body.query.includes("object(expression:")) {
       const expression = String((body.variables as { expression?: unknown }).expression ?? "");
       const content = state.files[expression] ?? null;
@@ -941,9 +953,46 @@ describe("stewards' source contract", () => {
     expect(w.github.calls.find((c) => typeof c.variables.q === "string")!.variables.q).toBe("repo:Acme/Widgets in:body abc123");
   });
 
-  it("answers sourceBacklog as unsupported, distinct from an empty backlog (BB-331)", async () => {
+  it("reads a repository's whole open backlog through sourceBacklog, unlabelled and unassigned included (BB-396)", async () => {
     const w = await setup();
-    expect(await w.harness.callRpc("sourceBacklog", { team: "ENG" }, STEWARDS)).toEqual({ issues: [], unsupported: true, truncated: false, errors: [] });
+    w.github.state.backlogIssues = [
+      { __typename: "Issue", number: 3, title: "Fix login", state: "OPEN", stateReason: null, createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-02T00:00:00Z", author: { login: "jane" }, labels: { nodes: [{ name: "bug" }, { name: "status:todo" }] }, assignees: { nodes: [{ login: "dylan" }] } },
+      { __typename: "Issue", number: 4, title: "Add widgets", state: "OPEN", stateReason: null, createdAt: "2026-10-03T00:00:00Z", updatedAt: "2026-10-03T00:00:00Z", author: null, labels: { nodes: [] }, assignees: { nodes: [] } },
+    ];
+    const out = (await w.harness.callRpc("sourceBacklog", { team: "Acme/Widgets" }, STEWARDS)) as { issues: Array<Record<string, unknown>>; unsupported: boolean; truncated: boolean; errors: string[] };
+    expect(out.unsupported).toBe(false);
+    expect(out.truncated).toBe(false);
+    expect(out.errors).toEqual([]);
+    expect(out.issues).toEqual([
+      { id: "Acme/Widgets#3", key: "Acme/Widgets#3", title: "Fix login", state: "status:todo", stateType: null, unit: "Acme/Widgets", labels: ["bug", "status:todo"], assignees: ["dylan"], priority: null, estimate: null, createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-02T00:00:00Z" },
+      { id: "Acme/Widgets#4", key: "Acme/Widgets#4", title: "Add widgets", state: "open", stateType: null, unit: "Acme/Widgets", labels: [], assignees: [], priority: null, estimate: null, createdAt: "2026-10-03T00:00:00Z", updatedAt: "2026-10-03T00:00:00Z" },
+    ]);
+  });
+
+  it("pages a repository's backlog and stops at the cap with truncated (BB-396)", async () => {
+    const w = await setup();
+    w.github.state.backlogIssues = Array.from({ length: 1001 }, (_, i) => ({ __typename: "Issue", number: i + 1, title: `Issue ${i + 1}`, state: "OPEN", stateReason: null, createdAt: null, updatedAt: null, author: null, labels: { nodes: [] }, assignees: { nodes: [] } }));
+    const out = (await w.harness.callRpc("sourceBacklog", { team: "Acme/Widgets" }, STEWARDS)) as { issues: unknown[]; truncated: boolean; errors: string[] };
+    expect(out.truncated).toBe(true);
+    expect(out.issues).toHaveLength(1000);
+    // Ten pages of 100, then the cap stops it without an eleventh call.
+    expect(w.github.calls.filter((c) => (c.variables as { labels?: unknown }).labels === undefined && (c.variables as { first?: unknown }).first === 100)).toHaveLength(10);
+  });
+
+  it("answers a bad repository and an unreadable one as errors, never an empty backlog (BB-396)", async () => {
+    const w = await setup();
+    expect(await w.harness.callRpc("sourceBacklog", { team: "not-a-repo" }, STEWARDS)).toEqual({ issues: [], unsupported: false, truncated: false, errors: ["not-a-repo: not owner/repo"] });
+    expect(((await w.harness.callRpc("sourceBacklog", { team: "acme/gone" }, STEWARDS)) as { errors: string[] }).errors).toEqual(["acme/gone: no such repository, or it is not visible to the signed-in GitHub user"]);
+    // A read that fails is an error too, distinct from an empty list.
+    w.github.state.fail = true;
+    const failed = (await w.harness.callRpc("sourceBacklog", { team: "Acme/Widgets" }, STEWARDS)) as { issues: unknown[]; errors: string[] };
+    expect(failed.issues).toEqual([]);
+    expect(failed.errors[0]).toMatch(/API rate limit exceeded/u);
+  });
+
+  it("reads a repository with no open issues as an empty backlog, not an error (BB-396)", async () => {
+    const w = await setup();
+    expect(await w.harness.callRpc("sourceBacklog", { team: "Acme/Widgets" }, STEWARDS)).toEqual({ issues: [], unsupported: false, truncated: false, errors: [] });
   });
 
   it("files a GitHub issue through sourceCreateIssue, refusing an unsigned description, a priority and anyone but the viewer (BB-360)", async () => {

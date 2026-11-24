@@ -22,6 +22,7 @@ import { z } from "zod";
 import { WATCHES_CHANGED } from "./channels.js";
 import { createGhTokenReader, type TokenReader } from "./gh.js";
 import {
+  BACKLOG_ISSUES_QUERY,
   DEPENDENCY_GRAPH_QUERY,
   FILE_AT_REF_QUERY,
   GITHUB_API_URL,
@@ -43,6 +44,7 @@ import {
   kindName,
   labelAlreadyExists,
   labelPath,
+  parseBacklogIssues,
   parseCompare,
   parseCreatedComment,
   parseCreatedIssue,
@@ -77,7 +79,7 @@ import {
 } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
 import { createPoller, DEFAULT_POLL_TIMING, RateLimitError, type PollResult, type Poller, type PollerTiming } from "./poller.js";
-import { deploymentSchema, ringStewards, signedBy, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type EntitySnapshot, type SearchIssue, type WorkflowRun } from "./source-contract.js";
+import { deploymentSchema, ringStewards, signedBy, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type BacklogIssue, type Deployment, type EntitySnapshot, type SearchIssue, type WorkflowRun } from "./source-contract.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, initialNoChecks, NO_CHECKS_GRACE_MS, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
@@ -120,6 +122,10 @@ export const RATE_LIMIT_FLOOR = 10;
 
 /** How many deployments one poll reads the status of per repository, newest first. */
 export const DEPLOYMENTS_PER_POLL = 20;
+
+/** One page of a repository's open backlog, and the most one `sourceBacklog` call returns in all (BB-396). */
+const BACKLOG_PAGE = 100;
+const BACKLOG_MAX = 1000;
 
 /** How many entity cursors the poller remembers before it drops the oldest. */
 export const INTEREST_CURSOR_MAX = 5000;
@@ -1065,11 +1071,30 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         return { issues: issues.slice(0, limit), unsupported: false, errors };
       },
 
-      // A team's whole backlog is a Linear read; GitHub has no such notion.
-      // Stewards tells "this source cannot do it" apart from an empty list
-      // and from a read error, so this is a typed answer, not a throw.
-      async sourceBacklog() {
-        return { issues: [], unsupported: true, truncated: false, errors: [] };
+      // A repository's whole open backlog (BB-396), read-only: every open
+      // issue, unlabelled and unassigned included, oldest first. The `team`
+      // input carries the repository (`owner/repo`) on this source. Pull
+      // requests are not in GitHub's `issues` connection, so none are read.
+      // Pages stop at the cap and `truncated` says the cap cut the list rather
+      // than the list having ended; a repository that cannot be read is an
+      // error, never an empty-but-successful list.
+      async sourceBacklog({ team }) {
+        const repo = parseRepo(team);
+        if (repo === null) return { issues: [], unsupported: false, truncated: false, errors: [`${team}: not owner/repo`] };
+        try {
+          const issues: BacklogIssue[] = [];
+          let after: string | null = null;
+          do {
+            const page = parseBacklogIssues(await query(BACKLOG_ISSUES_QUERY, { ...repo, first: BACKLOG_PAGE, after }, checkSignal()));
+            if (page === null) return { issues: [], unsupported: false, truncated: false, errors: [`${team}: no such repository, or it is not visible to the signed-in GitHub user`] };
+            issues.push(...page.issues);
+            after = page.next;
+          } while (after !== null && issues.length < BACKLOG_MAX);
+          const truncated = after !== null || issues.length > BACKLOG_MAX;
+          return { issues: issues.slice(0, BACKLOG_MAX), unsupported: false, truncated, errors: [] };
+        } catch (error) {
+          return { issues: [], unsupported: false, truncated: false, errors: [`${team}: ${errorMessage(error)}`] };
+        }
       },
 
       // BB-360: the source-neutral ticket_update. GitHub issues carry labels
