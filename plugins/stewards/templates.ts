@@ -165,10 +165,14 @@ when it fits the promote rule; otherwise your workers do it here.
 If the ready gate has not passed, start no workers: escalate a conflict and
 wait. If scheduling is with the project steward or the binding is held, start
 no workers either; you are woken when it decides or the hold lifts. Otherwise
-start one worker per pull request with a precise task: the
-repo, the branch, the acceptance criteria, and "open a draft pull request,
-link it to the ticket, and stop when checks pass". When the pull requests are
-ready, request review and move the ticket to In Review.
+start one worker per pull request with a precise task: the repo, the branch,
+the acceptance criteria, and that it follows the \`build-tickets\` skill —
+build, test, open a draft pull request that links the ticket, run the
+independent reviewer round (the \`pr-reviewer\` skill), merge by the lane
+gate, and end at merge. Give the task as written; never add "do not merge" or
+"report back before merging", because a worker obeys that when the gate is
+met and the pull request then sits until a person merges it by hand. When the
+pull requests are ready, request review and move the ticket to In Review.
 
 ${SECRET_REQUEST}
 
@@ -179,7 +183,12 @@ ${buildBlocker("the ticket")}
 ## In Review
 
 Follow the linked pull requests. Start a worker to address change requests or
-failing checks. A review wait that outlives its budget reads red and the
+failing checks; a follow-up worker task on an open pull request (a rebase, a
+CI fix) must leave the pull request with a reviewer round on its new head, or
+say that the round already exists. When the lane gate reads "no reviewer
+round yet" and no worker is running, it is not waiting for the plugin to
+merge: start a worker to run the review round on the current head. A review
+wait that outlives its budget reads red and the
 plugin posts one signed nudge naming the requested reviewer; if a second
 budget passes it files the owner's **Review it yourself / Reassign / Keep
 waiting** decide item, and Keep waiting resets the budget once. ${WAIT_SLACK_GUIDANCE} When every
@@ -269,9 +278,14 @@ If the ready gate has not passed, start no workers: escalate a conflict and
 wait. If scheduling is with the project steward or the binding is held, start
 no workers either; you are woken when it decides or the hold lifts. Otherwise
 start one worker per pull request with a precise task: the repo, the branch,
-the acceptance criteria, and "open a draft pull request, name the local ticket
-key in its body, and stop when checks pass". When the pull requests are ready,
-request review and move the ticket to In Review.
+the acceptance criteria, and that it follows the \`build-tickets\` skill —
+build, test, open a draft pull request that names the local ticket key in its
+body, run the independent reviewer round (the \`pr-reviewer\` skill), merge by
+the lane gate, and end at merge. Give the task as written; never add "do not
+merge" or "report back before merging", because a worker obeys that when the
+gate is met and the pull request then sits until a person merges it by hand.
+When the pull requests are ready, request review and move the ticket to In
+Review.
 
 ${SECRET_REQUEST}
 
@@ -282,7 +296,12 @@ ${buildBlocker("the ticket")}
 ## In Review
 
 Follow the linked pull requests. Start a worker to address change requests or
-failing checks. A review wait that outlives its budget reads red and the plugin
+failing checks; a follow-up worker task on an open pull request (a rebase, a
+CI fix) must leave the pull request with a reviewer round on its new head, or
+say that the round already exists. When the lane gate reads "no reviewer
+round yet" and no worker is running, it is not waiting for the plugin to
+merge: start a worker to run the review round on the current head. A review
+wait that outlives its budget reads red and the plugin
 posts one signed nudge naming the requested reviewer; if a second budget passes
 it files the owner's **Review it yourself / Reassign / Keep waiting** decide
 item, and Keep waiting resets the budget once. ${WAIT_SLACK_GUIDANCE} When every
@@ -396,12 +415,17 @@ If the ready gate has not passed, start no workers: escalate a conflict and
 wait. If scheduling is with the project steward or the binding is held, start
 no workers either; you are woken when it decides or the hold lifts. Otherwise
 start one worker per pull request with a precise task: the repo, the branch,
-the acceptance criteria, and "open a draft pull request, name the issue in its
-body, and stop when checks pass". The pull request must NOT use a GitHub
-closing keyword — no \`Fixes #N\`, \`Closes #N\` or \`Resolves #N\` — so GitHub
-does not close the issue at merge; you close it yourself once the merge is
-deployed. When the pull requests are ready, request review and move the issue
-to \`status:in-review\` with \`ticket_update { key, state }\`.
+the acceptance criteria, and that it follows the \`build-tickets\` skill —
+build, test, open a draft pull request that names the issue in its body, run
+the independent reviewer round (the \`pr-reviewer\` skill), merge by the lane
+gate, and end at merge. Give the task as written; never add "do not merge" or
+"report back before merging", because a worker obeys that when the gate is
+met and the pull request then sits until a person merges it by hand. The pull
+request must NOT use a GitHub closing keyword — no \`Fixes #N\`, \`Closes #N\`
+or \`Resolves #N\` — so GitHub does not close the issue at merge; you close it
+yourself once the merge is deployed. When the pull requests are ready, request
+review and move the issue to \`status:in-review\` with
+\`ticket_update { key, state }\`.
 
 ${SECRET_REQUEST}
 
@@ -412,7 +436,12 @@ ${buildBlocker("the issue")}
 ## status:in-review
 
 Follow the linked pull requests. Start a worker to address change requests or
-failing checks. A review wait that outlives its budget reads red and the
+failing checks; a follow-up worker task on an open pull request (a rebase, a
+CI fix) must leave the pull request with a reviewer round on its new head, or
+say that the round already exists. When the lane gate reads "no reviewer
+round yet" and no worker is running, it is not waiting for the plugin to
+merge: start a worker to run the review round on the current head. A review
+wait that outlives its budget reads red and the
 plugin posts one signed nudge naming the requested reviewer; if a second
 budget passes it files the owner's **Review it yourself / Reassign / Keep
 waiting** decide item, and Keep waiting resets the budget once. ${WAIT_SLACK_GUIDANCE} When every

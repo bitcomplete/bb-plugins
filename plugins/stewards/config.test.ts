@@ -48,7 +48,7 @@ import {
   watchProblems,
 } from "./roles.js";
 import { opsTargetKey, parseOpsTargetKey } from "./ops.js";
-import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
+import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, LOCAL_TICKETS, OPS_WATCH, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { parseTemplateStamp, templateHash, templateWarnings } from "./template-stamp.js";
 
 describe("the project file", () => {
@@ -465,6 +465,36 @@ describe("playbooks", () => {
     const linear = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
     if (!linear.ok) throw new Error(linear.error);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/bb stewards escalate/u);
+  });
+
+  // BB-391: a ticket playbook's worker task must not stop at green checks. It
+  // runs the build-tickets review round and merges by the lane gate, and the
+  // review stage says a "no reviewer round yet" gate with no worker means
+  // start a worker to run the round, never wait for the plugin to merge.
+  it("ends each ticket worker task at merge and covers a missing reviewer round (BB-391)", () => {
+    const ticketTemplates: [string, string][] = [
+      ["linear-tickets", LINEAR_TICKETS],
+      ["local-tickets", LOCAL_TICKETS],
+      ["github-issues", GITHUB_ISSUES],
+    ];
+    const flat = (text: string) => text.replace(/\s+/gu, " ");
+    for (const [name, text] of ticketTemplates) {
+      const t = flat(text);
+      // No template tells the worker to stop when checks pass.
+      expect(t, name).not.toMatch(/stop when checks pass/u);
+      // The worker task runs the reviewer round and merges by the lane gate.
+      expect(t, name).toContain("follows the `build-tickets` skill");
+      expect(t, name).toContain("run the independent reviewer round");
+      expect(t, name).toContain("merge by the lane gate");
+      expect(t, name).toContain("Give the task as written");
+      expect(t, name).toContain('never add "do not merge"');
+      // A no-reviewer-round gate with no worker is a worker task, not a wait.
+      expect(t, name).toContain('reads "no reviewer round yet"');
+      expect(t, name).toContain("start a worker to run the review round on the current head");
+      expect(t, name).toContain("not waiting for the plugin to merge");
+      // A follow-up worker task leaves a reviewer round on the new head.
+      expect(t, name).toContain("a follow-up worker task on an open pull request (a rebase, a CI fix) must leave the pull request with a reviewer round on its new head");
+    }
   });
 
   it("tells the PR playbooks that an approval survives small follow-ups and when a human must approve", () => {
