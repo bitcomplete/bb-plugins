@@ -3096,8 +3096,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-362: the backlog role reads `sourceBacklog`, which only the linear
         // source serves, so a project with a Linear backlog and no Linear team
         // cannot run it. Say so plainly rather than reading an empty backlog
-        // for ever. A project with only GitHub repos is not a Linear problem.
-        if (file.linear.teams.length === 0 && backlogRepos.length === 0) problems.push(`${PROJECT_FILE}: backlog needs a Linear team; the backlog role is Linear-only`);
+        // for ever. A project with only GitHub repos is not a Linear problem,
+        // but a GitHub role must not hide a Linear role's missing team.
+        const hasGithubBacklog = backlogRepos.length > 0 || (file.backlog.repos?.length ?? 0) > 0;
+        if (file.linear.teams.length === 0 && (backlogTeams.length > 0 || file.backlog.team !== undefined || !hasGithubBacklog)) problems.push(`${PROJECT_FILE}: backlog needs a Linear team; the backlog role is Linear-only`);
         if (backlogTeams.length === 0 && backlogRepos.length === 0) problems.push(`${PROJECT_FILE}: backlog is configured but no role watches a backlog; add a backlog role or remove the block`);
         else if (file.backlog.team !== undefined && !backlogTeams.includes(file.backlog.team)) problems.push(`${PROJECT_FILE}: backlog.team is ${file.backlog.team} but no role watches that team (${backlogTeams.join(", ")}); they must name the same team`);
       }

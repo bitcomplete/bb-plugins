@@ -20147,4 +20147,12 @@ describe("no-Linear projects (BB-362)", () => {
     const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
     expect(check.stdout).toMatch(/backlog needs a Linear team; the backlog role is Linear-only/u);
   });
+
+  it("keeps the Linear-only problem line when a GitHub backlog role is also present (BB-395)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: {} });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { team: "BB" } }, gh: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"], joe: ["gh"] } });
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/backlog needs a Linear team; the backlog role is Linear-only/u);
+  });
 });
