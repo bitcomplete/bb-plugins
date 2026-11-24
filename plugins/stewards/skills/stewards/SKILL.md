@@ -262,7 +262,8 @@ Two tools are yours; everything else you do with the tools every thread has.
   server, so this server adopts it as an ordinary labelled ticket and you
   specify it the usual way. The backlog steward may also have triaged it
   first — kind, `repo:` and `size:` labels, `duplicate`/`blockedBy`/`related`
-  relations, or a priority, and at most one question comment — and it touches
+  relations, or a priority, and signed comments within the project's comment
+  budget (a question, or a stale-cancel proposal) — and it touches
   the ticket no more once the ticket is adopted. Treat that as input, not as
   work to redo, and do not wait for the backlog steward to act again.
 - **Comments, not description edits.** Start a spec comment with
