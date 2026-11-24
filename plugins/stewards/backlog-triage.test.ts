@@ -235,3 +235,67 @@ describe("the plan (BB-341)", () => {
     expect(planIsEmpty({ addLabels: [], relations: [], priority: "none", comment: null })).toBe(false);
   });
 });
+
+describe("the GitHub triage path (BB-397)", () => {
+  const githubConfig = (over: Partial<TriageConfig> = {}): TriageConfig => config({ source: "github", team: "acme/web", repos: ["acme/web", "acme/bb"], ...over });
+  const githubTicket = (over: Partial<TriageTicket> = {}): TriageTicket => ticket({ key: "acme/web#1", unit: "acme/web", state: "open", stateType: null, priority: null, labels: [], assignees: [], updatedAt: "2026-10-14T00:00:00Z", ...over });
+  const githubParams = (over: Partial<BacklogTriageParams> = {}): BacklogTriageParams => ({ key: "acme/web#1", ...over });
+  const githubDecide = (over: Partial<Parameters<typeof decideTriage>[0]> = {}) =>
+    decideTriage({ params: githubParams(), ticket: githubTicket(), config: githubConfig(), ledger: [], bound: false, now: NOW, relatedTeams: new Map(), signedComment: SIGNED, ...over });
+
+  it("accepts the fixed label vocabulary, including repo:<name>", () => {
+    const result = githubDecide({ params: githubParams({ addLabels: ["bug", "repo:web", "size:S"] }) });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.plan).toMatchObject({ addLabels: ["bug", "repo:web", "size:S"], priority: null, relations: [] });
+    expect(reason(githubDecide({ params: githubParams({ addLabels: ["size:XL"] }) }))).toMatch(/not in the triage vocabulary/u);
+    // The adoption label is refused on GitHub exactly as on Linear.
+    expect(reason(githubDecide({ params: githubParams({ addLabels: ["bb-managed"] }) }))).toMatch(/adoption label/u);
+  });
+
+  it("matches the watched repository ignoring case", () => {
+    expect(githubDecide({ ticket: githubTicket({ unit: "Acme/Web" }), params: githubParams({ addLabels: ["bug"] }) }).ok).toBe(true);
+  });
+
+  it("refuses a priority and a relation before any write", () => {
+    expect(reason(githubDecide({ params: githubParams({ priority: "high" }) }))).toMatch(/no priority/u);
+    expect(reason(githubDecide({ params: githubParams({ relations: [{ type: "related", issue: "acme/web#2" }] }) }))).toMatch(/no relations/u);
+    // The refusal is the whole call: a label in the same call is not written.
+    expect(reason(githubDecide({ params: githubParams({ addLabels: ["bug"], priority: "high" }) }))).toMatch(/no priority/u);
+  });
+
+  it("refuses a closed issue and an issue in another repository", () => {
+    expect(reason(githubDecide({ ticket: githubTicket({ state: "closed" }) }))).toMatch(/closed/u);
+    expect(reason(githubDecide({ ticket: githubTicket({ state: "closed (not planned)" }) }))).toMatch(/closed/u);
+    expect(reason(githubDecide({ ticket: githubTicket({ unit: "acme/other" }) }))).toMatch(/not the watched team/u);
+  });
+
+  it("refuses a bound or adopted issue", () => {
+    expect(reason(githubDecide({ bound: true }))).toMatch(/already bound/u);
+    // The adoption label plus an assignee is an adopted issue.
+    expect(reason(githubDecide({ ticket: githubTicket({ labels: ["bb-managed"], assignees: ["jane"] }) }))).toMatch(/adopted/u);
+  });
+
+  it("refuses a pull request key, which is spelled owner/repo#N like an issue", () => {
+    expect(reason(githubDecide({ ticket: githubTicket({ kind: "pull" }) }))).toMatch(/issues only/u);
+  });
+
+  it("keeps the comment budget and the one-open-question rule", () => {
+    const question = entry({ kind: "comment", detail: { kind: "question" }, at: NOW - DAY });
+    expect(reason(githubDecide({ params: githubParams({ comment: "Again?" }), ledger: [question] }))).toMatch(/budget/u);
+    expect(reason(githubDecide({ params: githubParams({ comment: "Second?" }), ledger: [question], config: githubConfig({ commentsPerWeek: 2 }) }))).toMatch(/open question/u);
+    const reply: SnapshotComment = { id: "c2", author: "Sam", did: "commented", body: "Yes", createdAt: new Date(NOW - 1000).toISOString(), url: null, signedBy: null };
+    expect(githubDecide({ params: githubParams({ comment: "Second?" }), ledger: [question], config: githubConfig({ commentsPerWeek: 2 }), ticket: githubTicket({ comments: [reply] }) }).ok).toBe(true);
+  });
+
+  it("accepts a stale-cancel proposal only after staleDays", () => {
+    const stale = githubTicket({ updatedAt: new Date(NOW - 20 * DAY).toISOString() });
+    const result = githubDecide({ params: githubParams({ comment: "Propose closing this.", proposeCancel: true }), ticket: stale });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.plan.comment?.kind).toBe("stale");
+    expect(reason(githubDecide({ params: githubParams({ comment: "Propose closing this.", proposeCancel: true }), ticket: githubTicket({ updatedAt: new Date(NOW - 2 * DAY).toISOString() }) }))).toMatch(/not stale/u);
+  });
+
+  it("is read-only when triage is off", () => {
+    expect(reason(githubDecide({ config: githubConfig({ triage: false }), params: githubParams({ addLabels: ["bug"] }) }))).toMatch(/triage is off/u);
+  });
+});

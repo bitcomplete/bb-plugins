@@ -13271,7 +13271,7 @@ Watch the repository's whole open backlog.`;
     expect(t.rpcCalls.filter((c) => c.pluginId === "linear" && c.method === "sourceBacklog")).toEqual([]);
   });
 
-  it("offers a GitHub backlog steward no triage or promotion, and refuses a direct call (BB-396)", async () => {
+  it("offers a GitHub backlog steward triage but not promotion, and refuses a GitHub promotion (BB-397)", async () => {
     const t = await setup();
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"], triage: true, promote: true } });
     t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"] } });
@@ -13284,17 +13284,13 @@ Watch the repository's whole open backlog.`;
     t.hooks.store.patch(binding.id, { threadId: "thr_github_backlog" });
     t.threads.set("thr_github_backlog", { status: "idle", archivedAt: null });
     const config = await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id: "thr_github_backlog", title: null, parentThreadId: null, sourceThreadId: null } }));
-    // Neither Linear-only write tool is offered, even with both flags on.
-    expect(config.tools.map((x) => x.name)).toEqual(["ticket_read", "ticket_search", "steward_report", "steward_update"]);
-    expect(config.instructions).toMatch(/read-only/u);
-    expect(config.instructions).not.toMatch(/`backlog_triage` adds labels/u);
+    // Triage is offered with the flag on; promotion stays Linear-only.
+    expect(config.tools.map((x) => x.name)).toEqual(["backlog_triage", "ticket_read", "ticket_search", "steward_report", "steward_update"]);
+    expect(config.instructions).toMatch(/`backlog_triage` adds labels or posts one comment/u);
     expect(config.instructions).not.toMatch(/`backlog_promote` is your one promotion write/u);
-    // A direct call refuses before any read or write reaches either source.
+    // A direct promotion refuses before any read or write reaches either source.
     t.rpcCalls.length = 0;
-    const triage = await t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bug"] }, "thr_github_backlog");
     const promote = await t.tool("backlog_promote", {}, "thr_github_backlog");
-    expect(triage.error).toBe(true);
-    expect(triage.text).toMatch(/Linear-only/u);
     expect(promote.error).toBe(true);
     expect(promote.text).toMatch(/Linear-only/u);
     expect(t.rpcCalls.filter((c) => c.method === "sourceUpdateIssue" || c.method === "sourceComment" || c.method === "sourceBacklog")).toEqual([]);
@@ -13731,6 +13727,155 @@ describe("the backlog triage writes (BB-341)", () => {
     const digest = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
     expect(digest).toContain("- Writes: BB-1 label");
     expect(digest).toMatch(/- Refused: size:XL .*\(1\)/u);
+  });
+});
+
+describe("the GitHub backlog triage writes (BB-397)", () => {
+  const GITHUB_BACKLOG_WATCH = `---
+name: backlog
+kind: ops
+source: github
+may: []
+models:
+  steward: claude/claude-sonnet-5-5/medium
+requeue-default: 1d
+---
+
+Watch the repository's whole open backlog.`;
+
+  const githubBacklogIssue = (over: Record<string, unknown> = {}) => ({ id: "acme/web#1", key: "acme/web#1", title: "Fix login", state: "open", stateType: null, unit: "acme/web", labels: [], assignees: [], priority: null, estimate: null, createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-14T00:00:00Z", ...over });
+
+  /** A project with a GitHub backlog role and its steward thread, and one un-adopted issue the tool reads. */
+  async function triagingGithub(options: { triage?: boolean; block?: Record<string, unknown>; ticket?: Partial<EntitySnapshot>; comments?: EntitySnapshot["comments"] } = {}) {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] }, backlog: { repos: ["acme/web"], triage: options.triage ?? true, ...(options.block ?? {}) } });
+    t.files[ROLES_FILE] = JSON.stringify({ version: 2, roles: { backlog: { backlog: { repos: ["acme/web"] } } }, holders: { jane: ["backlog"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.files[playbookPath("backlog")] = GITHUB_BACKLOG_WATCH;
+    t.setBacklog([githubBacklogIssue()]);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.byEntity("ops", "backlog/github/acme/web")!;
+    t.hooks.store.patch(binding.id, { threadId: "thr_github_backlog" });
+    t.threads.set("thr_github_backlog", { status: "idle", archivedAt: null });
+    t.entities.set("acme/web#1", githubIssue({ id: "acme/web#1", key: "acme/web#1", unit: "acme/web", state: "open", stateType: null, labels: [], assignees: [], priority: null, updatedAt: "2026-10-14T00:00:00Z", comments: options.comments ?? [], ...(options.ticket ?? {}) }));
+    return { t, binding };
+  }
+
+  const tools = async (t: Awaited<ReturnType<typeof setup>>, id: string) => (await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id, title: null, parentThreadId: null, sourceThreadId: null } }))).tools.map((x) => x.name);
+
+  it("is offered only when backlog.triage is true, and absent writes nothing", async () => {
+    const readTools = ["ticket_read", "ticket_search", "steward_report", "steward_update"];
+    const off = await triagingGithub({ triage: false });
+    expect(await tools(off.t, "thr_github_backlog")).toEqual(readTools);
+    expect((await off.t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bug"] }, "thr_github_backlog")).error).toBe(true);
+    expect(off.t.linearWrites).toEqual([]);
+
+    const on = await triagingGithub({ triage: true });
+    expect(await tools(on.t, "thr_github_backlog")).toEqual(["backlog_triage", ...readTools]);
+  });
+
+  it("writes labels and a signed comment through the github source, and records each in the ledger", async () => {
+    const { t } = await triagingGithub();
+    const result = await t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bug", "repo:web", "size:S"], comment: "Is SSO in scope?" }, "thr_github_backlog");
+    expect(result.error).toBe(false);
+    expect(result.text).toMatch(/Triaged acme\/web#1/u);
+    const update = t.linearWrites.find((w) => w.method === "sourceUpdateIssue")!;
+    expect(update.input).toMatchObject({ key: "acme/web#1", addLabels: ["bug", "repo:web", "size:S"] });
+    expect("priority" in update.input).toBe(false);
+    expect(update.input.relations).toEqual([]);
+    const comment = t.linearWrites.find((w) => w.method === "sourceComment")!;
+    expect(String(comment.input.body)).toContain("Is SSO in scope?");
+    expect(String(comment.input.body)).toContain("from bb thread thr_github_backlog");
+    // The writes go through the github-watcher source, never linear.
+    expect(t.rpcCalls.some((c) => c.pluginId === "github-watcher" && c.method === "sourceUpdateIssue")).toBe(true);
+    expect(t.rpcCalls.filter((c) => c.pluginId === "linear" && (c.method === "sourceUpdateIssue" || c.method === "sourceComment"))).toEqual([]);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "acme/web" });
+    expect(ledger.map((e) => `${e.outcome}:${e.kind}`)).toEqual(["accepted:label", "accepted:comment"]);
+  });
+
+  it("refuses a priority and a relation for a GitHub target, with a refused ledger entry and no write RPC", async () => {
+    const { t } = await triagingGithub();
+    t.rpcCalls.length = 0;
+    const priority = await t.tool("backlog_triage", { key: "acme/web#1", priority: "high" }, "thr_github_backlog");
+    expect(priority.error).toBe(true);
+    expect(priority.text).toMatch(/no priority/u);
+    const relation = await t.tool("backlog_triage", { key: "acme/web#1", relations: [{ type: "related", issue: "acme/web#2" }] }, "thr_github_backlog");
+    expect(relation.error).toBe(true);
+    expect(relation.text).toMatch(/no relations/u);
+    expect(t.linearWrites).toEqual([]);
+    expect(t.rpcCalls.filter((c) => c.method === "sourceUpdateIssue" || c.method === "sourceComment")).toEqual([]);
+    const ledger = t.hooks.store.backlogWrites("p1", { team: "acme/web" });
+    expect(ledger).toHaveLength(2);
+    expect(ledger.every((e) => e.outcome === "refused" && e.kind === "triage")).toBe(true);
+  });
+
+  it("refuses the second comment in the window", async () => {
+    const { t } = await triagingGithub({ block: { commentsPerWeek: 1 } });
+    const first = await t.tool("backlog_triage", { key: "acme/web#1", comment: "First question?" }, "thr_github_backlog");
+    expect(first.error).toBe(false);
+    const second = await t.tool("backlog_triage", { key: "acme/web#1", comment: "Second question?" }, "thr_github_backlog");
+    expect(second.error).toBe(true);
+    expect(second.text).toMatch(/budget/u);
+    expect(t.linearWrites.filter((w) => w.method === "sourceComment")).toHaveLength(1);
+    expect(t.hooks.store.backlogWrites("p1", { team: "acme/web" }).filter((e) => e.outcome === "refused" && e.kind === "triage")).toHaveLength(1);
+  });
+
+  it("refuses a second open question until a human replies", async () => {
+    const { t } = await triagingGithub({ block: { commentsPerWeek: 2 } });
+    expect((await t.tool("backlog_triage", { key: "acme/web#1", comment: "First question?" }, "thr_github_backlog")).error).toBe(false);
+    const second = await t.tool("backlog_triage", { key: "acme/web#1", comment: "Second question?" }, "thr_github_backlog");
+    expect(second.error).toBe(true);
+    expect(second.text).toMatch(/open question/u);
+
+    // A human reply after the question lets the next one through.
+    const replied = await triagingGithub({ block: { commentsPerWeek: 2 }, comments: [{ id: "c9", author: "sam", did: "commented", body: "Yes", createdAt: "2026-10-14T16:00:00Z", url: null, signedBy: null }] });
+    expect((await replied.t.tool("backlog_triage", { key: "acme/web#1", comment: "First question?" }, "thr_github_backlog")).error).toBe(false);
+    expect((await replied.t.tool("backlog_triage", { key: "acme/web#1", comment: "Second question?" }, "thr_github_backlog")).error).toBe(false);
+  });
+
+  it("accepts a stale-cancel proposal only after staleDays", async () => {
+    const stale = await triagingGithub({ ticket: { updatedAt: "2026-09-01T00:00:00Z" } });
+    const ok = await stale.t.tool("backlog_triage", { key: "acme/web#1", comment: "Propose closing this.", proposeCancel: true }, "thr_github_backlog");
+    expect(ok.error).toBe(false);
+    expect(stale.t.hooks.store.backlogWrites("p1", { team: "acme/web" }).at(-1)).toMatchObject({ outcome: "accepted", kind: "comment", detail: { kind: "stale" } });
+
+    const fresh = await triagingGithub({ ticket: { updatedAt: "2026-10-14T00:00:00Z" } });
+    const refused = await fresh.t.tool("backlog_triage", { key: "acme/web#1", comment: "Propose closing this.", proposeCancel: true }, "thr_github_backlog");
+    expect(refused.error).toBe(true);
+    expect(refused.text).toMatch(/not stale/u);
+    expect(fresh.t.linearWrites).toEqual([]);
+  });
+
+  it("refuses a closed, adopted or another-repository issue, and a label outside the vocabulary or an adoption label", async () => {
+    const closed = await triagingGithub({ ticket: { state: "closed" } });
+    expect((await closed.t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bug"] }, "thr_github_backlog")).text).toMatch(/closed/u);
+
+    const adopted = await triagingGithub({ ticket: { labels: ["bb-managed"], assignees: ["jane"] } });
+    expect((await adopted.t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bug"] }, "thr_github_backlog")).text).toMatch(/adopted/u);
+
+    const other = await triagingGithub({ ticket: { unit: "acme/other" } });
+    expect((await other.t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bug"] }, "thr_github_backlog")).text).toMatch(/not the watched team/u);
+
+    const outside = await triagingGithub();
+    expect((await outside.t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["size:XL"] }, "thr_github_backlog")).text).toMatch(/not in the triage vocabulary/u);
+
+    const adoption = await triagingGithub();
+    expect((await adoption.t.tool("backlog_triage", { key: "acme/web#1", addLabels: ["bb-managed"] }, "thr_github_backlog")).text).toMatch(/adoption label/u);
+    expect(adoption.t.linearWrites).toEqual([]);
+  });
+
+  it("refuses a pull-request key, records the refusal and makes no write RPC", async () => {
+    const { t } = await triagingGithub();
+    // A pull request is keyed owner/repo#N like an issue; the backlog steward
+    // manages issues only.
+    t.entities.set("acme/web#7", pull());
+    const result = await t.tool("backlog_triage", { key: "acme/web#7", addLabels: ["bug"] }, "thr_github_backlog");
+    expect(result.error).toBe(true);
+    expect(result.text).toMatch(/issues only/u);
+    expect(t.linearWrites).toEqual([]);
+    expect(t.rpcCalls.filter((c) => c.method === "sourceUpdateIssue" || c.method === "sourceComment")).toEqual([]);
+    expect(t.hooks.store.backlogWrites("p1", { team: "acme/web" })).toEqual([expect.objectContaining({ outcome: "refused", kind: "triage", issueKey: "acme/web#7" })]);
   });
 });
 

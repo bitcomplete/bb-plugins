@@ -12963,12 +12963,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // offered to a backlog thread. The tool re-reads the flag itself, so
         // turning it off refuses at once even before the selection refreshes.
         const backlogBlock = configs.get(b.projectId)?.value?.file.backlog;
-        // BB-396: triage writes and promotion are Linear-only, so a GitHub
-        // backlog steward is read-only. Neither tool is offered, and the prompt
-        // says so, rather than inviting a tool that can only fail.
-        const linearBacklog = target?.kind === "backlog" && target.source === "linear";
-        const backlogTriage = linearBacklog && backlogBlock?.triage === true;
-        const backlogPromote = linearBacklog && backlogBlock?.promote === true;
+        // BB-397: triage writes are offered for a GitHub backlog too, when
+        // `backlog.triage` is on. Promotion stays Linear-only (child C), so a
+        // GitHub steward never gets `backlog_promote`, and the prompt says so
+        // rather than inviting a tool that can only fail.
+        const githubBacklog = target?.kind === "backlog" && target.source === "github";
+        const backlogTriage = target?.kind === "backlog" && backlogBlock?.triage === true;
+        const backlogPromote = target?.kind === "backlog" && target.source === "linear" && backlogBlock?.promote === true;
         if (target?.kind === "backlog") {
           const backlogWrites = ["steward_report", "steward_update", ...(backlogTriage ? ["backlog_triage"] : []), ...(backlogPromote ? ["backlog_promote"] : []), "ticket_read", "ticket_search"];
           return {
@@ -12977,14 +12978,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             instructions:
               `You are the backlog steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
               "The plugin reads the target (a Linear team or a GitHub repository) for you and every wake carries the whole open backlog. You never edit a description, start a worker, cancel or close a ticket. " +
-              (target.source !== "linear"
-                ? "This is a GitHub backlog, so it is read-only: triage writes and promotion are Linear-only, and neither `backlog_triage` nor `backlog_promote` is offered. "
-                : (backlogTriage
-                    ? "`backlog_triage` adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
-                    : "The backlog is read-only for triage on this project: `backlog.triage` is off. ") +
-                  (backlogPromote
-                    ? "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit; the plugin picks the ticket, so a key that is not the top-ordered eligible one is ignored. "
-                    : "No promotion is offered: `backlog.promote` is off. ")) +
+              (backlogTriage
+                ? githubBacklog
+                  ? "`backlog_triage` adds labels or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window; GitHub issues have no priority and no relations, so those writes are refused. "
+                  : "`backlog_triage` adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
+                : "The backlog is read-only for triage on this project: `backlog.triage` is off. ") +
+              (githubBacklog
+                ? "Promotion is Linear-only, so no `backlog_promote` is offered. "
+                : backlogPromote
+                  ? "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit; the plugin picks the ticket, so a key that is not the top-ordered eligible one is ignored. "
+                  : "No promotion is offered: `backlog.promote` is off. ") +
               "`ticket_read` and `ticket_search` are reads only. End every turn you were woken for with steward_report. Read the stewards skill for the protocol.",
           };
         }
@@ -13252,7 +13255,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "backlog_triage",
       description:
-        "Triage one un-adopted ticket in your backlog team: add kind (bug/feature/chore), repo:<name> and size:S|M|L labels; add duplicate/blockedBy/related relations; set a priority that is unset or last set by you; or post one signed comment (a question, or with proposeCancel a stale-cancel proposal). It never edits a description, changes state, assigns, cancels or closes, and it enforces the comment budget, the one-open-question rule and the stale window.",
+        "Triage one un-adopted ticket in your backlog: add kind (bug/feature/chore), repo:<name> and size:S|M|L labels; on a Linear backlog add duplicate/blockedBy/related relations or set a priority that is unset or last set by you (GitHub issues have neither, so those writes are refused); or post one signed comment (a question, or with proposeCancel a stale-cancel proposal). It never edits a description, changes state, assigns, cancels or closes, and it enforces the comment budget, the one-open-question rule and the stale window.",
       presentation: { label: { pending: "Triaging a backlog ticket", completed: "Triaged a backlog ticket" } },
       parameters: backlogTriageParamsSchema,
       execute: store.coalescingTool(async (input, { threadId }) => {
@@ -13261,9 +13264,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (binding === null || target === null || target.kind !== "backlog") {
           return toolError(new Error("backlog_triage is for a backlog steward's thread; this thread is not one."));
         }
-        // BB-396: triage is a Linear write; a GitHub backlog is read-only, and
-        // the refusal happens before any read or ledger write.
-        if (target.source !== "linear") return toolError(new Error("backlog_triage is Linear-only; a GitHub backlog is read-only."));
+        // BB-397: triage reads and writes through the target's own source. The
+        // pure decision refuses a priority or a relation for a GitHub target
+        // before any write.
+        const source = target.source;
         const projectId = binding.projectId;
         const team = target.unit;
         const record = (outcome: "accepted" | "refused", kind: BacklogWrite["kind"], detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
@@ -13279,6 +13283,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const triageConfig: TriageConfig = {
             triage: block?.triage === true,
             team,
+            source,
             commentsPerWeek: block?.commentsPerWeek ?? 1,
             staleDays: block?.staleDays ?? 14,
             label: config.file.label,
@@ -13289,14 +13294,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (!triageConfig.triage) return toolError(new Error("backlog.triage is off; the backlog steward is read-only."));
 
           // Fail closed: a ticket that cannot be read is refused, and no
-          // Linear write happens.
-          const entity = await snapshot("linear", input.key).catch((error: unknown) => {
+          // write happens.
+          const entity = await snapshot(source, input.key).catch((error: unknown) => {
             throw new Error(`${input.key} could not be read: ${errorMessage(error)}`);
           });
-          if (entity === null) return toolError(new Error(`No Linear issue ${input.key}, or it is not visible to the connected user.`));
+          if (entity === null) return toolError(new Error(`No issue ${input.key}, or it is not visible to the connected user.`));
           const ticket: TriageTicket = {
             key: entity.key,
             unit: entity.unit,
+            kind: entity.kind,
             labels: entity.labels,
             priority: entity.priority,
             state: entity.state,
@@ -13307,10 +13313,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           };
           const bound = store.find(entity.key, projectId) !== null || store.find(entity.id, projectId) !== null;
 
+          // Relations exist on Linear only; a GitHub call carrying one is
+          // refused by the pure decision, so no read is made for it here.
           const relatedTeams = new Map<string, string>();
-          for (const relation of input.relations ?? []) {
-            const related = await snapshot("linear", relation.issue).catch(() => null);
-            if (related !== null) relatedTeams.set(relation.issue.trim().toLowerCase(), related.unit);
+          if (source === "linear") {
+            for (const relation of input.relations ?? []) {
+              const related = await snapshot(source, relation.issue).catch(() => null);
+              if (related !== null) relatedTeams.set(relation.issue.trim().toLowerCase(), related.unit);
+            }
           }
 
           let ledger: BacklogWrite[];
@@ -13331,11 +13341,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           // Labels, priority and relations in one RPC, then the comment. A
           // failure writes a refusal; nothing is reported as accepted that
-          // Linear refused.
+          // the source refused.
           if (plan.addLabels.length > 0 || plan.priority !== null || plan.relations.length > 0) {
             try {
               await sourceRpc(
-                "linear",
+                source,
                 "sourceUpdateIssue",
                 { key: entity.key, addLabels: plan.addLabels, ...(plan.priority === null ? {} : { priority: plan.priority }), relations: plan.relations },
                 sourceContract.sourceUpdateIssue.output,
@@ -13351,7 +13361,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           if (plan.comment !== null) {
             try {
-              await sourceRpc("linear", "sourceComment", { key: entity.key, body: plan.comment.body }, sourceContract.sourceComment.output);
+              await sourceRpc(source, "sourceComment", { key: entity.key, body: plan.comment.body }, sourceContract.sourceComment.output);
             } catch (error) {
               const reason = `the comment was refused: ${errorMessage(error)}`;
               record("refused", "comment", { kind: plan.comment.kind }, reason, entity.id, entity.key);
