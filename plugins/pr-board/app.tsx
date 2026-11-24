@@ -263,9 +263,9 @@ type AgentModelContext = z.infer<
   (typeof rpcContract)["agent_model_get"]["output"]
 >;
 type ReviewerLoad =
-  | { kind: "idle" | "loading" }
+  | { kind: "loading" }
   | { kind: "error"; message: string }
-  | { kind: "ready"; rows: ReviewerOptions };
+  | { kind: "ready"; option: ReviewerOptions[number] };
 function OneClick({
   prs,
   view,
@@ -276,13 +276,28 @@ function OneClick({
   refetch: () => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
-  const [load, setLoad] = useState<ReviewerLoad>({ kind: "idle" });
-  const pending = useRef<Promise<ReviewerOptions> | null>(null);
+  const [load, setLoad] = useState<Map<string, ReviewerLoad>>(new Map());
+  const pending = useRef<Map<string, Promise<ReviewerOptions>>>(new Map());
   const [chosen, setChosen] = useState<Map<string, string[]>>(new Map());
   const [sent, setSent] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    const listed = new Set(prs.map((pr) => pr.row.key));
+    const keepListed = <T,>(current: Map<string, T>) => {
+      const next = new Map([...current].filter(([key]) => listed.has(key)));
+      return next.size === current.size ? current : next;
+    };
+    setLoad(keepListed);
+    setChosen(keepListed);
+    setSent((current) => {
+      const next = new Set([...current].filter((key) => listed.has(key)));
+      return next.size === current.size ? current : next;
+    });
+    for (const key of pending.current.keys())
+      if (!listed.has(key)) pending.current.delete(key);
+  }, [prs]);
   const groups = view.reviewer_batches
     .map((batch) => ({
       ...batch,
@@ -304,58 +319,93 @@ function OneClick({
     const login = groups.find((batch) => batch.keys.includes(row.key))?.login;
     return login ? [login] : row.review_targets;
   };
-  const reviewersFor = (row: CalmRow, options: ReviewerOptions | null) => {
+  const optionsFor = (key: string) => {
+    const result = load.get(key);
+    return result?.kind === "ready" ? result.option : undefined;
+  };
+  const reviewersFor = (row: CalmRow, option = optionsFor(row.key)) => {
     const selected = chosen.get(row.key) ?? suggestion(row);
-    const candidates = options?.find((option) => option.key === row.key)?.candidates;
     return [...new Set(selected)]
       .filter((login) =>
-        options === null || candidates?.some((candidate) => candidate.login === login),
+        option === undefined || option.candidates.some((candidate) => candidate.login === login),
       )
       .slice(0, 10);
   };
-  const loadCandidates = () => {
-    if (!pending.current) {
-      setLoad({ kind: "loading" });
-      pending.current = rpc
-        .call("reviewers_get", { keys: prs.map((pr) => pr.row.key) })
+  const loadCandidates = async (rows: CalmRow[]) => {
+    const missing = rows.map((row) => row.key).filter((key) =>
+      !optionsFor(key) && !pending.current.has(key),
+    );
+    for (let start = 0; start < missing.length; start += 100) {
+      const keys = missing.slice(start, start + 100);
+      setLoad((current) => {
+        const next = new Map(current);
+        for (const key of keys) next.set(key, { kind: "loading" });
+        return next;
+      });
+      const request: Promise<ReviewerOptions> = rpc
+        .call("reviewers_get", { keys })
         .then(
           (options) => {
-            setLoad({ kind: "ready", rows: options });
-            return options;
+            const loaded = keys.map((key) => options.find((option) => option.key === key) ??
+              { key, candidates: [], note: null },
+            );
+            setLoad((current) => {
+              const next = new Map(current);
+              for (const option of loaded)
+                if (pending.current.get(option.key) === request)
+                  next.set(option.key, { kind: "ready", option });
+              return next;
+            });
+            return loaded;
           },
           (cause) => {
-            pending.current = null;
-            setLoad({ kind: "error", message: message(cause) });
+            const failed = keys.filter((key) => pending.current.get(key) === request);
+            for (const key of failed) pending.current.delete(key);
+            setLoad((current) => {
+              const next = new Map(current);
+              for (const key of failed) next.set(key, { kind: "error", message: message(cause) });
+              return next;
+            });
             throw cause;
           },
         );
+      for (const key of keys) pending.current.set(key, request);
     }
-    return pending.current;
+    const ready = rows.flatMap((row) => optionsFor(row.key) ?? []);
+    const requests = new Set(rows.flatMap((row) => {
+      const request = pending.current.get(row.key);
+      return !optionsFor(row.key) && request ? [request] : [];
+    }));
+    return [...ready, ...(await Promise.all(requests)).flat()];
   };
-  const options = load.kind === "ready" ? load.rows : null;
   const sendable = prs.filter((pr) =>
-    !sent.has(pr.row.key) && reviewersFor(pr.row, options).length,
+    !sent.has(pr.row.key) && reviewersFor(pr.row).length,
   );
   const send = async (rows: CalmRow[]) => {
     if (busy) return;
     setBusy(true);
     setError(null);
     try {
-      const options = await loadCandidates();
+      const options = await loadCandidates(rows);
       const requests = rows.filter((row) => !sent.has(row.key)).flatMap((row) => {
-        const reviewers = reviewersFor(row, options);
+        const reviewers = reviewersFor(row, options.find((option) => option.key === row.key));
         return reviewers.length ? [{ key: row.key, reviewers }] : [];
       });
       if (!requests.length) return;
-      const result = await rpc.call("reviewers_request", { requests });
-      setSent((current) => new Set([...current, ...result.sent]));
-      refetch();
-      setNotice(
-        `${result.sent.length} review ${result.sent.length === 1 ? "request" : "requests"} sent.${result.skipped.length ? ` ${result.skipped.map((skip) => {
-          const row = rows.find((row) => row.key === skip.key);
-          return `${row ? `${row.title} #${row.number}` : skip.key}: ${skip.reason}`;
-        }).join(" · ")}` : ""}`,
-      );
+      const result: z.infer<typeof rpcContract.reviewers_request.output> = { sent: [], skipped: [] };
+      for (let start = 0; start < requests.length; start += 100) {
+        const batch = await rpc.call("reviewers_request", { requests: requests.slice(start, start + 100) });
+        result.sent.push(...batch.sent);
+        result.skipped.push(...batch.skipped);
+        setSent((current) => new Set([...current, ...batch.sent]));
+        refetch();
+        setNotice(
+          `${result.sent.length} review ${result.sent.length === 1 ? "request" : "requests"} sent.${result.skipped.length ? ` ${result.skipped.map((skip) => {
+            const row = rows.find((row) => row.key === skip.key);
+            return `${row ? `${row.title} #${row.number}` : skip.key}: ${skip.reason}`;
+          }).join(" · ")}` : ""}`,
+        );
+      }
     } catch (cause) {
       setError(message(cause));
     } finally {
@@ -383,9 +433,10 @@ function OneClick({
           </p>
           <ul>
             {batch.prs.map(({ row }) => {
-              const option = options?.find((option) => option.key === row.key);
-              const selected = reviewersFor(row, options);
-              const ineligible = load.kind === "ready"
+              const rowLoad = load.get(row.key);
+              const option = optionsFor(row.key);
+              const selected = reviewersFor(row);
+              const ineligible = option
                 ? suggestion(row).filter((login) =>
                     !option?.candidates.some((candidate) => candidate.login === login),
                   )
@@ -408,7 +459,7 @@ function OneClick({
                       <div className="calm-reviewer-actions">
                         <Popover
                           onOpenChange={(open) => {
-                            if (open && load.kind !== "ready") void loadCandidates().catch(() => {});
+                            if (open) void loadCandidates([row]).catch(() => {});
                           }}
                         >
                           <PopoverTrigger
@@ -417,8 +468,8 @@ function OneClick({
                             aria-label={`Choose reviewers for ${label}`}
                             disabled={disabled}
                           >
-                            {load.kind === "loading" ? "Loading reviewers…" :
-                              load.kind === "error" ? "Reviewers unavailable" :
+                            {rowLoad?.kind === "loading" ? "Loading reviewers…" :
+                              rowLoad?.kind === "error" ? "Reviewers unavailable" :
                                 selected.join(", ") || "Choose reviewers"}
                             <span aria-hidden>⌄</span>
                           </PopoverTrigger>
@@ -428,10 +479,10 @@ function OneClick({
                             sideOffset={4}
                           >
                             <PopoverTitle>Reviewers for {label}</PopoverTitle>
-                            {load.kind === "idle" || load.kind === "loading" ? (
+                            {!rowLoad || rowLoad.kind === "loading" ? (
                               <p role="status">Loading eligible reviewers…</p>
-                            ) : load.kind === "error" ? (
-                              <p role="alert">{load.message}</p>
+                            ) : rowLoad.kind === "error" ? (
+                              <p role="alert">{rowLoad.message}</p>
                             ) : (
                               <>
                                 {option?.note ? <p className="calm-muted">{option.note}</p> : null}
@@ -1094,7 +1145,7 @@ export function Board({ subPath }: { subPath?: string }) {
                       <ul>{questionRows}</ul>
                     </EffortGroup>
                     <OneClick
-                      key={`${organization}:${group("one-click").map((pr) => pr.row.key).join(",")}`}
+                      key={organization}
                       prs={group("one-click")}
                       view={view}
                       refetch={refetch}
