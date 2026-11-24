@@ -6936,6 +6936,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         look,
         triage: block?.triage ?? false,
         promote: block?.promote ?? false,
+        source: target.source,
         wipLimit: block?.wipLimit ?? 5,
         commentsPerWeek: block?.commentsPerWeek ?? 1,
         staleDays: block?.staleDays ?? 14,
@@ -12963,13 +12964,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // offered to a backlog thread. The tool re-reads the flag itself, so
         // turning it off refuses at once even before the selection refreshes.
         const backlogBlock = configs.get(b.projectId)?.value?.file.backlog;
-        // BB-397: triage writes are offered for a GitHub backlog too, when
-        // `backlog.triage` is on. Promotion stays Linear-only (child C), so a
-        // GitHub steward never gets `backlog_promote`, and the prompt says so
-        // rather than inviting a tool that can only fail.
+        // BB-397/BB-398: triage writes and promotion are offered for a GitHub
+        // backlog too, when their `backlog.*` flag is on. Both tools re-read
+        // the flag themselves, so turning one off refuses at once.
         const githubBacklog = target?.kind === "backlog" && target.source === "github";
         const backlogTriage = target?.kind === "backlog" && backlogBlock?.triage === true;
-        const backlogPromote = target?.kind === "backlog" && target.source === "linear" && backlogBlock?.promote === true;
+        const backlogPromote = target?.kind === "backlog" && backlogBlock?.promote === true;
         if (target?.kind === "backlog") {
           const backlogWrites = ["steward_report", "steward_update", ...(backlogTriage ? ["backlog_triage"] : []), ...(backlogPromote ? ["backlog_promote"] : []), "ticket_read", "ticket_search"];
           return {
@@ -12983,11 +12983,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   ? "`backlog_triage` adds labels or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window; GitHub issues have no priority and no relations, so those writes are refused. "
                   : "`backlog_triage` adds labels, relations and a priority, or posts one comment, and the plugin enforces the comment budget, the label vocabulary and the stale window. "
                 : "The backlog is read-only for triage on this project: `backlog.triage` is off. ") +
-              (githubBacklog
-                ? "Promotion is Linear-only, so no `backlog_promote` is offered. "
-                : backlogPromote
-                  ? "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit; the plugin picks the ticket, so a key that is not the top-ordered eligible one is ignored. "
-                  : "No promotion is offered: `backlog.promote` is off. ") +
+              (backlogPromote
+                ? githubBacklog
+                  ? "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted open issue to `status:todo`, adds the adoption label and assigns it to this server, one per pass, and only while the WIP count is under the limit; the plugin picks the issue, so a key that is not the top-ordered eligible one is ignored. "
+                  : "`backlog_promote` is your one promotion write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit; the plugin picks the ticket, so a key that is not the top-ordered eligible one is ignored. "
+                : "No promotion is offered: `backlog.promote` is off. ") +
               "`ticket_read` and `ticket_search` are reads only. End every turn you were woken for with steward_report. Read the stewards skill for the protocol.",
           };
         }
@@ -13384,18 +13384,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /**
-     * BB-385: the backlog steward's one promotion write. It is offered only
-     * when `backlog.promote` is true, and the flag is re-read on every call,
-     * so turning it off refuses at once. The plugin picks the ticket: it reads
-     * the team's fresh backlog, counts Todo plus In Progress against the WIP
-     * limit, orders the un-adopted Backlog tickets by the owner's priority and
-     * takes the first ready-looking unblocked one. Every accepted promotion
-     * and every refusal is appended to the ledger the digest reports from.
+     * BB-385/BB-398: the backlog steward's one promotion write. It is offered
+     * only when `backlog.promote` is true, and the flag is re-read on every
+     * call, so turning it off refuses at once. The plugin picks the ticket: it
+     * reads the target's fresh backlog, counts its WIP against the limit,
+     * orders the un-adopted Backlog tickets by the owner's priority and takes
+     * the first ready-looking unblocked one. Every accepted promotion and
+     * every refusal is appended to the ledger the digest reports from.
      */
     bb.agents.registerTool({
       name: "backlog_promote",
       description:
-        "Promote one ticket from the backlog to Todo under the WIP limit: the plugin picks the top-ordered ready-looking un-adopted Backlog ticket, adds the adoption label and assigns it to this server. It promotes at most one per pass and ignores a `key` that is not the top-ordered eligible ticket. It refuses when Todo plus In Progress is at or over backlog.wipLimit, and it never edits a description, cancels, closes or changes priority.",
+        "Promote one ticket from the backlog under the WIP limit: the plugin picks the top-ordered ready-looking un-adopted Backlog ticket (on a GitHub backlog, an open issue with no status label), moves it to Todo (`status:todo` on GitHub), adds the adoption label and assigns it to this server. It promotes at most one per pass and ignores a `key` that is not the top-ordered eligible ticket. It refuses when the WIP count is at or over backlog.wipLimit, and it never edits a description, cancels, closes or changes priority.",
       presentation: { label: { pending: "Promoting a backlog ticket", completed: "Promoted a backlog ticket" } },
       parameters: backlogPromoteParamsSchema,
       execute: store.coalescingTool(async (input, { threadId }) => {
@@ -13404,9 +13404,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (binding === null || target === null || target.kind !== "backlog") {
           return toolError(new Error("backlog_promote is for a backlog steward's thread; this thread is not one."));
         }
-        // BB-396: promotion is a Linear write; a GitHub backlog is read-only,
-        // and the refusal happens before any read or ledger write.
-        if (target.source !== "linear") return toolError(new Error("backlog_promote is Linear-only; a GitHub backlog is read-only."));
+        // BB-398: promotion reads and writes through the target's own source;
+        // the pure decision maps the state and the WIP count per source.
+        const source = target.source;
         const projectId = binding.projectId;
         const team = target.unit;
         const record = (outcome: "accepted" | "refused", detail: Record<string, unknown>, reason: string | null, issueId: string, issueKey: string) =>
@@ -13421,6 +13421,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const promoteConfig: PromoteConfig = {
               promote: block?.promote === true,
               team,
+              source,
               wipLimit: block?.wipLimit ?? 5,
               label: config.file.label,
               adoptedLabels: [config.file.label, INITIATIVE_LABEL, ...config.file.tickets.flatMap((t) => t.match.labels ?? [])],
@@ -13440,17 +13441,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
 
             // Fail closed: a backlog that cannot be read is refused, and no
-            // Linear write happens.
+            // write happens.
             let out: z.infer<typeof sourceContract.sourceBacklog.output>;
             try {
-              out = await sourceRpc("linear", "sourceBacklog", { team }, sourceContract.sourceBacklog.output);
+              out = await sourceRpc(source, "sourceBacklog", { team }, sourceContract.sourceBacklog.output);
             } catch (error) {
               const reason = `the backlog could not be read: ${errorMessage(error)}`;
               record("refused", promoteRefusedDetail(input), reason, "", "");
               return toolError(new Error(reason));
             }
             if (out.unsupported || out.errors.length > 0) {
-              const reason = `the backlog could not be read: ${out.unsupported ? "the linear source does not support sourceBacklog" : out.errors.join("; ")}`;
+              const reason = `the backlog could not be read: ${out.unsupported ? `the ${source} source does not support sourceBacklog` : out.errors.join("; ")}`;
               record("refused", promoteRefusedDetail(input), reason, "", "");
               return toolError(new Error(reason));
             }
@@ -13467,13 +13468,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // the issue read that carries its description and open blockers.
             if (wipCount(issues, promoteConfig) >= promoteConfig.wipLimit) {
               record("refused", promoteRefusedDetail(input), PROMOTE_WIP_FULL, "", "");
-              return toolError(new Error(`WIP full: Todo plus In Progress is at the limit of ${promoteConfig.wipLimit}; no promotion.`));
+              const scope = source === "github" ? "the GitHub WIP count" : "Todo plus In Progress";
+              return toolError(new Error(`WIP full: ${scope} is at the limit of ${promoteConfig.wipLimit}; no promotion.`));
             }
             const details = new Map<string, PromoteDetail>();
             for (const candidate of orderedCandidates(issues, promoteConfig)) {
               let snap;
               try {
-                snap = await snapshot("linear", candidate.key);
+                snap = await snapshot(source, candidate.key);
               } catch (error) {
                 const reason = `${candidate.key} could not be read: ${errorMessage(error)}`;
                 record("refused", promoteRefusedDetail(input), reason, "", candidate.key);
@@ -13503,7 +13505,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
             const plan = decision.plan;
             try {
-              await sourceRpc("linear", "sourceUpdateIssue", { key: plan.key, state: plan.state, addLabels: plan.addLabels, assignee: plan.assignee }, sourceContract.sourceUpdateIssue.output);
+              await sourceRpc(source, "sourceUpdateIssue", { key: plan.key, state: plan.state, addLabels: plan.addLabels, assignee: plan.assignee }, sourceContract.sourceUpdateIssue.output);
             } catch (error) {
               const reason = `the write was refused: ${errorMessage(error)}`;
               record("refused", promoteRefusedDetail(input), reason, decision.candidate.key, decision.candidate.key);

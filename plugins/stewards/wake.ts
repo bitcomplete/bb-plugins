@@ -22,7 +22,7 @@ import { newHumanComments } from "./reconcile.js";
 import { reportedItem, type GateState } from "./ready-gate.js";
 import { currentStoredGate, type StoredGate } from "./assessed-gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
-import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotComment, type WorkflowRun } from "./source-contract.js";
+import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotComment, type Source, type WorkflowRun } from "./source-contract.js";
 import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Assumption, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type PlaybookRefresh, type Question, type Worker } from "./store.js";
 import type { CheckFinding } from "./template-stamp.js";
 
@@ -1116,6 +1116,8 @@ export type BacklogWakeInput = {
   triage: boolean;
   /** Whether `backlog.promote` is on, so the promotion tool is offered (BB-385). */
   promote: boolean;
+  /** The target's source; optional and defaulting to `linear`, so the Linear wake text is unchanged (BB-398). */
+  source?: Source;
   /** Stage 3's Todo + In Progress ceiling, `backlog.wipLimit` (BB-385). */
   wipLimit: number;
   /** The comment budget, `backlog.commentsPerWeek`. */
@@ -1165,11 +1167,16 @@ export function formatBacklogWake(input: BacklogWakeInput): string {
   out.push("", "## 1. Instructions");
   if (playbook.general !== "") out.push("", playbook.general);
   out.push("", `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`);
+  const github = (input.source ?? "linear") === "github";
   out.push(
     "",
-    "`backlog_triage` adds labels, relations and a priority, or posts one comment; it never edits a description, assigns, cancels, closes or changes state." +
+    (github
+      ? "`backlog_triage` adds labels or posts one comment; GitHub issues have no priority and no relations, so those writes are refused. It never edits a description, assigns, cancels, closes or changes state."
+      : "`backlog_triage` adds labels, relations and a priority, or posts one comment; it never edits a description, assigns, cancels, closes or changes state.") +
       (input.promote
-        ? " `backlog_promote` is the one other Linear write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit. It never edits a description, cancels or closes."
+        ? github
+          ? " `backlog_promote` is the one other write: it moves the top-ordered ready-looking un-adopted open issue to `status:todo`, adds the adoption label and assigns it to this server, one per pass, and only while the WIP count is under the limit. It never edits a description, cancels or closes."
+          : " `backlog_promote` is the one other Linear write: it moves the top-ordered ready-looking un-adopted Backlog ticket to Todo, adds the adoption label and assigns it to this server, one per pass, and only while Todo plus In Progress is under the WIP limit. It never edits a description, cancels or closes."
         : "") +
       " Every write it accepts is appended to the ledger below and reported in the digest. `steward_report` ends the turn.",
   );
@@ -1200,7 +1207,7 @@ export function formatBacklogWake(input: BacklogWakeInput): string {
   for (const w of input.ledger) out.push(`- ${w.outcome === "accepted" ? "Accepted" : "Refused"}${w.issueKey === "" ? "" : ` ${w.issueKey}`}: ${w.outcome === "accepted" ? w.kind : `${w.kind} — ${w.reason ?? "refused"}`}`);
   out.push("", "### Limits", "");
   out.push(`- \`backlog.triage\` is ${input.triage ? "on; the plugin offers `backlog_triage`" : "off; the backlog steward is read-only"}.`);
-  out.push(`- \`backlog.promote\` is ${input.promote ? `on; the plugin offers \`backlog_promote\`, one promotion per pass while Todo plus In Progress is under ${input.wipLimit}` : "off; no promotion is offered"}.`);
+  out.push(`- \`backlog.promote\` is ${input.promote ? `on; the plugin offers \`backlog_promote\`, one promotion per pass while ${github ? "the WIP count is" : "Todo plus In Progress is"} under ${input.wipLimit}` : "off; no promotion is offered"}.`);
   out.push(`- Comments: ${input.commentsPerWeek} per ticket per rolling seven days, the stale-cancel proposal included.`);
   out.push(`- Stale window: ${input.staleDays} days.`);
 
@@ -1211,7 +1218,7 @@ export function formatBacklogWake(input: BacklogWakeInput): string {
   out.push(
     "",
     "---",
-    "Report the look with `steward_report` and end the turn. Triage a qualifying ticket with `backlog_triage` before the report, so the ledger lists it." + (input.promote ? " Promote one with `backlog_promote` before the report when Todo plus In Progress is under the limit." : ""),
+    "Report the look with `steward_report` and end the turn. Triage a qualifying ticket with `backlog_triage` before the report, so the ledger lists it." + (input.promote ? ` Promote one with \`backlog_promote\` before the report when ${github ? "the WIP count is" : "Todo plus In Progress is"} under the limit.` : ""),
   );
   return fit(head, snapshot, out);
 }

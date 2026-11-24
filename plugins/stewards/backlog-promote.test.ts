@@ -214,3 +214,86 @@ describe("the ledger entries (BB-385)", () => {
     expect(promoteRefusedDetail({})).toEqual({ requestedKey: null });
   });
 });
+
+describe("the GitHub promotion path (BB-398)", () => {
+  const githubConfig = (over: Partial<PromoteConfig> = {}): PromoteConfig => config({ team: "acme/web", source: "github", ...over });
+  const githubIssue = (over: Partial<BacklogPromoteIssue> = {}): BacklogPromoteIssue => issue({ key: "acme/web#1", unit: "acme/web", state: "open", stateType: null, ...over });
+  const githubDetail = (over: Partial<PromoteDetail> = {}): PromoteDetail => detail(over);
+  const githubDetailsOf = (entries: Array<[string, Partial<PromoteDetail>]>): Map<string, PromoteDetail> => new Map(entries.map(([key, over]) => [key, githubDetail(over)]));
+  const githubDecide = (over: Partial<Parameters<typeof decidePromote>[0]> = {}) =>
+    decidePromote({ params: {}, issues: [githubIssue()], details: githubDetailsOf([["acme/web#1", {}]]), config: githubConfig(), ...over });
+
+  it("reads the GitHub backlog state as an open issue with no status label", () => {
+    expect(isBacklogState(githubIssue({ state: "open" }), "github")).toBe(true);
+    expect(isBacklogState(githubIssue({ state: "status:backlog" }), "github")).toBe(true);
+    expect(isBacklogState(githubIssue({ state: "open", labels: ["status:backlog"] }), "github")).toBe(true);
+    expect(isBacklogState(githubIssue({ state: "status:todo" }), "github")).toBe(false);
+    expect(isBacklogState(githubIssue({ state: "status:in-progress" }), "github")).toBe(false);
+    expect(isBacklogState(githubIssue({ state: "status:in-review" }), "github")).toBe(false);
+    expect(isBacklogState(githubIssue({ state: "closed" }), "github")).toBe(false);
+    // The Linear predicate is untouched by the source argument's default.
+    expect(isBacklogState(issue({ state: "Backlog", stateType: "backlog" }))).toBe(true);
+  });
+
+  it("counts status:todo and status:in-progress as WIP, not status:in-review or open", () => {
+    expect(isTodoOrInProgress(githubIssue({ state: "status:todo" }), "github")).toBe(true);
+    expect(isTodoOrInProgress(githubIssue({ state: "status:in-progress" }), "github")).toBe(true);
+    expect(isTodoOrInProgress(githubIssue({ state: "status:in-review" }), "github")).toBe(false);
+    expect(isTodoOrInProgress(githubIssue({ state: "open" }), "github")).toBe(false);
+    // The status label is read from the labels too, for a malformed issue
+    // carrying two status labels (which reads `open`).
+    expect(isTodoOrInProgress(githubIssue({ state: "open", labels: ["status:todo"] }), "github")).toBe(true);
+  });
+
+  it("counts status labels and adopted open issues, and excludes closed ones", () => {
+    const issues = [
+      githubIssue({ key: "acme/web#1", state: "status:todo" }),
+      githubIssue({ key: "acme/web#2", state: "status:in-progress" }),
+      githubIssue({ key: "acme/web#3", state: "open", labels: ["bb-managed"], assignees: ["jane"] }),
+      githubIssue({ key: "acme/web#4", state: "open", assignees: ["jane"] }),
+      githubIssue({ key: "acme/web#5", state: "status:in-review", labels: ["bb-managed"], assignees: ["jane"] }),
+      githubIssue({ key: "acme/web#6", state: "closed", labels: ["bb-managed"], assignees: ["jane"] }),
+      githubIssue({ key: "acme/other#1", unit: "acme/other", state: "status:todo" }),
+    ];
+    expect(wipCount(issues, githubConfig())).toBe(5);
+  });
+
+  it("plans exactly status:todo, the adoption label and this server's own login", () => {
+    expect(promotePlan(githubIssue({ key: "acme/web#1" }), githubConfig())).toEqual({ key: "acme/web#1", state: "status:todo", addLabels: ["bb-managed"], assignee: "me" });
+    const result = githubDecide();
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.plan).toEqual({ key: "acme/web#1", state: "status:todo", addLabels: ["bb-managed"], assignee: "me" });
+      expect(result.candidate.key).toBe("acme/web#1");
+    }
+  });
+
+  it("refuses while the opt-in is off and at the WIP limit", () => {
+    expect(reason(githubDecide({ config: githubConfig({ promote: false }) }))).toMatch(/promote is off/u);
+    const full = [githubIssue({ key: "acme/web#1", state: "status:todo" }), githubIssue({ key: "acme/web#2", state: "status:in-progress" })];
+    expect(reason(githubDecide({ issues: full, details: githubDetailsOf([]), config: githubConfig({ wipLimit: 2 }) }))).toBe("WIP full");
+  });
+
+  it("never picks an adopted issue and orders oldest first", () => {
+    expect(orderedCandidates([githubIssue({ key: "acme/web#1", labels: ["bb-managed"] }), githubIssue({ key: "acme/web#2", assignees: ["jane"] }), githubIssue({ key: "acme/web#3", state: "status:todo" })], githubConfig())).toEqual([]);
+    const issues = [githubIssue({ key: "acme/web#3", createdAt: "2026-10-09T00:00:00Z" }), githubIssue({ key: "acme/web#1", createdAt: "2026-10-01T00:00:00Z" }), githubIssue({ key: "acme/web#2", createdAt: "2026-10-05T00:00:00Z" })];
+    expect(orderedCandidates(issues, githubConfig()).map((i) => i.key)).toEqual(["acme/web#1", "acme/web#2", "acme/web#3"]);
+  });
+
+  it("refuses when the only candidate has an open blocker and picks the next ready one", () => {
+    expect(reason(githubDecide({ details: githubDetailsOf([["acme/web#1", { blockedBy: ["acme/web#9"] }]]) }))).toBe("no eligible candidate");
+    const result = githubDecide({
+      issues: [githubIssue({ key: "acme/web#1", createdAt: "2026-10-01T00:00:00Z" }), githubIssue({ key: "acme/web#2", createdAt: "2026-10-02T00:00:00Z" })],
+      details: githubDetailsOf([
+        ["acme/web#1", { blockedBy: ["acme/web#9"] }],
+        ["acme/web#2", {}],
+      ]),
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.plan.key).toBe("acme/web#2");
+  });
+
+  it("names the GitHub state in the ledger entry", () => {
+    expect(promoteAcceptedDetail(githubIssue({ key: "acme/web#1" }), { key: "acme/web#1" }, githubConfig())).toEqual({ state: "status:todo", addLabels: ["bb-managed"], assignee: "me", requestedKey: "acme/web#1", promoted: "acme/web#1" });
+  });
+});

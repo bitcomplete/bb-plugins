@@ -5,6 +5,7 @@
 // contract. Keeping the limits here is the point: the playbook says them, but
 // the plugin enforces them.
 import { z } from "zod";
+import type { Source } from "./source-contract.js";
 
 /**
  * The one gated tool's parameters. `key` is a hint only: the plugin picks the
@@ -26,6 +27,19 @@ export const FORBIDDEN_PROMOTE_FIELDS = ["description", "state", "assignee", "ca
 /** The only state a promotion sets, and the only assignee it names. */
 export const PROMOTE_STATE = "Todo";
 export const PROMOTE_ASSIGNEE = "me" as const;
+
+/**
+ * The GitHub state a promotion sets: the `status:todo` label the
+ * `github-issues` playbook's spec phase keys on. GitHub has no workflow
+ * states, so the state is a status label and `sourceUpdateIssue` replaces any
+ * other `status:*` label when one is set.
+ */
+export const PROMOTE_GITHUB_STATE = "status:todo";
+/** The GitHub status labels the WIP ceiling counts: the playbook's todo and build phases. */
+export const PROMOTE_GITHUB_TODO_LABEL = "status:todo";
+export const PROMOTE_GITHUB_IN_PROGRESS_LABEL = "status:in-progress";
+/** The GitHub backlog state beyond the playbook's `open`: an issue carrying a `status:backlog` label. */
+export const PROMOTE_GITHUB_BACKLOG_LABEL = "status:backlog";
 
 /** The priority order the owner sets by hand; anything else (unset, unknown) ranks last. */
 const PRIORITY_RANK: Record<string, number> = { urgent: 0, high: 1, medium: 2, low: 3 };
@@ -60,8 +74,15 @@ export type PromoteDetail = {
 /** The project's promotion limits and the fixed labels no write may touch. */
 export type PromoteConfig = {
   promote: boolean;
-  /** The team the binding watches. */
+  /** The unit the binding watches: a Linear team key, or a GitHub `owner/repo`. */
   team: string;
+  /**
+   * The backlog source the target reads and writes through (BB-398). Optional
+   * and defaulting to `linear`, so the Linear call sites and their tests are
+   * unchanged. GitHub has no workflow states and no priority, so the state
+   * mapping and the WIP count differ.
+   */
+  source?: Source;
   /** Stage 3's Todo + In Progress ceiling. */
   wipLimit: number;
   /** The project's adoption label (project.label). */
@@ -78,18 +99,45 @@ export type PromoteDecision = { ok: true; plan: PromotePlan; candidate: BacklogP
 const sameTeam = (issue: BacklogPromoteIssue, config: PromoteConfig): boolean => issue.unit.trim().toUpperCase() === config.team.trim().toUpperCase();
 
 /**
+ * Whether a GitHub issue carries one of the given status labels, by its
+ * snapshot state (which is the one status label when it carries exactly one)
+ * or by its labels. GitHub's `state` is derived from a `status:*` label, but a
+ * malformed issue carrying two status labels reads `open`, so the labels are
+ * checked too.
+ */
+function githubHasStatus(issue: BacklogPromoteIssue, labels: readonly string[]): boolean {
+  const wanted = new Set(labels.map((l) => l.trim().toLowerCase()));
+  if (wanted.has(issue.state.trim().toLowerCase())) return true;
+  return issue.labels.some((l) => wanted.has(l.trim().toLowerCase()));
+}
+
+/** Whether the state is a terminal closed one; GitHub's closed issues are never WIP or candidates. */
+const isClosedState = (issue: BacklogPromoteIssue): boolean => issue.state.trim().toLowerCase().startsWith("closed");
+
+/**
  * Whether an issue sits in Todo or In Progress, the two states the WIP
  * ceiling counts. This is by state name, not state type: "In Review" is a
  * `started` state in Linear's BB team, and a ticket in review is not work in
- * progress for the ceiling.
+ * progress for the ceiling. On GitHub the two are the `status:todo` and
+ * `status:in-progress` labels the `github-issues` playbook keys on.
  */
-export function isTodoOrInProgress(issue: BacklogPromoteIssue): boolean {
+export function isTodoOrInProgress(issue: BacklogPromoteIssue, source: Source = "linear"): boolean {
+  if (source === "github") return githubHasStatus(issue, [PROMOTE_GITHUB_TODO_LABEL, PROMOTE_GITHUB_IN_PROGRESS_LABEL]);
   const name = issue.state.trim().toLowerCase();
   return name === "todo" || name === "in progress";
 }
 
-/** Whether an issue sits in the team's Backlog state. */
-export function isBacklogState(issue: BacklogPromoteIssue): boolean {
+/**
+ * Whether an issue sits in the watched unit's Backlog state. On GitHub that is
+ * the `open` state (an issue with no status label), the state the
+ * `github-issues` playbook's `open` phase covers, or an issue carrying a
+ * `status:backlog` label.
+ */
+export function isBacklogState(issue: BacklogPromoteIssue, source: Source = "linear"): boolean {
+  if (source === "github") {
+    if (issue.state.trim().toLowerCase() === "open") return true;
+    return githubHasStatus(issue, [PROMOTE_GITHUB_BACKLOG_LABEL]);
+  }
   const type = (issue.stateType ?? "").trim().toLowerCase();
   if (type === "backlog") return true;
   return issue.state.trim().toLowerCase() === "backlog";
@@ -117,9 +165,21 @@ export function candidateEligible(issue: BacklogPromoteIssue, detail: PromoteDet
   return isReadyLooking(issue, detail) && !hasOpenBlocker(detail);
 }
 
-/** How many Todo or In Progress issues the team has, the WIP ceiling's numerator. */
+/**
+ * How many issues the watched unit has in progress, the WIP ceiling's
+ * numerator. Linear counts Todo and In Progress by state name. GitHub counts
+ * `status:todo` and `status:in-progress`, and also an open issue that is
+ * already adopted (the adoption label or any assignee), because on GitHub the
+ * adoption is what marks it as being worked even before its status label
+ * moves; a closed issue never counts.
+ */
 export function wipCount(issues: readonly BacklogPromoteIssue[], config: PromoteConfig): number {
-  return issues.filter((issue) => sameTeam(issue, config) && isTodoOrInProgress(issue)).length;
+  const source = config.source ?? "linear";
+  return issues.filter((issue) => {
+    if (!sameTeam(issue, config)) return false;
+    if (isTodoOrInProgress(issue, source)) return true;
+    return source === "github" && !isClosedState(issue) && isAdopted(issue, config);
+  }).length;
 }
 
 const createdAtMs = (issue: BacklogPromoteIssue): number => {
@@ -138,13 +198,15 @@ const createdAtMs = (issue: BacklogPromoteIssue): number => {
  * promote the newest ticket, the opposite of the criterion.
  */
 export function orderedCandidates(issues: readonly BacklogPromoteIssue[], config: PromoteConfig): BacklogPromoteIssue[] {
+  const source = config.source ?? "linear";
   const rank = (issue: BacklogPromoteIssue): number => PRIORITY_RANK[(issue.priority ?? "").trim().toLowerCase()] ?? 4;
-  return issues.filter((issue) => sameTeam(issue, config) && isBacklogState(issue) && !isAdopted(issue, config)).sort((a, b) => rank(a) - rank(b) || createdAtMs(a) - createdAtMs(b) || a.key.localeCompare(b.key));
+  return issues.filter((issue) => sameTeam(issue, config) && isBacklogState(issue, source) && !isAdopted(issue, config)).sort((a, b) => rank(a) - rank(b) || createdAtMs(a) - createdAtMs(b) || a.key.localeCompare(b.key));
 }
 
-/** The one plan a promotion writes: Todo, the adoption label, and this server's own login. */
+/** The one plan a promotion writes: Todo (`status:todo` on GitHub), the adoption label, and this server's own login. */
 export function promotePlan(candidate: BacklogPromoteIssue, config: PromoteConfig): PromotePlan {
-  return { key: candidate.key, state: PROMOTE_STATE, addLabels: [config.label], assignee: PROMOTE_ASSIGNEE };
+  const source = config.source ?? "linear";
+  return { key: candidate.key, state: source === "github" ? PROMOTE_GITHUB_STATE : PROMOTE_STATE, addLabels: [config.label], assignee: PROMOTE_ASSIGNEE };
 }
 
 /**
@@ -178,7 +240,8 @@ export function decidePromote(input: { params: BacklogPromoteParams; issues: rea
 
 /** The ledger detail for an accepted promotion, recorded beside the write. */
 export function promoteAcceptedDetail(candidate: BacklogPromoteIssue, params: BacklogPromoteParams, config: PromoteConfig): Record<string, unknown> {
-  return { state: PROMOTE_STATE, addLabels: [config.label], assignee: PROMOTE_ASSIGNEE, requestedKey: params.key ?? null, promoted: candidate.key };
+  const source = config.source ?? "linear";
+  return { state: source === "github" ? PROMOTE_GITHUB_STATE : PROMOTE_STATE, addLabels: [config.label], assignee: PROMOTE_ASSIGNEE, requestedKey: params.key ?? null, promoted: candidate.key };
 }
 
 /** The ledger detail for a refused promotion, so the digest can show the reason. */
