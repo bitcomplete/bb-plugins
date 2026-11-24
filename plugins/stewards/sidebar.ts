@@ -39,6 +39,8 @@ export interface SidebarBinding {
   overdueMs: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
+  /** BB-392: the binding's only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
+  reviewerRoundMissing?: boolean;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
   wakeFailure: string | null;
   needsUser: boolean;
@@ -147,6 +149,8 @@ export interface SidebarEffort {
   overdueMs: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource: boolean;
+  /** BB-392: the binding's only unmet gate piece is the reviewer round, so the row names it. */
+  reviewerRoundMissing?: boolean;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
   wakeFailure: string | null;
   /** The binding's worker records, so a wait on a finished one reads as a lost hand-off (BB-152). */
@@ -287,6 +291,8 @@ export interface EffortStatus {
   overdueMs?: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
   noWakeSource?: boolean;
+  /** BB-392: the binding's only unmet gate piece is the reviewer round, so the row names it. */
+  reviewerRoundMissing?: boolean;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
   wakeFailure?: string | null;
   /** The binding's workers, so a wait on a finished one reads as a lost hand-off (BB-152). */
@@ -496,6 +502,10 @@ function baseEffortPhrase(e: EffortStatus, now: number): string {
   const lostHandoff = waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? [], e.wait) || e.pending.some(isLostHandoffNote);
   if (lostHandoff) return e.requeueAt === null ? "hand-off lost: worker finished" : `hand-off lost: worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
   if (e.pending.some(isQuietWorkerFinish)) return e.requeueAt === null ? "worker finished" : `worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
+  // BB-392: the gate's only unmet piece is the reviewer round, so the row says
+  // what is missing instead of repeating a plain wait (`waiting for the plugin
+  // to merge it`). A running worker already reads the count above.
+  if (e.reviewerRoundMissing === true) return "waiting on the reviewer round (none started)";
   // BB-247: a dated wait reads its date, so the row says when the plugin will
   // wake the steward even though nothing else is live on the binding.
   if (e.waitingUntil !== null && e.waitingUntil !== undefined && e.waitingOn !== null && e.waitingOn !== undefined && e.waitingOn !== "") {
@@ -549,6 +559,7 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     overdue: false,
     overdueMs: null,
     noWakeSource: false,
+    reviewerRoundMissing: false,
     wakeFailure: null,
     workers: [],
     needsUser: false,
@@ -774,6 +785,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       overdue: b.overdue,
       overdueMs: b.overdueMs,
       noWakeSource: b.noWakeSource,
+      reviewerRoundMissing: b.reviewerRoundMissing ?? false,
       wakeFailure: b.wakeFailure,
       workers: b.workers,
       needsUser: b.needsUser,

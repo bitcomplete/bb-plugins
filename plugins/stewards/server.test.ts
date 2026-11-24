@@ -8129,6 +8129,163 @@ describe("needs you items", () => {
     expect(t.sends.filter((s) => s.threadId === t.steward).length).toBe(wakes);
   });
 
+  describe("the missing-reviewer-round wake (BB-392)", () => {
+    const stewardSends = (t: Awaited<ReturnType<typeof withPull>>) => t.sends.filter((s) => s.threadId === t.steward);
+    const firedText = (t: Awaited<ReturnType<typeof withPull>>) => stewardSends(t).some((s) => /No reviewer round on/u.test(s.text));
+    // The reviewer-round wake alone: a push also wakes the steward with its own
+    // mechanical "Pushed" line, so counting all sends would count that too.
+    const roundWakes = (t: Awaited<ReturnType<typeof withPull>>) => stewardSends(t).filter((s) => /No reviewer round on/u.test(s.text)).length;
+
+    it("arms one look, fires once per head, and re-arms on a new head", async () => {
+      const t = await withPull([]);
+      // The first look only arms the one-look grace; nothing fires.
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundGrace).toEqual(["acme/web#7#aaaaaaa1"]);
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundWakes).toEqual([]);
+      expect(roundWakes(t)).toBe(0);
+      // The second look fires exactly one wake naming the pull, the sha and the next step.
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(roundWakes(t)).toBe(1);
+      const fired = stewardSends(t).filter((s) => /No reviewer round on/u.test(s.text)).at(-1)!.text;
+      expect(fired).toMatch(/No reviewer round on acme\/web#7 at aaaaaaa/u);
+      expect(fired).toMatch(/no bb-review marker/u);
+      expect(fired).toMatch(/no worker is running/u);
+      expect(fired).toMatch(/Start a worker for the review round/u);
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundGrace).toEqual([]);
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundWakes).toEqual(["acme/web#7#aaaaaaa1"]);
+      // A third look at the same head is quiet.
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(roundWakes(t)).toBe(1);
+      // A new push re-arms: one look of grace, then one more wake.
+      t.entities.set("acme/web#7", pull({}, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] }, headSha: "bbbbbbb2" }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(roundWakes(t)).toBe(1);
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundGrace).toEqual(["acme/web#7#bbbbbbb2"]);
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(roundWakes(t)).toBe(2);
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundWakes).toEqual(["acme/web#7#aaaaaaa1", "acme/web#7#bbbbbbb2"]);
+    });
+
+    it("does not fire while a worker is mid-turn", async () => {
+      const t = await withPull([]);
+      const b = t.binding();
+      t.hooks.store.addWorker("thr_w1", b.id, "ENG-12: Implement");
+      t.hooks.store.setWorker("thr_w1", "running", null);
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(firedText(t)).toBe(false);
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundGrace).toEqual([]);
+    });
+
+    it("does not fire while a reviewer descendant is live", async () => {
+      const t = await withPull([]);
+      const b = t.binding();
+      t.hooks.store.addWorker("thr_w1", b.id, "ENG-12: Implement");
+      t.hooks.store.setWorker("thr_w1", "finished", "Spawned the reviewer.");
+      t.harness.sdk.stub("threads.experimental_listDescendants", async () => ({ threads: [{ threadId: "thr_w1", descendantIds: ["thr_r1"] }] }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(firedText(t)).toBe(false);
+    });
+
+    it("does not fire while a parentless reviewer is live (BB-323)", async () => {
+      const t = await withPull([]);
+      const b = t.binding();
+      t.hooks.store.addWorker("thr_w1", b.id, "ENG-12: Implement");
+      t.hooks.store.setWorker("thr_w1", "finished", "Spawned the reviewer.");
+      await t.createdReviewer("thr_r1", "thr_w1", "Review round 1");
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(firedText(t)).toBe(false);
+    });
+
+    it("does not fire when the reviewer listing fails", async () => {
+      const t = await withPull([]);
+      const b = t.binding();
+      t.hooks.store.addWorker("thr_w1", b.id, "ENG-12: Implement");
+      t.hooks.store.setWorker("thr_w1", "finished", "Spawned the reviewer.");
+      t.harness.sdk.stub("threads.experimental_listDescendants", async () => {
+        throw new Error("listing is down");
+      });
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(firedText(t)).toBe(false);
+    });
+
+    it("does not fire for failing checks, a reviewer verdict, approval-needed, or a draft", async () => {
+      const red = await withPull([], { checks: { state: "failure", failing: ["ci"] } });
+      await red.ring("linear", "uuid-12");
+      await red.flush();
+      await red.ring("linear", "uuid-12");
+      await red.flush();
+      expect(firedText(red)).toBe(false);
+
+      const verdict = await withPull([comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=changes-requested lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" })]);
+      await verdict.ring("linear", "uuid-12");
+      await verdict.flush();
+      await verdict.ring("linear", "uuid-12");
+      await verdict.flush();
+      expect(firedText(verdict)).toBe(false);
+
+      const approval = await withPull([marker]);
+      await approval.ring("linear", "uuid-12");
+      await approval.flush();
+      await approval.ring("linear", "uuid-12");
+      await approval.flush();
+      expect(firedText(approval)).toBe(false);
+
+      const draft = await withPull([], { draft: true });
+      await draft.ring("linear", "uuid-12");
+      await draft.flush();
+      await draft.ring("linear", "uuid-12");
+      await draft.flush();
+      expect(firedText(draft)).toBe(false);
+    });
+
+    it("names the missing reviewer round in the status line, not a plain wait", async () => {
+      const sidebarFlag = async (t: Awaited<ReturnType<typeof withPull>>) => {
+        const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; reviewerRoundMissing?: boolean }> };
+        return sidebar.bindings.find((b) => b.key === "ENG-12")?.reviewerRoundMissing;
+      };
+      const t = await withPull([]);
+      expect(await sidebarFlag(t)).toBe(true);
+      const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; reviewerRoundMissing?: boolean }> } };
+      expect(board.board.stewards.find((s) => s.key === "ENG-12")?.reviewerRoundMissing).toBe(true);
+      // Red checks are not the eligible state: the status flag is false.
+      t.entities.set("acme/web#7", pull({}, { checks: { state: "failure", failing: ["ci"] } }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(await sidebarFlag(t)).toBe(false);
+    });
+
+    it("does not name the missing reviewer round while a reviewer is live", async () => {
+      const t = await withPull([]);
+      const sidebarFlag = async () => {
+        const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; reviewerRoundMissing?: boolean }> };
+        return sidebar.bindings.find((b) => b.key === "ENG-12")?.reviewerRoundMissing;
+      };
+      expect(await sidebarFlag()).toBe(true);
+      const b = t.binding();
+      t.hooks.store.addWorker("thr_w1", b.id, "ENG-12: Implement");
+      t.hooks.store.setWorker("thr_w1", "finished", "Spawned the reviewer.");
+      await t.createdReviewer("thr_r1", "thr_w1", "Review round 1");
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(await sidebarFlag()).toBe(false);
+    });
+  });
+
   it("does not merge while a worker is still running", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
