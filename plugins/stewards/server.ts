@@ -162,7 +162,7 @@ import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, LOCAL_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { templateWarnings, type CheckFinding } from "./template-stamp.js";
 import type { DeploymentTarget } from "./config.js";
-import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBacklogWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, initiativeIdle, initiativeUnmet, noWakeSourceReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBacklogWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, initiativeIdle, initiativeLiveWait, initiativeUnmet, noWakeSourceReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
@@ -14169,6 +14169,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // A report replaces the typed wait; a report without one clears it.
             wait,
             ...(wait === null ? { waitSince: null, waitNudgedAt: null, waitSlackedAt: null } : waitChanged || b.waitSince === null ? { waitSince: now(), waitNudgedAt: null, waitSlackedAt: null } : {}),
+            // BB-406: reporting a typed wait whose kind has a live producer
+            // flips the idle predicate false, so the clock clears with the
+            // report rather than at the next reconcile. A `date` or `external`
+            // wait is idle time and leaves it alone.
+            ...(initiativeLiveWait(wait) ? { idleInitiativeSince: null } : {}),
             ...(noteBeyondMaxWait ? { requeueUntilNoted: untilAt } : {}),
             awaitingReport: false,
             missedReports: 0,
@@ -15264,6 +15269,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             store.patch(target.id, {
               ...(input.priority === undefined ? {} : { priority: input.priority }),
               ...(input.hold === undefined ? {} : { hold: input.hold === "" ? null : input.hold, holdBehind: behindKeys, holdStack: stackKeys }),
+              // BB-406: setting a hold flips the idle predicate false, so the
+              // clock clears with the write rather than at the next reconcile.
+              ...(input.hold === undefined || input.hold === "" ? {} : { idleInitiativeSince: null }),
             });
             const behindNote = behindKeys.length === 0 ? "" : ` (behind ${behindKeys.join(", ")}: lifts itself once ${behindKeys.length === 1 ? "its pull requests merge or it ends" : "their pull requests merge or they end"})`;
             const stackNote = stackKeys.length === 0 ? "" : ` (stacked on ${stackKeys.join(", ")}: lifts itself once ${stackKeys.length === 1 ? "its pull request opens" : "their pull requests open"})`;

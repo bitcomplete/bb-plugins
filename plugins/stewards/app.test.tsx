@@ -1166,7 +1166,7 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
   });
 
   it("shows an idle initiative's chip on the effort row and not on a control (BB-406)", async () => {
-    const idleSince = Date.now() - 120 * 60_000;
+    const idleSince = Date.now() - 45 * 60_000;
     const idle = await renderBoardWith({
       subPath: "p1/ENG-1",
       stewards: [boardSteward({ key: "ENG-1", title: "Idle initiative", idleInitiativeSince: idleSince, idleInitiativeUnmet: 2 })],

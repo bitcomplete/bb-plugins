@@ -13,3 +13,15 @@ export function formatDuration(ms: number): string {
   if (ms % UNIT_MS.h! === 0) return `${ms / UNIT_MS.h!}h`;
   return `${Math.round(ms / UNIT_MS.m!)}m`;
 }
+
+/**
+ * A rounded age, e.g. `2d`, `3h`, `45m`: days when at least a day, hours when
+ * at least an hour, else minutes (at least one). Unlike `formatDuration` it
+ * does not require an exact multiple, so a real elapsed time reads `71h`, never
+ * `4273m`.
+ */
+export function formatAge(ms: number): string {
+  if (ms >= UNIT_MS.d!) return `${Math.round(ms / UNIT_MS.d!)}d`;
+  if (ms >= UNIT_MS.h!) return `${Math.round(ms / UNIT_MS.h!)}h`;
+  return `${Math.max(1, Math.round(ms / UNIT_MS.m!))}m`;
+}

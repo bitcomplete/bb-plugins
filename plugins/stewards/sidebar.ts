@@ -11,7 +11,7 @@
 // lifecycle owner. Since BB-72 a worker's parent is its steward and a
 // reviewer's is its worker, so the fallback and the records agree.
 
-import { formatDuration } from "./duration.js";
+import { formatAge } from "./duration.js";
 import type { DeployState } from "./deploy.js";
 import type { Wait } from "./wait.js";
 
@@ -450,23 +450,22 @@ export function waitingOnNamesFinishedWorker(
  * value is the wait's age; a live wait past its budget reads `<phrase>,
  * overdue <duration>`.
  */
-export function overduePhrase(ms: number): string {
-  if (ms >= 86_400_000) return `${Math.round(ms / 86_400_000)}d`;
-  if (ms >= 3_600_000) return `${Math.round(ms / 3_600_000)}h`;
-  return `${Math.max(1, Math.round(ms / 60_000))}m`;
-}
+export const overduePhrase = formatAge;
 
 /**
  * BB-406: the `idle <duration>` chip an initiative row shows, with its unmet
  * count as the tooltip; null for a binding that is not idle. The duration is
  * read from the stored clock at render time.
  */
-export function idleInitiativeChip(e: Pick<EffortStatus, "idleInitiativeSince" | "idleInitiativeUnmet">, now: number): { text: string; title: string } | null {
+export function idleInitiativeChip(e: Pick<EffortStatus, "idleInitiativeSince" | "idleInitiativeUnmet" | "hold">, now: number): { text: string; title: string } | null {
   const since = e.idleInitiativeSince;
   if (since === null || since === undefined) return null;
+  // A held initiative is listed as held, never as idle, even before the next
+  // reconcile clears the stored clock.
+  if (e.hold !== null && e.hold !== undefined) return null;
   const unmet = e.idleInitiativeUnmet;
   const title = unmet === null || unmet === undefined ? "unmet criteria unknown" : `${unmet} unmet criteria`;
-  return { text: `idle ${formatDuration(Math.max(0, now - since))}`, title };
+  return { text: `idle ${formatAge(Math.max(0, now - since))}`, title };
 }
 
 /** A short relative time to a future moment, for `next look <time>` (BB-83). */

@@ -168,8 +168,10 @@ export function createBriefing(store: Store, now: () => number): (projectId: str
         stall: openWith((x) => x.kind === "stall"),
         // BB-247: the dated waits still ahead, listed separately from stalls.
         datedWaits: open.filter((b) => b.requeueUntil !== null && b.requeueUntil > now()),
-        // BB-406: an initiative the reconcile marked idle, however long ago.
-        idle: open.filter((b) => b.idleInitiativeSince !== null),
+        // BB-406: an initiative the reconcile marked idle, however long ago. A
+        // held binding is listed as held, not idle, even before the next
+        // reconcile clears the stored clock.
+        idle: open.filter((b) => b.idleInitiativeSince !== null && b.hold === null),
       },
       done:
         scoped === null

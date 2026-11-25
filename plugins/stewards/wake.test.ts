@@ -1116,6 +1116,16 @@ describe("initiative idle (BB-406)", () => {
     expect(idleInitiativeLine(idle(), T)).toBeNull();
   });
 
+  it("rounds a real elapsed time, never rendering an over-an-hour age as minutes (BB-406)", () => {
+    const b = idle({ idleInitiativeSince: T - (5 * 3_600_000 + 13 * 60_000 + 4_000) });
+    expect(idleInitiativeLine(b, T)).toBe("ENG-12: idle 5h — 3 unmet criteria");
+  });
+
+  it("does not render an idle line for a held initiative even if the clock is set (BB-406)", () => {
+    const held = idle({ idleInitiativeSince: T - 5 * 3_600_000, hold: "a freeze" });
+    expect(idleInitiativeLine(held, T)).toBeNull();
+  });
+
   it("carries the idle line in the initiative's own wake only while idle", () => {
     const b = idle({ idleInitiativeSince: T - 3 * DAY }, { comments: [met("Scope memo approved (owner)")] });
     expect(initiativeIdleWakeLine(b, T)).toBe("- **This initiative has been idle for 3d:** 2 unmet criteria, no open child, nothing live it waits on.");

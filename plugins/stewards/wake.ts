@@ -6,6 +6,7 @@
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
 import { formatDuration, GITHUB_TODO_LABEL, INITIATIVE_LABEL, INITIATIVE_PLAYBOOK, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
+import { formatAge } from "./duration.js";
 import { landLessonInstruction } from "./lessons.js";
 import type { GuidanceUnit } from "./guidance.js";
 import type { BigDecision } from "./decisions.js";
@@ -1703,6 +1704,17 @@ export function initiativeUnmet(binding: Pick<Binding, "kind" | "playbook" | "la
 }
 
 /**
+ * BB-406: whether a stored typed wait is of a kind whose live producer keeps an
+ * initiative from reading idle. A `date`, `external` or absent wait is not; a
+ * `pull`, `review`, `deployment`, `worker`, `binding` or `person` wait is, when
+ * it is live. The report and hold writes use this to clear the idle clock on a
+ * flip without a reconcile.
+ */
+export function initiativeLiveWait(wait: { kind: WaitKind } | null): boolean {
+  return wait !== null && INITIATIVE_LIVE_WAIT_KINDS.has(wait.kind);
+}
+
+/**
  * BB-406: whether an initiative is idle — in its build phase, not held, with at
  * least one criterion unmet, no child still open and no live typed wait. Pure:
  * `children` is the fresh snapshot's child list and `waitLive` the composer's
@@ -1727,7 +1739,7 @@ export function initiativeIdle(
   // Anything but completed or canceled is an open child, including a null type.
   if (children.some((c) => c.stateType !== "completed" && c.stateType !== "canceled")) return false;
   const wait = binding.wait ?? null;
-  if (wait !== null && INITIATIVE_LIVE_WAIT_KINDS.has(wait.kind) && waitLive === true) return false;
+  if (initiativeLiveWait(wait) && waitLive === true) return false;
   return true;
 }
 
@@ -1739,6 +1751,9 @@ export function initiativeIdle(
  */
 export function idleInitiativeLine(binding: Binding, now: number): string | null {
   if (binding.idleInitiativeSince === null) return null;
+  // A held initiative is listed as held, never as idle, even before the next
+  // reconcile clears the stored clock.
+  if (binding.hold !== null) return null;
   if (initiativeProgress(binding) === null) return null;
   const unmet = initiativeUnmet(binding);
   const criteria = unmet === null ? "unmet criteria unknown" : `${unmet} unmet criteria`;
@@ -1749,7 +1764,7 @@ export function idleInitiativeLine(binding: Binding, now: number): string | null
       : wait.kind === "date"
         ? `, waiting on ${binding.requeueUntil === null ? wait.ref : new Date(binding.requeueUntil).toISOString()}`
         : `, waiting on ${waitPhrase(wait)}`;
-  return `${binding.entityKey}: idle ${formatDuration(Math.max(0, now - binding.idleInitiativeSince))} — ${criteria}${waiting}`;
+  return `${binding.entityKey}: idle ${formatAge(Math.max(0, now - binding.idleInitiativeSince))} — ${criteria}${waiting}`;
 }
 
 /** BB-406: the one line an idle initiative's own wake carries, or null when it is not idle. */
@@ -1757,7 +1772,7 @@ export function initiativeIdleWakeLine(binding: Binding, now: number): string | 
   if (binding.idleInitiativeSince === null) return null;
   const unmet = initiativeUnmet(binding);
   const criteria = unmet === null ? "an unknown number of unmet criteria" : `${unmet} unmet criteria`;
-  return `- **This initiative has been idle for ${formatDuration(Math.max(0, now - binding.idleInitiativeSince))}:** ${criteria}, no open child, nothing live it waits on.`;
+  return `- **This initiative has been idle for ${formatAge(Math.max(0, now - binding.idleInitiativeSince))}:** ${criteria}, no open child, nothing live it waits on.`;
 }
 
 /**
@@ -2180,7 +2195,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}${choicesNote(x.choices)}`),
     ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}${initiativeFlag(b)}`),
     // BB-406: an idle initiative is reported with how long it has been idle.
-    ...(r.idle ?? []).map((b) => idleInitiativeLine(b, now)).filter((line): line is string => line !== null),
+    ...(r.idle ?? []).map((b) => idleInitiativeLine(b, now)).filter((line): line is string => line !== null).map((line) => `- ${line}`),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."), "");
 
