@@ -54,6 +54,14 @@ describe("the shipped pr-reviewer skill's product ack (BB-207)", () => {
 const stewardsSkill = readFileSync(fileURLToPath(new URL("./skills/stewards/SKILL.md", import.meta.url)), "utf8");
 const onboardingSkill = readFileSync(fileURLToPath(new URL("./skills/onboarding/SKILL.md", import.meta.url)), "utf8");
 
+// BB-405: the shipped skill text states project-specific restart details
+// generically, so it reads for any project.
+describe("the shipped stewards skill names no project-specific restart detail (BB-405)", () => {
+  it("keeps bb-gate, the router probe and the pod's commit file out of the shipped text", () => {
+    expect(stewardsSkill).not.toMatch(/bb-gate|_bb-gate|\/opt\/bb-plugins-commit|quiet window/u);
+  });
+});
+
 describe("the shipped stewards skill's child filing (BB-250, BB-360)", () => {
   it("files a child through the source-neutral ticket_file, naming the parent", () => {
     expect(stewardsSkill).toContain("### Filing a child");
