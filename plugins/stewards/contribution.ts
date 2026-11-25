@@ -2,12 +2,13 @@
 // interface and the composer. BB-387 (C3) makes the composer's gate the one
 // `assess()` returns: the github contributor owns the pull merge gate
 // (`pullGate`, `gateInputKey`, `assessedPullGate`, the BB-321 forwarded-owner
-// rule) and `assess()` composes its `merge` items. The waits, resources, holds
-// and reasons are still shadow — the reconcile computes them beside the
+// rule) and `assess()` composes its `merge` items. The resources, holds and
+// reasons are still shadow — the reconcile computes them beside the
 // assessment and `compare` records any divergence through the existing
-// divergence log (BB-293). BB-399 (C4) adds the composed `liveness`
-// (idle/stall), still shadow: `assess()` keeps today's inline answer and no
-// surface reads the composed one.
+// divergence log (BB-293). BB-399 (C4) added the composed `liveness`
+// (idle/stall); BB-400 (C5) makes it the one `assess()` reads, so the inline
+// idle/stall derivation is deleted and the composer is the only place idle or
+// stall is derived.
 //
 // A source contributes what it knows about the subjects it owns: gate items,
 // waits, resources, holds and reasons. `compose()` folds those into one
@@ -186,10 +187,13 @@ export type SourceContributor = {
 
 /**
  * The composed answer, beside `assess()`. `gate` is exactly
- * `Assessment["gate"]`. `liveness` is the shadow idle/stall answer (BB-399,
- * C4): `compose` leaves it at its neutral default because it folds
- * contributions only, and `composeAssessment` derives it from the
- * contributions plus the rows the look already holds.
+ * `Assessment["gate"]`. `liveness` is the idle/stall answer (BB-399, C4;
+ * BB-400, C5 makes it the one `assess()` reads): `idleBase` is
+ * `idleInActiveStage`'s answer before the typed wait is applied, `idle` is
+ * that with a live typed wait suppressing it, and `stalled` is the
+ * observed/typed-wait stall. `compose` leaves it at its neutral default
+ * because it folds contributions only, and `composeAssessment` derives it
+ * from the contributions plus the rows the look already holds.
  */
 export type ComposedAssessment = {
   gate: Assessment["gate"];
@@ -197,7 +201,7 @@ export type ComposedAssessment = {
   resources: readonly ResourceContribution[];
   holds: readonly HoldContribution[];
   reasons: readonly Reason[];
-  liveness: { idle: boolean; stalled: boolean };
+  liveness: { idleBase: boolean; idle: boolean; stalled: boolean };
 };
 
 const empty = (source: ContributionSource): SourceContribution => ({ source, gate: [], waits: [], resources: [], holds: [], reasons: [] });
@@ -336,7 +340,7 @@ export function compose(contributions: readonly SourceContribution[]): ComposedA
     reasons: contributions.flatMap((c) => c.reasons),
     // `compose` folds contributions only; the liveness also reads rows, so
     // `composeAssessment` overwrites this neutral default.
-    liveness: { idle: false, stalled: false },
+    liveness: { idleBase: false, idle: false, stalled: false },
   };
 }
 
@@ -345,14 +349,13 @@ export function compose(contributions: readonly SourceContribution[]): ComposedA
 const NO_OWN_PULLS: ReadonlySet<string> = new Set<string>();
 
 /**
- * BB-399 (C4): the composed idle and stall, in shadow. `assess()` keeps its
- * inline answer; this is the answer the next slice's consumer will read. The
- * idle base is `idleInActiveStage`'s rows with the own-pull wait taken from
- * the github contributor's `open-pull` resources, so core names no pull
- * request; a live typed wait suppresses the idle wake, exactly as `assess()`
- * does. The stall is the `observedStall`/typed-wait rule, with `live` from the
- * rows and the requeue ahead read from the holds contribution. It reads only
- * rows the look already holds, so it adds no store read or source call.
+ * BB-399 (C4): the composed idle and stall. BB-400 (C5) makes it the one
+ * `assess()` reads. The idle base is `idleInActiveStage`'s rows with the
+ * own-pull wait taken from the github contributor's `open-pull` resources, so
+ * core names no pull request; a live typed wait suppresses the idle wake. The
+ * stall is the `observedStall`/typed-wait rule, with `live` from the rows and
+ * the requeue ahead read from the holds contribution. It reads only rows the
+ * look already holds, so it adds no store read or source call.
  */
 function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): ComposedAssessment["liveness"] {
   const { binding, observed, workers, escalations, needs, now } = input;
@@ -379,24 +382,16 @@ function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): 
   const dateAhead = composed.holds.some((h) => h.id === "requeue" && h.held);
   const live = assessLiveWakeSource(input.sources);
   return {
+    idleBase,
     idle: typedWait !== null && waitLive === true ? false : idleBase,
     stalled: typedWait === null ? observedStall(binding, live, now) : !live && waitLive !== true && !dateAhead,
   };
 }
 
-/** The shadow composition for one binding, from the rows the look already holds. */
+/** The composition for one binding, from the rows the look already holds. */
 export function composeAssessment(input: AssessmentInput): ComposedAssessment {
   const composed = compose(CONTRIBUTORS.map((c) => c.contribute(input)));
   composed.gate.readyPassed = gateState(input.playbook, input.binding.ready, input.currentSpecHash).passed;
   composed.liveness = composeLiveness(input, composed);
   return composed;
-}
-
-/**
- * BB-387 (C3): the one gate `assess()` composes. The pull `merge` items come
- * from the github contributor and core folds them with `compose`; the ready
- * gate stays core and is filled here. Nothing pull-specific is named.
- */
-export function composeGate(input: AssessmentInput): Assessment["gate"] {
-  return composeAssessment(input).gate;
 }

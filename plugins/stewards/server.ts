@@ -100,7 +100,7 @@ import {
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mergeWorkaroundParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
-import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessIdle, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
+import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
 import { composeAssessment } from "./contribution.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { ASK_ON_SLACK_CHOICE, NOT_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackCandidateLabel, slackNameCandidates, slackPersonKey, slackPersonLabel, slackPersonNotOnSlack, waitSlackAskOnceWhat, waitSlackInstruction, waitSlackTerminalWhat, type SlackCandidate, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
@@ -5533,9 +5533,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * BB-293/BB-322/BB-333/BB-375: the binding's one assessment, from the rows
-     * the look already holds. BB-333 made the typed-wait derivation
-     * authoritative; BB-375 made the reconcile its only writer: the stored
+     * BB-293/BB-322/BB-333/BB-375/BB-400: the binding's one assessment, from
+     * the rows the look already holds. BB-333 made the typed-wait derivation
+     * authoritative; BB-375 made the reconcile its only writer; BB-400 makes
+     * the composer's liveness the one `assess()` reads. The stored
      * `noWakeSource` is written from the assessment here for a ticket or pull
      * request and from `observedStall` on the ops path, and `steward_report`
      * derives the same answer for its reply without storing it. The shadow's
@@ -5553,9 +5554,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       config: ProjectConfig,
     ): Promise<Assessment> {
       const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config);
-      // BB-380 (C2) / BB-387 (C3): the composed answer is the gate's source and
-      // the waits/holds shadow, computed once and handed to `assess`, so the
-      // reconcile does not compose twice. No consumer reads it yet.
+      // BB-380 (C2) / BB-387 (C3) / BB-400 (C5): the composed answer is the
+      // gate's source and the liveness answer, computed once and handed to
+      // `assess`, so the reconcile does not compose twice; the waits/holds are
+      // still the shadow the divergence log reads.
       const composed = composeAssessment(input);
       const assessment = assess(input, composed);
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
@@ -6001,10 +6003,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // / `runningWorkerReason` call sites are gone. `inFlight` is still
       // running-or-parked today, so this is the same answer.
       const workerInFlight = assessment?.worker.inFlight ?? assessWorker(workers).inFlight;
-      // BB-285: which of the binding's own pull requests are gate-met. A
-      // gate-met own pull request is the plugin's to act on, so it does not
-      // suppress the idle wake (BB-83) the way an open one otherwise does.
-      const gateMetPulls = new Set((assessment?.gate.pulls ?? []).filter((p) => p.met).map((p) => p.pull.toLowerCase()));
       // BB-203: an open need or `user` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
       const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
@@ -6024,13 +6022,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // later of the last worker's end, the last own pull request's close and
       // the last wake; a worker finish asks for the look at once, without the
       // grace. An idle wake ends the period until one of those happens again.
-      // BB-329: the idle answer is derived in assessment.ts (`assessIdle`), so
-      // the surface and the stored assessment share one derivation.
-      const idle = assessIdle(
-        { stage, ending: b.ending, hold: b.hold, deployments, workers, ownPulls, gateMetPulls, escalations: store.openEscalations(b.id), needs: store.openNeeds(b.id), requeueUntil: b.requeueUntil },
-        observed,
-        now(),
-      );
+      // BB-400 (C5): the idle answer is the composer's, read from the one
+      // assessment this look already built. The old `assessIdle` call and its
+      // duplicate `openEscalations`/`openNeeds` reads are gone; an assessment
+      // that could not be built fails closed (no idle wake) rather than
+      // deriving idle a second way.
+      const idle = assessment?.liveness.idleBase ?? false;
       // Re-read the idle fields from the store: a worker finish may have set
       // `idleWakeNow` (or a deployment verdict reset the period) after this
       // reconcile captured `b`, and writing the stale locals back would lose
@@ -14260,28 +14257,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // ticket's own pull request counts as a source or not by one rule.
           const currentOwnPulls = current.kind === "ticket" && current.lastSnapshot !== null ? await ownPullKeys(current, store.workers(current.id), current.lastSnapshot) : new Set<string>();
           const liveSource = liveWakeSourceFor(current, currentOwnPulls);
-          // BB-333/BB-375: liveness and stall come from the typed wait, derived
-          // by the one assessment on every reconcile. The report derives the
-          // same answer here for its reply, so the reply is current in the turn
-          // the wait is set. A no-kind report falls to `observedStall`, the
-          // derivation `assess` itself uses for it. The report stores nothing:
-          // every reconcile, ticket, pull request or ops, is the column's sole
-          // writer.
+          // BB-333/BB-375/BB-400: liveness and stall come from the one
+          // assessment. The report derives the same answer here for its reply
+          // (the reconcile that stores it may not have run since the wait was
+          // set), so the reply is current in the turn the wait is set; a
+          // no-kind report is the assessment's own no-kind derivation. The
+          // report stores nothing: every reconcile, ticket, pull request or
+          // ops, is the column's sole writer. An ops binding has no snapshot to
+          // assess, so its report keeps the free-text rule the ops reconcile
+          // writes with (the ops path is out of C5's scope).
           let derivedStalled: boolean | null = null;
-          if (current.wait !== null && current.lastSnapshot !== null && playbook !== null && config !== null) {
+          if (current.lastSnapshot !== null && playbook !== null && config !== null) {
             try {
               const derived = assess(await buildAssessmentInput(current, current.lastSnapshot, store.workers(current.id), currentOwnPulls, playbook, specHashFor(current, current.lastSnapshot.entity), config));
               derivedStalled = derived.liveness.stalled;
             } catch (error) {
-              bb.log.warn(`stewards: could not derive the typed wait's liveness for ${current.entityKey}: ${errorMessage(error)}`);
+              bb.log.warn(`stewards: could not derive the liveness for ${current.entityKey}: ${errorMessage(error)}`);
             }
           }
           // BB-247: a dated wait is the plugin's own wake source while the date
           // is ahead, so it is not reported as waiting with no source (and is
-          // listed as a dated wait in the digest instead). `observedStall` is
-          // the same predicate the reconcile's `assess` derives a no-kind wait
-          // with, so the reply and the column cannot disagree.
-          const noWakeSource = derivedStalled ?? observedStall(current, liveSource, now());
+          // listed as a dated wait in the digest instead).
+          const noWakeSource = derivedStalled ?? (current.source === "ops" ? observedStall(current, liveSource, now()) : false);
           // BB-339: the open bindings the free text names, in the order they
           // appeared, so the report reply can point the steward at the hold it
           // can take in this turn. A key that resolves to nothing, to an ended
@@ -16721,7 +16718,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             description: "Every place the shadow assessment disagrees with the predicate it will replace, one row per distinct (binding, surface, old, new) with a first/last seen time and a count. --binding filters by binding id or entity key, --surface by surface name. --json emits the rows. Nothing reads the log to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's divergences (binding id or entity key)" },
-              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, hasLiveWakeSource, approvals.gate, approvals.pageRefusal, noWakeSource)" },
+              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, hasLiveWakeSource, approvals.gate, approvals.pageRefusal, noWakeSource, compose.waits, compose.holds)" },
               project: PROJECT_OPTION,
               json: JSON_OPTION,
             },

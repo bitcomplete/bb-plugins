@@ -4,17 +4,18 @@
 // explicit `parked`, distinct from `running`) and the wait liveness (wake
 // source, idle and stall derived from what the plugin observes, not the
 // stored `noWakeSource` flag, which only a reconcile writes for a ticket or
-// pull request).
+// pull request). BB-400 (C5) makes the composer the one place idle and stall
+// are derived: `assess()` reads them from the composed answer.
 //
 // It is pure: it reads only the rows a reconcile already has in hand and
 // decides nothing. `compare` runs the predicates the assessment will replace
 // over the same rows and returns every place the old answer and the assessment
 // disagree, so the divergence log can be read for several days before any
 // consumer reads the assessment.
-import { composeGate, pullGate, type ComposedAssessment } from "./contribution.js";
+import { composeAssessment, pullGate, type ComposedAssessment } from "./contribution.js";
 import { latestReviewMarker, type PrGate, type ProjectApprovalRecord } from "./gate.js";
 import { parsePullRef } from "./github.js";
-import { anyWorkerInFlight, idleInActiveStage, observedStall, productGateOptions, runningWorkerReason, stuckDue, type IdleBinding } from "./reconcile.js";
+import { anyWorkerInFlight, productGateOptions, runningWorkerReason, stuckDue } from "./reconcile.js";
 import { hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
 import type { EntitySnapshot } from "./source-contract.js";
@@ -69,9 +70,9 @@ export type AssessedLiveness = {
    * when the ref could not be read; JSON, never the raw snapshot.
    */
   waited: string | null;
-  /** `idleInActiveStage` before the typed wait is applied: what the consumer's idle wake reads (BB-333). */
+  /** The composer's `idleInActiveStage` before the typed wait is applied: what the consumer's idle wake reads (BB-333, BB-400). */
   idleBase: boolean;
-  /** `idleInActiveStage`. */
+  /** The composer's idle: `idleBase` with a live typed wait suppressing it. */
   idle: boolean;
   /** `stuckDue`: the phase backstop. */
   stuck: boolean;
@@ -298,14 +299,6 @@ export function assessWorker(workers: readonly Worker[]): AssessedWorker {
 }
 
 /**
- * The idle answer (BB-83), in one place: `assess` and the reconcile's idle
- * wake both call it, so no surface calls `idleInActiveStage` directly.
- */
-export function assessIdle(idleBinding: IdleBinding, observed: Observed, now: number = Date.now()): boolean {
-  return idleInActiveStage(idleBinding, observed, now);
-}
-
-/**
  * The live-wake-source answer (BB-154), in one place: `assess` and the report
  * path's `liveWakeSourceFor` both call it, so no surface calls
  * `hasLiveWakeSource` directly.
@@ -316,54 +309,35 @@ export function assessLiveWakeSource(sources: WakeSourceInput): boolean {
 
 /** Derive the one assessment for a binding from the rows the reconcile already read. */
 export function assess(input: AssessmentInput, composed?: ComposedAssessment): Assessment {
-  const { binding, observed, ownPulls, workers, escalations, needs, sources, playbook, now } = input;
+  const { binding, workers, escalations, sources, playbook, now } = input;
   // BB-387 (C3): the merge gate is the github contributor's `merge` items,
-  // folded by core; `assess()` names no pull-specific derivation. A caller
-  // that already composed the answer passes it in, so the reconcile does not
-  // compose twice.
-  const gate = composed?.gate ?? composeGate(input);
-  const pulls = gate.pulls;
-  const idleBinding: IdleBinding = {
-    stage: binding.stage,
-    ending: binding.ending,
-    hold: binding.hold,
-    deployments: binding.deployments,
-    requeueUntil: binding.requeueUntil,
-    workers,
-    ownPulls,
-    // BB-322: derived from the one assessment, so no surface computes the gate
-    // again; the old `gateMetPulls` input is retired.
-    gateMetPulls: new Set(pulls.filter((p) => p.met).map((p) => p.pull.toLowerCase())),
-    escalations,
-    needs,
-  };
-  const live = assessLiveWakeSource(sources);
+  // folded by core. BB-400 (C5): the idle/stall liveness is the composer's,
+  // too, so `assess()` names no pull-specific or typed-wait derivation. A
+  // caller that already composed the answer passes it in, so the reconcile
+  // does not compose twice.
+  const answer = composed ?? composeAssessment(input);
+  const gate = answer.gate;
   // BB-333: the typed wait is judged by its own kind, on every reconcile,
-  // never from a flag stored at report time. A no-kind report keeps today's
-  // free-text rule exactly.
+  // never from a flag stored at report time.
   const wait = binding.wait ?? null;
   const waitLive = wait === null ? null : typedWaitLive(wait, input);
-  const dateAhead = binding.requeueUntil !== null && binding.requeueUntil > now;
   const overdueMs = waitLive === true ? waitOverdueMs(wait, binding.waitSince ?? null, input.waitBudgets ?? {}, now) : null;
-  const idleBase = assessIdle(idleBinding, observed, now);
   return {
     bindingId: binding.id,
     entityKey: binding.entityKey,
     gate,
     worker: assessWorker(workers),
     liveness: {
-      live,
+      live: assessLiveWakeSource(sources),
       waitLive,
       waited: waitFingerprint(wait, input),
-      idleBase,
-      // A live typed wait is something the plugin waits on, so it suppresses
-      // the idle wake; a stalled or external one does not (BB-333).
-      idle: wait !== null && waitLive === true ? false : idleBase,
+      // BB-400 (C5): the idle base, the idle answer and the stall are the
+      // composer's, computed once and read here. The inline typed-wait
+      // derivation is deleted, not kept beside it.
+      idleBase: answer.liveness.idleBase,
+      idle: answer.liveness.idle,
       stuck: stuckDue(binding, playbook, [...escalations], now) !== null,
-      // BB-389: the typed wait may add liveness but never removes it. A binding
-      // with any live structured source is not stalled whatever the wait says;
-      // only a non-live wait (or none) can stall.
-      stalled: wait === null ? observedStall(binding, live, now) : !live && waitLive !== true && !dateAhead,
+      stalled: answer.liveness.stalled,
       reportedNoWakeSource: binding.noWakeSource,
       overdue: overdueMs !== null,
       overdueMs,
@@ -407,11 +381,13 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  *
  * BB-380 (C2) adds the shadow composer's own surfaces: `compose.waits` and
  * `compose.holds` (BB-387/C3 retired `compose.gate`, since the gate now comes
- * from the composed answer and cannot diverge from it). BB-399 (C4) adds
- * `compose.liveness`. The composed answer is a refactor of today's derivation,
- * so a row on one of them is a defect, not a fixture. The comparison runs only
- * when the caller passes the composed answer; the C1 characterization tests
- * call `compare` without one and see the seven surfaces they pin.
+ * from the composed answer and cannot diverge from it; BB-400/C5 retired
+ * `compose.liveness`, since `assess()` now reads idle and stalled from the
+ * composed answer and they cannot diverge either). The composed answer is a
+ * refactor of today's derivation, so a row on one of them is a defect, not a
+ * fixture. The comparison runs only when the caller passes the composed
+ * answer; the C1 characterization tests call `compare` without one and see the
+ * seven surfaces they pin.
  */
 export function compare(input: AssessmentInput, assessment: Assessment, composed?: ComposedAssessment): Divergence[] {
   const { binding, observed, ownPulls, projectApprovals, workers } = input;
@@ -492,25 +468,6 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     const assessedHolds = [binding.hold !== null ? "hold" : null, binding.ending !== null ? "ending" : null, binding.requeueUntil !== null ? `requeue:${binding.requeueUntil > input.now}` : null].filter((x) => x !== null).join(",");
     const composedHolds = composed.holds.map((h) => (h.id === "requeue" ? `requeue:${h.held}` : h.id)).join(",");
     if (assessedHolds !== composedHolds) add("compose.holds", assessedHolds, composedHolds, { binding: binding.id });
-
-    // BB-399 (C4): the composed idle/stall against the assessment's. The
-    // composed answer is a refactor of today's inline derivation, so a row
-    // here is a defect, not a fixture. `inputs` are booleans, ids, a kind and
-    // a timestamp only, never the wait text.
-    const assessedLiveness = `${assessment.liveness.idle}|${assessment.liveness.stalled}`;
-    const composedLiveness = `${composed.liveness.idle}|${composed.liveness.stalled}`;
-    if (assessedLiveness !== composedLiveness) {
-      add("compose.liveness", assessedLiveness, composedLiveness, {
-        binding: binding.id,
-        idle: assessment.liveness.idle,
-        stalled: assessment.liveness.stalled,
-        live: assessment.liveness.live,
-        waitKind: assessment.wait?.kind ?? null,
-        waitLive: assessment.liveness.waitLive === true,
-        requeueUntil: binding.requeueUntil,
-        now: input.now,
-      });
-    }
   }
   return out;
 }
