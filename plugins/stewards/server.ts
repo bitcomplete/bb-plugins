@@ -101,7 +101,7 @@ import {
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mergeWorkaroundParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
-import { composeAssessment } from "./contribution.js";
+import { composeAssessment, type ComposedAssessment } from "./contribution.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { ASK_ON_SLACK_CHOICE, NOT_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackCandidateLabel, slackNameCandidates, slackPersonKey, slackPersonLabel, slackPersonNotOnSlack, waitSlackAskOnceWhat, waitSlackInstruction, waitSlackTerminalWhat, type SlackCandidate, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
@@ -5544,22 +5544,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * now agree by construction. The column and every surface that reads it are
      * unchanged.
      */
-    async function assessBinding(
-      b: Binding,
-      observed: Observed,
-      workers: readonly Worker[],
-      ownPulls: ReadonlySet<string>,
-      playbook: Playbook,
-      currentSpecHash: string,
-      config: ProjectConfig,
-    ): Promise<Assessment> {
-      const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config);
-      // BB-380 (C2) / BB-387 (C3) / BB-400 (C5): the composed answer is the
-      // gate's source and the liveness answer, computed once and handed to
-      // `assess`, so the reconcile does not compose twice; the waits/holds are
-      // still the shadow the divergence log reads.
-      const composed = composeAssessment(input);
-      const assessment = assess(input, composed);
+    function recordAssessed(b: Binding, input: AssessmentInput, composed: ComposedAssessment, assessment: Assessment): void {
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
       // The shadow's `noWakeSource` divergence is retired with the flag: the
       // two agree by construction now, so `wait_divergence_state` stops being
@@ -5568,7 +5553,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // binding patch, so no extra store read is added.
       store.recordDivergences(compare(input, assessment, composed).filter((d) => d.surface !== "noWakeSource"));
       store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
-      return assessment;
+    }
+
+    async function assessBinding(
+      b: Binding,
+      observed: Observed,
+      workers: readonly Worker[],
+      ownPulls: ReadonlySet<string>,
+      playbook: Playbook,
+      currentSpecHash: string,
+      config: ProjectConfig,
+    ): Promise<{ assessment: Assessment; input: AssessmentInput }> {
+      const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config);
+      // BB-380 (C2) / BB-387 (C3) / BB-400 (C5): the composed answer is the
+      // gate's source and the liveness answer, computed once and handed to
+      // `assess`, so the reconcile does not compose twice; the waits/holds are
+      // still the shadow the divergence log reads.
+      const composed = composeAssessment(input);
+      const assessment = assess(input, composed);
+      recordAssessed(b, input, composed, assessment);
+      return { assessment, input };
     }
 
     /**
@@ -5940,8 +5944,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // already open when this ships can still read overdue one budget later.
       if (b.wait !== null && b.waitSince === null) b = store.patch(b.id, { waitSince: now() });
       let assessment: Assessment | null = null;
+      let assessmentInput: AssessmentInput | null = null;
       try {
-        assessment = await assessBinding(b, observed, workers, ownPulls, playbook, currentSpec, config);
+        // BB-400: the composer's idleBase reads `binding.stage`, so assess with
+        // this look's stage (from `phaseAndStage`), not the stage stored before
+        // the look. The old `assessIdle` call used the same local.
+        const built = await assessBinding({ ...b, stage }, observed, workers, ownPulls, playbook, currentSpec, config);
+        assessment = built.assessment;
+        assessmentInput = built.input;
       } catch (error) {
         bb.log.warn(`stewards: assessment failed for ${b.entityKey}: ${errorMessage(error)}`);
       }
@@ -5958,6 +5968,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // ticket comment), and `pull`/`deployment` are never nudged: the wake
       // asks the steward to look. When a second budget passes with the wait
       // still live and unchanged, the owner gets one decide item.
+      let overdueNeedFiled = false;
       if (assessment !== null && assessment.liveness.overdue && b.wait !== null && b.waitSince !== null) {
         const overdueWait = b.wait;
         const overdueBudget = waitBudgetMs(overdueWait.kind, config.file.waitBudgets);
@@ -5994,9 +6005,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // BB-358: the fixed ladder picks the rung (the Slack offer, the
             // ask-once question, or the terminal need) and files it once.
             const line = await fileOverdueWaitNeed(b, overdueWait, assessment, config);
-            if (line !== null) changes.push({ text: line, actionable: true });
+            if (line !== null) {
+              changes.push({ text: line, actionable: true });
+              overdueNeedFiled = true;
+            }
           }
         }
+      }
+      // BB-400: `fileOverdueWaitNeed` can file a decide item after the
+      // assessment was built, and the idle wake reads the assessment's
+      // `idleBase` (which `idleInActiveStage` suppresses while a need is open).
+      // Re-derive the liveness with the look's final needs/escalations so a
+      // need filed here suppresses the idle wake, as the removed `assessIdle`
+      // call's fresh reads did. It adds the three reads only on the rare look
+      // that files one, and no source call.
+      if (overdueNeedFiled && assessment !== null && assessmentInput !== null) {
+        const refreshed: AssessmentInput = { ...assessmentInput, needs: store.openNeeds(b.id), escalations: store.openEscalations(b.id) };
+        const composed = composeAssessment(refreshed);
+        assessment = assess(refreshed, composed);
+        assessmentInput = refreshed;
+        recordAssessed(b, refreshed, composed, assessment);
       }
       // BB-329: one worker-busy predicate. Every surface reads the assessment's
       // worker state (assessment.ts `assessWorker`); the old `anyWorkerInFlight`
@@ -14277,8 +14305,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           // BB-247: a dated wait is the plugin's own wake source while the date
           // is ahead, so it is not reported as waiting with no source (and is
-          // listed as a dated wait in the digest instead).
-          const noWakeSource = derivedStalled ?? (current.source === "ops" ? observedStall(current, liveSource, now()) : false);
+          // listed as a dated wait in the digest instead). When the fresh
+          // assessment is unavailable (a missing snapshot, playbook or config,
+          // or a failed build), fall back to the stored assessment's stall, not
+          // to `false`: the reply must not drop the warning. An ops binding has
+          // no stored assessment, so its report keeps the free-text rule the
+          // ops reconcile writes with (the ops path is out of C5's scope).
+          const storedStalled = (store.assessment(current.id)?.liveness as { stalled?: boolean } | null | undefined)?.stalled;
+          const noWakeSource = derivedStalled ?? storedStalled ?? (current.source === "ops" ? observedStall(current, liveSource, now()) : false);
           // BB-339: the open bindings the free text names, in the order they
           // appeared, so the report reply can point the steward at the hold it
           // can take in this turn. A key that resolves to nothing, to an ended

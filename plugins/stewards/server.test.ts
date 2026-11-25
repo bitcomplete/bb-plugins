@@ -15514,6 +15514,22 @@ describe("a steward idle in an active stage (BB-83)", () => {
     expect(t.sends.at(-1)!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
   });
 
+  // BB-400: the composer's idleBase reads `binding.stage`, so the reconcile must
+  // assess with this look's stage. On the look the ticket leaves an active
+  // stage, the stored stage is still build; judging idle on it would fire the
+  // idle wake after the ticket moved back to Todo.
+  it("stays quiet at a worker finish after the ticket leaves the active stages (BB-400)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    t.entities.set("uuid-12", issue({ state: "Todo", stateType: "unstarted" }));
+    const before = t.sends.length;
+    await t.idle("thr_w1", "Done for now.");
+    expect(t.sends.slice(before).map((s) => s.text).join("\n")).not.toMatch(idleLine);
+  });
+
   it("stays quiet at a worker finish that leaves its own pull request open", async () => {
     const t = await setup();
     const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
