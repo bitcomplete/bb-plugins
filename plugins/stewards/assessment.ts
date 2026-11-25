@@ -407,11 +407,11 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  *
  * BB-380 (C2) adds the shadow composer's own surfaces: `compose.waits` and
  * `compose.holds` (BB-387/C3 retired `compose.gate`, since the gate now comes
- * from the composed answer and cannot diverge from it). The composed answer is
- * a refactor of today's derivation, so a row on one of them is a defect, not a
- * fixture. The comparison runs only when the caller passes the composed answer;
- * the C1 characterization tests call `compare` without one and see the seven
- * surfaces they pin.
+ * from the composed answer and cannot diverge from it). BB-399 (C4) adds
+ * `compose.liveness`. The composed answer is a refactor of today's derivation,
+ * so a row on one of them is a defect, not a fixture. The comparison runs only
+ * when the caller passes the composed answer; the C1 characterization tests
+ * call `compare` without one and see the seven surfaces they pin.
  */
 export function compare(input: AssessmentInput, assessment: Assessment, composed?: ComposedAssessment): Divergence[] {
   const { binding, observed, ownPulls, projectApprovals, workers } = input;
@@ -492,6 +492,25 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     const assessedHolds = [binding.hold !== null ? "hold" : null, binding.ending !== null ? "ending" : null, binding.requeueUntil !== null ? `requeue:${binding.requeueUntil > input.now}` : null].filter((x) => x !== null).join(",");
     const composedHolds = composed.holds.map((h) => (h.id === "requeue" ? `requeue:${h.held}` : h.id)).join(",");
     if (assessedHolds !== composedHolds) add("compose.holds", assessedHolds, composedHolds, { binding: binding.id });
+
+    // BB-399 (C4): the composed idle/stall against the assessment's. The
+    // composed answer is a refactor of today's inline derivation, so a row
+    // here is a defect, not a fixture. `inputs` are booleans, ids, a kind and
+    // a timestamp only, never the wait text.
+    const assessedLiveness = `${assessment.liveness.idle}|${assessment.liveness.stalled}`;
+    const composedLiveness = `${composed.liveness.idle}|${composed.liveness.stalled}`;
+    if (assessedLiveness !== composedLiveness) {
+      add("compose.liveness", assessedLiveness, composedLiveness, {
+        binding: binding.id,
+        idle: assessment.liveness.idle,
+        stalled: assessment.liveness.stalled,
+        live: assessment.liveness.live,
+        waitKind: assessment.wait?.kind ?? null,
+        waitLive: assessment.liveness.waitLive === true,
+        requeueUntil: binding.requeueUntil,
+        now: input.now,
+      });
+    }
   }
   return out;
 }

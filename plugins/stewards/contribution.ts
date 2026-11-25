@@ -5,7 +5,9 @@
 // rule) and `assess()` composes its `merge` items. The waits, resources, holds
 // and reasons are still shadow — the reconcile computes them beside the
 // assessment and `compare` records any divergence through the existing
-// divergence log (BB-293).
+// divergence log (BB-293). BB-399 (C4) adds the composed `liveness`
+// (idle/stall), still shadow: `assess()` keeps today's inline answer and no
+// surface reads the composed one.
 //
 // A source contributes what it knows about the subjects it owns: gate items,
 // waits, resources, holds and reasons. `compose()` folds those into one
@@ -16,6 +18,7 @@
 // from the `AssessmentInput` the reconcile already holds.
 import { createHash } from "node:crypto";
 import {
+  assessLiveWakeSource,
   ownPullEntities,
   pullIsOpen,
   typedWaitLive,
@@ -25,7 +28,7 @@ import {
 import type { AssessedGate, Assessment, AssessmentInput, DecideMark } from "./assessment.js";
 import { waitBudgetMs } from "./config.js";
 import { prGate, type PrGate, type PrGateOptions, type ProjectApprovalRecord } from "./gate.js";
-import { productGateOptions } from "./reconcile.js";
+import { idleInActiveStage, observedStall, productGateOptions } from "./reconcile.js";
 import { gateState } from "./ready-gate.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation } from "./store.js";
@@ -180,13 +183,20 @@ export type SourceContributor = {
   contribute(input: AssessmentInput): SourceContribution;
 };
 
-/** The composed answer, beside `assess()`. `gate` is exactly `Assessment["gate"]`. */
+/**
+ * The composed answer, beside `assess()`. `gate` is exactly
+ * `Assessment["gate"]`. `liveness` is the shadow idle/stall answer (BB-399,
+ * C4): `compose` leaves it at its neutral default because it folds
+ * contributions only, and `composeAssessment` derives it from the
+ * contributions plus the rows the look already holds.
+ */
 export type ComposedAssessment = {
   gate: Assessment["gate"];
   waits: readonly WaitContribution[];
   resources: readonly ResourceContribution[];
   holds: readonly HoldContribution[];
   reasons: readonly Reason[];
+  liveness: { idle: boolean; stalled: boolean };
 };
 
 const empty = (source: ContributionSource): SourceContribution => ({ source, gate: [], waits: [], resources: [], holds: [], reasons: [] });
@@ -318,6 +328,53 @@ export function compose(contributions: readonly SourceContribution[]): ComposedA
     resources: contributions.flatMap((c) => c.resources),
     holds: contributions.flatMap((c) => c.holds),
     reasons: contributions.flatMap((c) => c.reasons),
+    // `compose` folds contributions only; the liveness also reads rows, so
+    // `composeAssessment` overwrites this neutral default.
+    liveness: { idle: false, stalled: false },
+  };
+}
+
+/** No own pulls: the composer's idle derivation takes the pull wait from the
+ * github contributor's `open-pull` resources, so core names no pull set. */
+const NO_OWN_PULLS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * BB-399 (C4): the composed idle and stall, in shadow. `assess()` keeps its
+ * inline answer; this is the answer the next slice's consumer will read. The
+ * idle base is `idleInActiveStage`'s rows with the own-pull wait taken from
+ * the github contributor's `open-pull` resources, so core names no pull
+ * request; a live typed wait suppresses the idle wake, exactly as `assess()`
+ * does. The stall is the `observedStall`/typed-wait rule, with `live` from the
+ * rows and the requeue ahead read from the holds contribution. It reads only
+ * rows the look already holds, so it adds no store read or source call.
+ */
+function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): ComposedAssessment["liveness"] {
+  const { binding, observed, workers, escalations, needs, now } = input;
+  const idleBase =
+    idleInActiveStage(
+      {
+        stage: binding.stage,
+        ending: binding.ending,
+        hold: binding.hold,
+        deployments: binding.deployments,
+        requeueUntil: binding.requeueUntil,
+        workers,
+        ownPulls: NO_OWN_PULLS,
+        escalations,
+        needs,
+      },
+      observed,
+      now,
+    ) && !composed.resources.some((r) => r.active);
+  // A binding has at most one stored typed wait, so the composed waits hold at
+  // most that one item.
+  const typedWait = composed.waits[0] ?? null;
+  const waitLive = typedWait === null ? null : typedWait.live;
+  const dateAhead = composed.holds.some((h) => h.id === "requeue" && h.held);
+  const live = assessLiveWakeSource(input.sources);
+  return {
+    idle: typedWait !== null && waitLive === true ? false : idleBase,
+    stalled: typedWait === null ? observedStall(binding, live, now) : !live && waitLive !== true && !dateAhead,
   };
 }
 
@@ -325,6 +382,7 @@ export function compose(contributions: readonly SourceContribution[]): ComposedA
 export function composeAssessment(input: AssessmentInput): ComposedAssessment {
   const composed = compose(CONTRIBUTORS.map((c) => c.contribute(input)));
   composed.gate.readyPassed = gateState(input.playbook, input.binding.ready, input.currentSpecHash).passed;
+  composed.liveness = composeLiveness(input, composed);
   return composed;
 }
 

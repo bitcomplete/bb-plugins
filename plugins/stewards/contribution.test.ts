@@ -349,6 +349,70 @@ describe("the composed answer equals today's assess() on the C1 characterization
 });
 
 // ---------------------------------------------------------------------------
+// BB-399 (C4): the composed liveness (idle/stall), in shadow.
+// ---------------------------------------------------------------------------
+
+describe("the composed liveness is assess()'s (BB-399)", () => {
+  /**
+   * Every wait kind (live and not), no wait, a live structured source, and the
+   * three hold-like rows the idle rule reads.
+   */
+  const livenessCases = (): Array<[string, AssessmentInput]> => [
+    ["no wait", input({ binding: binding({ status: status("the vendor") }) })],
+    ...waitCases(),
+    ["live source", waitInput({ kind: "external", ref: "the vendor" }, { workers: [{ threadId: "thr_w1", status: "running" } as never] })],
+    ["hold", input({ binding: binding({ hold: "a freeze" }) })],
+    ["ending", input({ binding: binding({ ending: "terminal" }) })],
+    ["requeue ahead", input({ binding: binding({ requeueUntil: 1_000_000 + 86_400_000 }) })],
+  ];
+
+  it("derives idle and stalled equal to assess()'s for every row", () => {
+    for (const [label, i] of livenessCases()) {
+      const a = assess(i);
+      expect(composeAssessment(i).liveness, label).toEqual({ idle: a.liveness.idle, stalled: a.liveness.stalled });
+    }
+  });
+
+  it("records zero compose.liveness divergences for every row", () => {
+    for (const [label, i] of livenessCases()) {
+      const rows = compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface === "compose.liveness");
+      expect(rows, label).toEqual([]);
+    }
+  });
+
+  it("records no compose.liveness row when no composed answer is passed", () => {
+    const union = new Set<string>();
+    for (const [, i] of livenessCases()) for (const d of compare(i, assess(i))) union.add(d.surface);
+    expect(union.has("compose.liveness")).toBe(false);
+  });
+
+  it("takes the idle pull wait from the github contributor's open-pull resources, not from core naming the pull set", () => {
+    // A ticket in build with an open, gate-unmet own pull is not idle. The
+    // composer reads the github contributor's `open-pull` resource for it, so
+    // stubbing that contribution away flips the composed idle — core never
+    // names the pull set.
+    const i = matrix("ticket", "build");
+    expect(composeAssessment(i).liveness.idle).toBe(false);
+    const spy = vi.spyOn(githubContributor, "contribute").mockReturnValue({ source: "github", gate: [], waits: [], resources: [], holds: [], reasons: [] });
+    try {
+      expect(composeAssessment(i).liveness.idle).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("records a compose.liveness row with id, kind, boolean and timestamp inputs when the composed answer disagrees", () => {
+    const i = input();
+    const a = assess(i);
+    const composed = { ...composeAssessment(i), liveness: { idle: !a.liveness.idle, stalled: a.liveness.stalled } };
+    const rows = compare(i, a, composed).filter((d) => d.surface === "compose.liveness");
+    expect(rows).toHaveLength(1);
+    expect(Object.keys(rows[0]!.inputs).sort()).toEqual(["binding", "idle", "live", "now", "requeueUntil", "stalled", "waitKind", "waitLive"]);
+    for (const v of Object.values(rows[0]!.inputs)) expect(v === null || ["string", "number", "boolean"].includes(typeof v)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The interface itself: the types the later consumer slices read.
 // ---------------------------------------------------------------------------
 
@@ -360,6 +424,9 @@ describe("the contribution interface (BB-380)", () => {
     expect(composed.resources).toEqual([]);
     expect(composed.holds).toEqual([]);
     expect(composed.reasons).toEqual([]);
+    // `compose` folds contributions only; the liveness is a neutral default
+    // that `composeAssessment` overwrites.
+    expect(composed.liveness).toEqual({ idle: false, stalled: false });
   });
 
   it("a gate contribution carries the source, subject, id and inputs the design names", () => {
