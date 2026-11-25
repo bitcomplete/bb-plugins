@@ -692,11 +692,10 @@ unmet criterion has an open child, a named blocker, or waits for a slot under
 the limit, and the report names each.
 
 **A soak is not assumed.** A slice is verified by its tests and, once it is
-live on the owner's server, by you exercising it by hand in production (`bb
-stewards` commands, the Stewards page data, the digest, a real ticket) and
-recording what you ran and saw in a `**Note:**`. That check is enough to file
-and merge what follows. A soak is allowed only when all of these hold, and you
-say so in a `**Note:**` before it starts:
+live, by you exercising it by hand in production and recording what you ran
+and saw in a `**Note:**`. That check is enough to file and merge what
+follows. A soak is allowed only when all of these hold, and you say so in a
+`**Note:**` before it starts:
 
 - The defect it guards against cannot be exercised by a test or a hand check
   after deploy, because it depends on real event volume or a state that only
@@ -722,10 +721,10 @@ the hold is on filing: file that one child once you have recorded the check or
 the soak in a `**Note:**`.
 
 **Check the restart; do not wait on a date for it.** When the next step needs
-the owner's server on an image carrying a merge, check on every wake whether
-the pending restart has landed, and proceed once it has. When you must wait,
-set the date wait just after the project's next scheduled look, and say in the
-report that the owner can press Restart now to skip it.
+a merge to be live, check on every wake whether it has landed, and proceed
+once it has. When you must wait, set the date wait just after the project's
+next scheduled look, and say in the report how the owner can make it land
+sooner.
 
 **A wait on an outcome names its producer and checks it.** The report names
 what will deliver the outcome (a binding, a thread, a workflow, a person).
