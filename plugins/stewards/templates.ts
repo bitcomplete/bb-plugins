@@ -872,7 +872,9 @@ source: linear
 phases:
   Backlog:     { stage: spec }
   Todo:        { stage: spec }
+  Ready:       { stage: spec }
   In Progress: { stage: build, stuck: 7d }
+  In Review:   { stage: review, stuck: 3d }
   "label:initiative:awaiting-outcome": { stage: build, stuck: 120d }
 terminal: [Done, Canceled]
 ready:
@@ -946,8 +948,8 @@ merge.**
 ## Backlog
 
 Read the ticket. If it is not something this project does, escalate a decision.
-Otherwise move it to Todo (\`ticket_update\`) and follow the discovery steps
-there.
+Otherwise move it to its first working state — \`Todo\` on a tracker, \`Ready\`
+on a local ticket (\`ticket_update\`) — and follow the discovery steps there.
 
 ## Todo
 
@@ -963,6 +965,22 @@ The ready gate's approval is the **user's**: when the checklist is met, the
 plugin asks the owner, and you wait for it. Do not escalate for it. Do not
 file a child until the outcome and criteria are approved, and move the ticket
 to In Progress only once the approval is recorded.
+
+## Ready
+
+A local ticket's \`Ready\` is the tracker's \`Todo\`: the spec state. Specify the
+initiative against the ready checklist. Work out the outcome, the criteria, the
+signals and the calendar from the ticket and the project's docs, and post them
+as spec comments. Say in the criteria what must exist or be true and who says
+each is met. A criterion written as calendar time ("a week of digests") is
+rewritten as the evidence it stands for, or marked as not blocking any other
+criterion. Ask only what you cannot work out, as a decision escalation, one
+question at a time. Report the checklist on every turn.
+
+The ready gate's approval is the **user's**: when the checklist is met, the
+plugin asks the owner, and you wait for it. Do not escalate for it. Do not file
+a child until the outcome and criteria are approved, and move the ticket to In
+Progress only once the approval is recorded.
 
 ## In Progress
 
@@ -1075,6 +1093,14 @@ revision rather than acting on it.
 
 Once the remaining criteria wait on an outcome (a filed claim, a cycle run),
 add the \`initiative:awaiting-outcome\` label and report the wait.
+
+## In Review
+
+The initiative's children are in review. Keep driving them: answer a child's
+questions, and when a child merges, mark each criterion it met with a
+\`**Met:**\` comment. If the initiative itself was moved here, move it back to In
+Progress and keep driving; the binding ends when the ticket closes, never on a
+child's merge.
 
 ## label:initiative:awaiting-outcome
 

@@ -50,6 +50,7 @@ import {
 import { opsTargetKey, parseOpsTargetKey } from "./ops.js";
 import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, INITIATIVE, LINEAR_TICKETS, LOCAL_TICKETS, OPS_WATCH, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { parseTemplateStamp, templateHash, templateWarnings } from "./template-stamp.js";
+import { LOCAL_STATES } from "./local-source.js";
 
 describe("the project file", () => {
   it("parses the template with defaults filled in", () => {
@@ -1305,7 +1306,7 @@ describe("the initiative playbook template (BB-405)", () => {
     expect(parsed.value.ready?.approval).toBe("user");
     expect(parsed.value.ready?.checklist).toContain("No criterion or working rule waits on calendar time; each wait names what triggers it");
     expect(parsed.value.models.steward).toMatchObject({ providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "medium" });
-    expect(Object.keys(parsed.value.phases)).toEqual(["Backlog", "Todo", "In Progress", "label:initiative:awaiting-outcome"]);
+    expect(Object.keys(parsed.value.phases)).toEqual(["Backlog", "Todo", "Ready", "In Progress", "In Review", "label:initiative:awaiting-outcome"]);
   });
 
   it("carries the keep-work-moving rules and the description headings", () => {
@@ -1323,6 +1324,18 @@ describe("the initiative playbook template (BB-405)", () => {
     expect(inProgress).toMatch(/Owed items are done on the wake they become possible/u);
     expect(INITIATIVE).toContain("`## Outcome`");
     expect(INITIATIVE).toContain("`## Criteria`");
+  });
+
+  it("covers every local state a ticket can be handed over in, so a local initiative has a phase", () => {
+    const parsed = parsePlaybook(INITIATIVE, "initiative");
+    if (!parsed.ok) throw new Error(parsed.error);
+    // A local ticket is adopted at Ready, In Progress or In Review; Backlog is
+    // parked and Done/Canceled are terminal. Each needs a phase or a section.
+    for (const state of LOCAL_STATES) {
+      const terminal = isTerminal(parsed.value, state);
+      expect(phaseOf(parsed.value, state) !== null || terminal, state).toBe(true);
+      if (state !== "Backlog" && !terminal) expect(parsed.value.sections[state], state).toBeDefined();
+    }
   });
 
   it("names no project-specific restart detail in any shipped template", () => {
