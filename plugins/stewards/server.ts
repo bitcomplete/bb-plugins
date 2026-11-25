@@ -5063,34 +5063,45 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /**
      * BB-408: an initiative's approval covers only its Outcome and Criteria
      * sections. Before BB-408 the pinned text was the whole description, so an
-     * approval stored then has a hash that no longer matches the new-form text
-     * even when the sections are unchanged. When the gate is evaluated and the
-     * stored hash differs from the new one, rewrite such an approval to the new
-     * form and keep it; a changed or unreadable one is left stale and asked for
-     * as today. Non-initiative bindings and an approval already in the new form
-     * are untouched.
+     * approval (and a decline) stored then has a hash that no longer matches
+     * the new-form text even when the sections are unchanged. When the gate is
+     * evaluated and the stored hash differs from the new one, rewrite such an
+     * approval to the new form and keep it; a changed or unreadable one is left
+     * stale and asked for as today. A declined spec's hash is re-pinned the
+     * same way, so a declined initiative is not asked again until its sections
+     * change. Non-initiative bindings and hashes already in the new form are
+     * untouched.
      */
     function repinInitiativeApproval(b: Binding, entity: EntitySnapshot): Binding {
       if (b.playbook !== INITIATIVE_PLAYBOOK) return b;
       const approval = b.ready.approval;
-      if (approval === null) return b;
+      const declinedSpecHash = b.ready.declinedSpecHash;
+      if (approval === null && declinedSpecHash === null) return b;
       const currentHash = specHashFor(b, entity);
-      if (approval.specHash === currentHash) return b;
-      const currentText = specTextFor(b, entity);
-      let repinned: string | null;
-      if (approval.approvedText !== null) {
-        // The stored text is the old whole-description form; derive the new
-        // form from it, keeping its spec comments.
-        repinned = repinInitiativeSpecText(approval.approvedText, b.playbook);
-      } else {
-        // An approval made before BB-249 carries no text. Its hash pins the old
-        // whole-description form; if it still matches, nothing changed since it
-        // was approved, so re-pin. The legacy hash reads no playbook.
-        const legacyHash = specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.source === "local" ? entity.viewer : null);
-        repinned = approval.specHash === legacyHash ? currentText : null;
+      // The legacy whole-description hash, computed only when a stored hash needs it.
+      const legacyHash = () => specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.source === "local" ? entity.viewer : null);
+      let next: ReadyState | null = null;
+      if (approval !== null && approval.specHash !== currentHash) {
+        const currentText = specTextFor(b, entity);
+        let repinned: string | null;
+        if (approval.approvedText !== null) {
+          // The stored text is the old whole-description form; derive the new
+          // form from it, keeping its spec comments.
+          repinned = repinInitiativeSpecText(approval.approvedText, b.playbook);
+        } else {
+          // An approval made before BB-249 carries no text. Its hash pins the
+          // old whole-description form; if it still matches, nothing changed
+          // since it was approved, so re-pin.
+          repinned = approval.specHash === legacyHash() ? currentText : null;
+        }
+        if (repinned !== null && repinned === currentText) next = { ...b.ready, approval: { ...approval, specHash: currentHash, approvedText: currentText } };
       }
-      if (repinned === null || repinned !== currentText) return b;
-      return store.patch(b.id, { ready: { ...b.ready, approval: { ...approval, specHash: currentHash, approvedText: currentText } } });
+      // A declined spec is not asked again until the spec changes; its stored
+      // hash is the old whole-description form too.
+      if (declinedSpecHash !== null && declinedSpecHash !== currentHash && declinedSpecHash === legacyHash()) {
+        next = { ...(next ?? b.ready), declinedSpecHash: currentHash };
+      }
+      return next === null ? b : store.patch(b.id, { ready: next });
     }
 
     /** The escalation-routing helpers bound to this server's store and wakes (escalations.ts). */

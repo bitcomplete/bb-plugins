@@ -2254,6 +2254,17 @@ describe("an initiative's approval is re-pinned to its Outcome and Criteria (BB-
     expect(t.hooks.store.openNeeds(stale.id).some((n) => n.kind === "approve-spec")).toBe(true);
   });
 
+  it("re-pins an old-form declined hash, so a declined initiative is not asked again", async () => {
+    const t = await initiative();
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const old = legacy(b, initiativeEntity());
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, declinedSpecHash: old.specHash } });
+    await t.ring("linear", "uuid-12");
+    const after = t.hooks.store.find("ENG-12", "p1")!;
+    expect(after.ready.declinedSpecHash).toBe(currentHash(initiativeEntity(), b));
+    expect(t.hooks.store.openNeeds(after.id).filter((n) => n.kind === "approve-spec")).toEqual([]);
+  });
+
   it("shows only the changed section in the re-approval diff", async () => {
     const t = await initiative();
     const b = t.hooks.store.find("ENG-12", "p1")!;
