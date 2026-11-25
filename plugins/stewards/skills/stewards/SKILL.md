@@ -353,6 +353,29 @@ Two tools are yours; everything else you do with the tools every thread has.
   binding, the wait, when you first reported it and the wake count. A wake
   for another reason, a changed wait or a new source resets the count, and a
   stall already open is not raised again.
+- **Prefer a trigger over a date (BB-404).** Every wait names a kind with a
+  live source: a pull request, a review, a deployment, a worker, a binding (a
+  child or another ticket), or a person (an open page item). "Is it live" is a
+  `deployment` wait. A `date` wait is allowed only when no trigger fits, and
+  the report says why none does.
+- **A restart needed is an escalation to the owner, not a date wait (BB-404).**
+  When the next step needs new plugin code running on the owner's server — a
+  hand check of new behaviour in production, or a `.bb` opt-in using a key or
+  value only the new image parses — wait on the deployment first; nothing is
+  asked before the image is staged. Once it is staged, check whether the
+  restart that carries the change has happened, and proceed if the merge is
+  already running. Otherwise raise one escalation for the owner, `Restart
+  needed for <key>`, with the merge, the staged deployment and what the
+  restart unblocks in the context, and wait `person` on that item, never a
+  date. The owner presses Restart now and closes the item, which wakes you, so
+  recheck before proceeding; if the image is still old, reopen the ask. One
+  open restart ask per binding: when another binding already has one open for
+  the same or a later image, raise your own and name that ask in its context,
+  so the owner restarts once and closes both, but do not wait on another
+  binding's item — the plugin's `person` wait and its close-delivery are
+  binding-scoped. The escalation is forwarded to the owner, never decided or
+  held by a parent steward or the project steward: only the owner can press
+  Restart now.
 - **A wait with a known end is a dated wait (BB-247).** When the wait has a
   date — a tax year closing, a deployment window, a pilot cycle finishing, a
   decision promised for Monday — report it as `steward_report { waitingOn,
@@ -649,8 +672,9 @@ who gives feedback and where, validators, the calendar, external events), and
 out of the description: baselines, measurements, intended differences and
 design summaries go in comments (`**Note:**`), linked from the description at
 most once, and the description is edited only to change Outcome, Criteria,
-Signals or Calendar. A criterion written as calendar time ("a week of
-digests") is rewritten as the evidence it stands for, or marked as not
+Signals or Calendar. No criterion or working rule waits on calendar time, and
+each wait names what triggers it. A criterion written as calendar time ("a
+week of digests") is rewritten as the evidence it stands for, or marked as not
 blocking any other criterion. Never tick a criterion in the description:
 progress is counted from `Met:` comments, not from ticked boxes.
 
@@ -720,11 +744,14 @@ soak that a child depends on has no binding to hold a merge behind, so there
 the hold is on filing: file that one child once you have recorded the check or
 the soak in a `**Note:**`.
 
-**Check the restart; do not wait on a date for it.** When the next step needs
-a merge to be live, check on every wake whether it has landed, and proceed
-once it has. When you must wait, set the date wait just after the project's
-next scheduled look, and say in the report how the owner can make it land
-sooner.
+**An owner-judged stage does not block the next stage.** While the owner
+judges a criterion, build the next stage behind its default-off opt-in;
+reviewing the opt-in pull request is the judgement, so the owner's call does
+not idle the initiative.
+
+**Owed items are done on the wake they become possible.** A `**Revision:**`
+you owe, or a `**Met:**` check whose evidence now exists, is posted on that
+wake and not deferred to a later one.
 
 **A wait on an outcome names its producer and checks it.** The report names
 what will deliver the outcome (a binding, a thread, a workflow, a person).

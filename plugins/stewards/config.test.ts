@@ -48,7 +48,7 @@ import {
   watchProblems,
 } from "./roles.js";
 import { opsTargetKey, parseOpsTargetKey } from "./ops.js";
-import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, LOCAL_TICKETS, OPS_WATCH, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
+import { DEPS_ALERTS, DEPS_PRS, GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, INITIATIVE, LINEAR_TICKETS, LOCAL_TICKETS, OPS_WATCH, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { parseTemplateStamp, templateHash, templateWarnings } from "./template-stamp.js";
 
 describe("the project file", () => {
@@ -1290,6 +1290,44 @@ describe("no-Linear project content (BB-362)", () => {
     for (const [name, text] of Object.entries(PLAYBOOK_TEMPLATES)) {
       expect(text, name).not.toMatch(/linear_[a-z_]+/u);
       expect(text, name).not.toMatch(/gh issue create/u);
+    }
+  });
+});
+
+// BB-405: the initiative template carries the keep-work-moving rules, so a
+// project that runs `bb stewards init` gets them from a playbook.
+describe("the initiative playbook template (BB-405)", () => {
+  it("parses under the strict parser with phases, ready checklist, approval and models", () => {
+    const parsed = parsePlaybook(INITIATIVE, "initiative");
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.kind).toBe("ticket");
+    expect(parsed.value.source).toBe("linear");
+    expect(parsed.value.ready?.approval).toBe("user");
+    expect(parsed.value.ready?.checklist).toContain("No criterion or working rule waits on calendar time; each wait names what triggers it");
+    expect(parsed.value.models.steward).toMatchObject({ providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "medium" });
+    expect(Object.keys(parsed.value.phases)).toEqual(["Backlog", "Todo", "In Progress", "label:initiative:awaiting-outcome"]);
+  });
+
+  it("carries the keep-work-moving rules and the description headings", () => {
+    const parsed = parsePlaybook(INITIATIVE, "initiative");
+    if (!parsed.ok) throw new Error(parsed.error);
+    const inProgress = parsed.value.sections["In Progress"] ?? "";
+    expect(inProgress).toMatch(/A soak is not assumed/u);
+    expect(inProgress).toMatch(/Pipeline: a deploy gates a merge, never filing/u);
+    expect(inProgress).toMatch(/Nothing\s+actionable/u);
+    expect(inProgress).toMatch(/File a child meant to start now in Todo/u);
+    expect(inProgress).toMatch(/Prefer a trigger over a date/u);
+    expect(inProgress).toMatch(/A restart needed is an escalation to the owner/u);
+    expect(inProgress).toMatch(/A wait on an outcome names its producer and checks it/u);
+    expect(inProgress).toMatch(/An owner-judged stage does not block the next stage/u);
+    expect(inProgress).toMatch(/Owed items are done on the wake they become possible/u);
+    expect(INITIATIVE).toContain("`## Outcome`");
+    expect(INITIATIVE).toContain("`## Criteria`");
+  });
+
+  it("names no project-specific restart detail in any shipped template", () => {
+    for (const [name, text] of Object.entries(PLAYBOOK_TEMPLATES)) {
+      expect(text, name).not.toMatch(/bb-gate|_bb-gate|\/opt\/bb-plugins-commit|quiet window/u);
     }
   });
 });

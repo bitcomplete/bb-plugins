@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import { PROJECT_CHANGED } from "./channels.js";
-import { PROJECT_FILE, playbookPath } from "./config.js";
+import { PROJECT_FILE, parsePlaybook, playbookPath } from "./config.js";
 import { ROLES_FILE } from "./roles.js";
 import { comment, crashingPod, githubIssue, issue, parkedWorker, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
@@ -11,7 +11,7 @@ import { guidanceUnitId } from "./guidance.js";
 import { parseDotenvValue, refreshPrompt, secretVariable, STEWARDS_SKILLS } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, needChoices, type Binding } from "./store.js";
-import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, LOCAL_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
+import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, INITIATIVE, LINEAR_TICKETS, LOCAL_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
 import { parseTemplateStamp, templateHash } from "./template-stamp.js";
 import { STANDING_RULES } from "./wake.js";
 import { setup, SHIPPED_SKILLS } from "./test-world.js";
@@ -3931,6 +3931,28 @@ describe("a GitHub issue ticket steward (BB-234)", () => {
     expect(check.exitCode).toBe(0);
   });
 
+  it("writes initiative.md from init with a template stamp, and prints it as a template (BB-405)", async () => {
+    const t = await setup();
+    delete t.files[PROJECT_FILE];
+    for (const name of Object.keys(PLAYBOOK_TEMPLATES)) delete t.files[playbookPath(name)];
+    const init = await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(init.exitCode).toBe(0);
+    expect(init.stdout).toContain(`wrote ${playbookPath("initiative")}`);
+    const written = [...t.writtenContent.entries()].find(([p]) => p.endsWith(playbookPath("initiative")))?.[1];
+    expect(written).toBeDefined();
+    expect(written).toContain("template: initiative@");
+    const parsed = parsePlaybook(written!, "initiative");
+    expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
+    // `bb stewards template initiative` prints the shipped text byte for byte.
+    const printed = await t.harness.behavior.runCli(["template", "initiative"], { threadId: "thr_me", projectId: "p1" });
+    expect(printed.exitCode).toBe(0);
+    expect(printed.stdout).toBe(INITIATIVE);
+    // An unknown name is refused and lists the valid names, initiative among them.
+    const unknown = await t.harness.behavior.runCli(["template", "nope"], { threadId: "thr_me", projectId: "p1" });
+    expect(unknown.exitCode).toBe(1);
+    expect(unknown.stdout).toContain("initiative");
+  });
+
   it("passes check for a no-teams project that carries only linear-tickets", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: [] } });
@@ -5170,7 +5192,7 @@ describe("bb stewards init", () => {
     const t = await setup();
     t.threads.set("thr_me", { status: "active", archivedAt: null });
     await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
-    expect(t.writes.length).toBe(8);
+    expect(t.writes.length).toBe(9);
     expect(t.writes.every((w) => w.hostId === "host_on")).toBe(true);
   });
 
@@ -5396,8 +5418,8 @@ describe("bb stewards survey and Set up stewards", () => {
     const before = t.writes.length;
     const second = await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
     expect(second.exitCode).toBe(0);
-    expect(second.stdout.match(/kept existing/gu)?.length).toBe(8);
-    expect(t.writes.length).toBe(before + 8);
+    expect(second.stdout.match(/kept existing/gu)?.length).toBe(9);
+    expect(t.writes.length).toBe(before + 9);
   });
 
   it("accepts the skill's hand-filled project.json and roles.json in check", async () => {
