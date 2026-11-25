@@ -184,7 +184,13 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     // request's handoff row (cached after the first read) so a moved pull
     // request belongs to its new binding — three own pull requests — and
     // `reconcileOnce` reads the handed-off pull list once for the pass.
-    expect(reconcile).toEqual({ storeReads: 197, sourceCalls: 12, reconciles: 4, bindings: 4 });
+    // BB-400 lowered them 197 → 185: the reconcile's idle wake reads the
+    // assessment it already built (`assessment.liveness.idleBase`) instead of
+    // calling `assessIdle` with fresh `store.openNeeds`/`store.openEscalations`
+    // rows, which `buildAssessmentInput` had already read. That is three store
+    // reads per binding (openNeeds is two statements, openEscalations one),
+    // twelve over the four bindings.
+    expect(reconcile).toEqual({ storeReads: 185, sourceCalls: 12, reconciles: 4, bindings: 4 });
     expect(wake).toEqual({ storeReads: 15, sourceCalls: 0, wakes: 1 });
   });
 

@@ -352,7 +352,7 @@ describe("the composed answer equals today's assess() on the C1 characterization
 // BB-399 (C4): the composed liveness (idle/stall), in shadow.
 // ---------------------------------------------------------------------------
 
-describe("the composed liveness is assess()'s (BB-399)", () => {
+describe("the composed liveness is assess()'s (BB-400, C5)", () => {
   /**
    * Every wait kind (live and not), no wait, a live structured source, and the
    * three hold-like rows the idle rule reads. The last two rows set `gatePulls`
@@ -395,20 +395,29 @@ describe("the composed liveness is assess()'s (BB-399)", () => {
   it("derives idle and stalled equal to assess()'s for every row", () => {
     for (const [label, i] of livenessCases()) {
       const a = assess(i);
-      expect(composeAssessment(i).liveness, label).toEqual({ idle: a.liveness.idle, stalled: a.liveness.stalled });
+      expect(composeAssessment(i).liveness, label).toMatchObject({ idle: a.liveness.idle, stalled: a.liveness.stalled });
     }
   });
 
-  it("records zero compose.liveness divergences for every row", () => {
-    for (const [label, i] of livenessCases()) {
-      const rows = compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface === "compose.liveness");
-      expect(rows, label).toEqual([]);
+  // BB-400 criterion: `assess().liveness.{idle,stalled}` is the composer's over
+  // the whole C1 characterization matrix, not just the liveness rows.
+  it("makes assess()'s idle and stalled the composed answer for every characterization fixture", () => {
+    for (const [label, i] of characterizationFixtures()) {
+      const a = assess(i);
+      const composed = composeAssessment(i);
+      expect({ idle: a.liveness.idle, stalled: a.liveness.stalled }, label).toEqual({ idle: composed.liveness.idle, stalled: composed.liveness.stalled });
     }
   });
 
-  it("records no compose.liveness row when no composed answer is passed", () => {
+  it("takes assess()'s idle, idleBase and stalled from a passed composed answer", () => {
+    const i = input();
+    const flipped = { ...composeAssessment(i), liveness: { idleBase: true, idle: true, stalled: true } };
+    expect(assess(i, flipped).liveness).toMatchObject({ idleBase: true, idle: true, stalled: true });
+  });
+
+  it("retired the compose.liveness surface from compare", () => {
     const union = new Set<string>();
-    for (const [, i] of livenessCases()) for (const d of compare(i, assess(i))) union.add(d.surface);
+    for (const [, i] of livenessCases()) for (const d of compare(i, assess(i), composeAssessment(i))) union.add(d.surface);
     expect(union.has("compose.liveness")).toBe(false);
   });
 
@@ -427,14 +436,24 @@ describe("the composed liveness is assess()'s (BB-399)", () => {
     }
   });
 
-  it("records a compose.liveness row with id, kind, boolean and timestamp inputs when the composed answer disagrees", () => {
-    const i = input();
-    const a = assess(i);
-    const composed = { ...composeAssessment(i), liveness: { idle: !a.liveness.idle, stalled: a.liveness.stalled } };
-    const rows = compare(i, a, composed).filter((d) => d.surface === "compose.liveness");
-    expect(rows).toHaveLength(1);
-    expect(Object.keys(rows[0]!.inputs).sort()).toEqual(["binding", "idle", "live", "now", "requeueUntil", "stalled", "waitKind", "waitLive"]);
-    for (const v of Object.values(rows[0]!.inputs)) expect(v === null || ["string", "number", "boolean"].includes(typeof v)).toBe(true);
+  // BB-400 criterion: no non-test source derives the typed-wait idle or stall
+  // outside the composer. The ops path's `observedStall` is a named exception
+  // (out of C5's scope), so this greps the typed-wait shape, not every call to
+  // the primitive.
+  it("derives the typed-wait idle and stall only in the composer", () => {
+    const dir = fileURLToPath(new URL(".", import.meta.url));
+    const files = readdirSync(dir, { recursive: true, encoding: "utf8" }).filter((f) => (f.endsWith(".ts") || f.endsWith(".tsx")) && !f.endsWith(".test.ts") && !f.endsWith(".test.tsx") && !f.includes("node_modules"));
+    const derivations: Array<{ file: string; line: string }> = [];
+    for (const file of files) {
+      for (const line of readFileSync(`${dir}${file}`, "utf8").split("\n")) {
+        if (/waitLive === true \? false|!live && waitLive !== true/.test(line)) derivations.push({ file, line: line.trim() });
+      }
+    }
+    expect(derivations.map((d) => d.file)).toEqual(["contribution.ts", "contribution.ts"]);
+    expect(derivations.map((d) => d.line)).toEqual([
+      "idle: typedWait !== null && waitLive === true ? false : idleBase,",
+      "stalled: typedWait === null ? observedStall(binding, live, now) : !live && waitLive !== true && !dateAhead,",
+    ]);
   });
 });
 
@@ -452,7 +471,7 @@ describe("the contribution interface (BB-380)", () => {
     expect(composed.reasons).toEqual([]);
     // `compose` folds contributions only; the liveness is a neutral default
     // that `composeAssessment` overwrites.
-    expect(composed.liveness).toEqual({ idle: false, stalled: false });
+    expect(composed.liveness).toEqual({ idleBase: false, idle: false, stalled: false });
   });
 
   it("a gate contribution carries the source, subject, id and inputs the design names", () => {
@@ -502,7 +521,7 @@ describe("the composed gate is the github contributor's (BB-387)", () => {
     expect(source).not.toMatch(/import\s*\{[^}]*\bassessedPullGate\b[^}]*\}/s);
     expect(source).not.toMatch(/import\s*\{[^}]*\bprGate\b[^}]*\}/s);
     // The gate arrives through the contributor's composer.
-    expect(source).toMatch(/\bcomposeGate\b/);
+    expect(source).toMatch(/\bcomposeAssessment\b/);
   });
 
   it("calls prGate from exactly one site in the plugin source, pullGate (BB-322 criterion 1)", () => {

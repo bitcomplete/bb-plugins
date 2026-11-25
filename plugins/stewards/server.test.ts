@@ -15514,6 +15514,22 @@ describe("a steward idle in an active stage (BB-83)", () => {
     expect(t.sends.at(-1)!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
   });
 
+  // BB-400: the composer's idleBase reads `binding.stage`, so the reconcile must
+  // assess with this look's stage. On the look the ticket leaves an active
+  // stage, the stored stage is still build; judging idle on it would fire the
+  // idle wake after the ticket moved back to Todo.
+  it("stays quiet at a worker finish after the ticket leaves the active stages (BB-400)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    t.entities.set("uuid-12", issue({ state: "Todo", stateType: "unstarted" }));
+    const before = t.sends.length;
+    await t.idle("thr_w1", "Done for now.");
+    expect(t.sends.slice(before).map((s) => s.text).join("\n")).not.toMatch(idleLine);
+  });
+
   it("stays quiet at a worker finish that leaves its own pull request open", async () => {
     const t = await setup();
     const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
@@ -17550,6 +17566,35 @@ describe("the wait budget (BB-351)", () => {
     // A repeated look does not file a second item.
     await t.hooks.reconcilePass("p1");
     expect(decideNeeds(t, b().id)).toHaveLength(1);
+  });
+
+  // BB-400: the assessment is built before `fileOverdueWaitNeed` can file a
+  // decide item, and the idle wake reads its `idleBase` (which
+  // `idleInActiveStage` suppresses while a need is open). The reconcile
+  // re-derives the liveness after the filing, so the need suppresses the idle
+  // wake in the same look. Without the re-derivation the wake carries both the
+  // decide line and the idle line.
+  it("does not fire the idle wake when an overdue person wait files a decide item in the same look (BB-400)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const binding = t.hooks.store.find("ENG-12")!;
+    // An open escalation the person wait names, routed to the project steward,
+    // so the wait is live and the binding has no user need yet.
+    const esc = t.hooks.store.escalate({ bindingId: binding.id, kind: "stuck", question: "Stuck?", meanwhile: "Waiting.", route: "project", recommendation: null });
+    // Past two budgets and already nudged, so this look files the decide item;
+    // the binding is idle in build and past the grace.
+    t.hooks.store.patch(binding.id, { wait: { kind: "person", ref: esc.id }, waitSince: t.now() - 2 * DAY, waitNudgedAt: t.now() - 2 * DAY, idleSince: t.now() - 2 * DAY, idleWokenAt: null, wokeAt: t.now() - 2 * DAY });
+    const before = t.sends.length;
+    await t.hooks.reconcilePass("p1");
+    await t.flush();
+    const sent = t.sends.slice(before).filter((s) => s.threadId === steward).map((s) => s.text).join("\n");
+    // The decide item was filed...
+    expect(sent).toContain("outlived a second budget");
+    expect(decideNeeds(t, binding.id)).toHaveLength(1);
+    // ...and the need it filed suppressed the idle wake in the same look.
+    expect(sent).not.toMatch(/Nothing is running and nothing is being waited on/u);
   });
 
   it("Keep waiting resets the budget once and files no second need until it passes again", async () => {
