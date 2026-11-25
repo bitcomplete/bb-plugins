@@ -9,6 +9,7 @@ import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { guidanceUnitId } from "./guidance.js";
 import { parseDotenvValue, refreshPrompt, secretVariable, STEWARDS_SKILLS } from "./server.js";
+import { specHash, specText } from "./reconcile.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, needChoices, type Binding } from "./store.js";
 import { GITHUB_ISSUES, GITHUB_PRS, GITHUB_REVIEWS, INITIATIVE, LINEAR_TICKETS, LOCAL_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate } from "./templates.js";
@@ -2175,6 +2176,106 @@ describe("initiative endings end the binding (BB-243)", () => {
     const { t, steward } = await initiativeBinding();
     await closeInitiative(t, steward, "Canceled", "canceled");
     expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ endedAt: expect.any(Number), endReason: "terminal" });
+  });
+});
+
+// BB-408: an initiative's approval is pinned to its Outcome and Criteria, not
+// the whole description, and an approval stored in the old whole-description
+// form is re-pinned once its sections are unchanged.
+describe("an initiative's approval is re-pinned to its Outcome and Criteria (BB-408)", () => {
+  const description = [
+    "## Outcome",
+    "",
+    "Users can log in.",
+    "",
+    "## Criteria",
+    "",
+    "- [ ] Login works",
+    "- [ ] SSO works",
+    "",
+    "## Signals",
+    "",
+    "| Metric | Value |",
+    "| --- | --- |",
+    "| logins | 3 |",
+    "",
+    "## Calendar",
+    "",
+    "2027-01-01",
+  ].join("\n");
+  const initiativeEntity = (over: Partial<EntitySnapshot> = {}) => issue({ description, labels: ["bb-managed", "initiative"], state: "In Progress", stateType: "started", ...over });
+  const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+  /** The pre-BB-408 hash and text of the current description: the whole description plus spec comments. */
+  const legacy = (b: Binding, e: EntitySnapshot) => ({ specHash: specHash(e, b.threadId), approvedText: specText(e, b.threadId) });
+  const currentHash = (e: EntitySnapshot, b: Binding) => specHash(e, b.threadId, undefined, null, "initiative");
+  const currentText = (e: EntitySnapshot, b: Binding) => specText(e, b.threadId, undefined, null, "initiative");
+
+  async function initiative(over: Partial<EntitySnapshot> = {}) {
+    const t = await setup();
+    const file = JSON.parse(t.files[PROJECT_FILE]!) as { playbooks?: Record<string, string> };
+    file.playbooks = { ticket: "initiative" };
+    t.files[PROJECT_FILE] = JSON.stringify(file);
+    t.files[playbookPath("initiative")] = INITIATIVE;
+    t.entities.set("uuid-12", initiativeEntity(over));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { phase: "In Progress", summary: "Specified.", nextAction: "Wait for approval", actor: "other", ready: met }, steward);
+    return t;
+  }
+
+  it("re-pins an unchanged old-form approval, files no item, and passes the gate", async () => {
+    const t = await initiative();
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, approval: { at: 1, by: "user", ...legacy(b, initiativeEntity()) } } });
+    await t.ring("linear", "uuid-12");
+    const after = t.hooks.store.find("ENG-12", "p1")!;
+    expect(after.ready.approval!.specHash).toBe(currentHash(initiativeEntity(), b));
+    expect(after.ready.approval!.approvedText).toBe(currentText(initiativeEntity(), b));
+    expect(t.hooks.store.openNeeds(after.id).filter((n) => n.kind === "approve-spec")).toEqual([]);
+    expect(t.hooks.store.openEscalations(after.id).filter((x) => x.kind === "approval")).toEqual([]);
+  });
+
+  it("re-pins an old approval with no text when its legacy hash matches, and not a changed one", async () => {
+    const t = await initiative();
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const old = legacy(b, initiativeEntity());
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, approval: { at: 1, by: "user", specHash: old.specHash, approvedText: null } } });
+    await t.ring("linear", "uuid-12");
+    const after = t.hooks.store.find("ENG-12", "p1")!;
+    expect(after.ready.approval!.specHash).toBe(currentHash(initiativeEntity(), b));
+    expect(after.ready.approval!.approvedText).toBe(currentText(initiativeEntity(), b));
+
+    // A changed description with the same stored legacy hash stays stale and asks.
+    t.entities.set("uuid-12", initiativeEntity({ description: description.replace("Users can log in.", "Users can log in with SSO.") }));
+    t.hooks.store.patch(b.id, { ready: { ...t.hooks.store.find("ENG-12", "p1")!.ready, approval: { at: 1, by: "user", specHash: old.specHash, approvedText: null } } });
+    await t.ring("linear", "uuid-12");
+    const stale = t.hooks.store.find("ENG-12", "p1")!;
+    expect(stale.ready.approval!.specHash).toBe(old.specHash);
+    expect(t.hooks.store.openNeeds(stale.id).some((n) => n.kind === "approve-spec")).toBe(true);
+  });
+
+  it("re-pins an old-form declined hash, so a declined initiative is not asked again", async () => {
+    const t = await initiative();
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const old = legacy(b, initiativeEntity());
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, declinedSpecHash: old.specHash } });
+    await t.ring("linear", "uuid-12");
+    const after = t.hooks.store.find("ENG-12", "p1")!;
+    expect(after.ready.declinedSpecHash).toBe(currentHash(initiativeEntity(), b));
+    expect(t.hooks.store.openNeeds(after.id).filter((n) => n.kind === "approve-spec")).toEqual([]);
+  });
+
+  it("shows only the changed section in the re-approval diff", async () => {
+    const t = await initiative();
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    t.entities.set("uuid-12", initiativeEntity({ description: description.replace("Users can log in.", "Users can log in with SSO.") }));
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, approval: { at: 1, by: "user", ...legacy(b, initiativeEntity()) } } });
+    await t.ring("linear", "uuid-12");
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-spec")!;
+    expect(need.data.specDiff).toContain("-Users can log in.");
+    expect(need.data.specDiff).toContain("+Users can log in with SSO.");
+    expect(need.data.specDiff).not.toContain("| logins |");
+    expect(need.data.specDiff).not.toContain("2027-01-01");
   });
 });
 

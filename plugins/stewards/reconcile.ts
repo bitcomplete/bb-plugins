@@ -6,7 +6,7 @@
 // The rule throughout: an event is a hint to look again, never the input a
 // decision is made from. Every function here compares two states.
 import { createHash } from "node:crypto";
-import { isTerminal, labelPhaseName, phaseOf, type Playbook } from "./config.js";
+import { INITIATIVE_PLAYBOOK, isTerminal, labelPhaseName, phaseOf, type Playbook } from "./config.js";
 import type { Deployments } from "./deploy.js";
 import { isMarkerComment, latestReviewMarker, reviewMarker } from "./gate.js";
 import { gateState, reportedItem } from "./ready-gate.js";
@@ -119,20 +119,95 @@ const DESCRIPTION_SIGNATURE = /\s*_— from bb thread ([A-Za-z0-9_-]+)_\s*$/u;
 /** The thread that signed the description, when its last edit was signed. */
 export const descriptionSignedBy = (entity: EntitySnapshot): string | null => DESCRIPTION_SIGNATURE.exec(entity.description ?? "")?.[1] ?? null;
 
+/** The NUL separator between the description and each spec comment (and, BB-408, between the two sections). */
+const SPEC_SEPARATOR = "\n\u0000\n";
+
+/** A markdown heading line: up to three leading spaces, one to six `#`, a space, the text, optional closing `#`s. */
+const HEADING = /^ {0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/u;
+
+/** A line's heading, or null when it is not one. The text is trimmed; an empty heading is not one. */
+function headingOf(line: string): { level: number; text: string } | null {
+  const m = HEADING.exec(line);
+  if (m === null) return null;
+  const text = m[2]!.trim();
+  return text === "" ? null : { level: m[1]!.length, text };
+}
+
+/**
+ * BB-408: the section of a description under a heading, from the heading to
+ * the next heading of the same or higher level, or the end. The heading text
+ * is matched case-insensitively on its trimmed text, and the heading line is
+ * part of the section. Null when no such heading exists, so a missing section
+ * is never read as an empty one.
+ */
+export function sectionText(description: string, name: string): string | null {
+  const lines = description.split("\n");
+  const wanted = name.toLowerCase();
+  let start = -1;
+  let level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const h = headingOf(lines[i]!);
+    if (h !== null && h.text.toLowerCase() === wanted) {
+      start = i;
+      level = h.level;
+      break;
+    }
+  }
+  if (start === -1) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    const h = headingOf(lines[i]!);
+    if (h !== null && h.level <= level) {
+      end = i;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
+}
+
+/**
+ * BB-408: an initiative's spec body is its `## Outcome` and `## Criteria`
+ * sections, joined by a NUL separator. When either heading is missing the
+ * whole description stands in, so a deleted or renamed heading changes the
+ * text and voids the approval rather than passing as an empty section.
+ */
+export function initiativeSpecBody(description: string): string {
+  const outcome = sectionText(description, "Outcome");
+  const criteria = sectionText(description, "Criteria");
+  if (outcome === null || criteria === null) return description;
+  return `${outcome}${SPEC_SEPARATOR}${criteria}`;
+}
+
+/**
+ * The BB-408 form of a stored approved text: the same extraction and fallback
+ * rule applied to its description, with its spec comments kept. A stored
+ * `approvedText` from before BB-408 is the whole-description form, so a
+ * re-approval diff compares like with like. Non-initiative text is unchanged.
+ */
+export function repinInitiativeSpecText(stored: string, playbook?: string | null): string {
+  if (playbook !== INITIATIVE_PLAYBOOK) return stored;
+  const [description = "", ...specs] = stored.split(SPEC_SEPARATOR);
+  return [initiativeSpecBody(description), ...specs].join(SPEC_SEPARATOR);
+}
+
 /**
  * The text an approval is pinned to: the description with its signature line
  * removed, then each spec comment as `<id>\n<body>`, joined by a NUL
  * separator. `specHash` hashes exactly this, and BB-249 stores it as the
- * approval's `approvedText` so a later edit can be diffed against it.
+ * approval's `approvedText` so a later edit can be diffed against it. For an
+ * initiative (`playbook === "initiative"`) the description stands in as only
+ * its Outcome and Criteria sections (BB-408); every other binding is byte for
+ * byte what it was before.
  */
-export function specText(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null): string {
+export function specText(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null, playbook?: string | null): string {
   const description = (entity.description ?? "").replace(DESCRIPTION_SIGNATURE, "").trim();
   const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread, owner, entity.source)).map((c) => `${c.id}\n${c.body}`);
-  return [description, ...specs].join("\n\u0000\n");
+  const body = playbook === INITIATIVE_PLAYBOOK ? initiativeSpecBody(description) : description;
+  return [body, ...specs].join(SPEC_SEPARATOR);
 }
 
-export function specHash(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null): string {
-  return createHash("sha256").update(specText(entity, stewardThreadId, isUserThread, owner)).digest("hex").slice(0, 16);
+export function specHash(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean, owner?: string | null, playbook?: string | null): string {
+  return createHash("sha256").update(specText(entity, stewardThreadId, isUserThread, owner, playbook)).digest("hex").slice(0, 16);
 }
 
 /**

@@ -48,6 +48,7 @@ import {
   isTerminal,
   legacyOpsPresent,
   INITIATIVE_LABEL,
+  INITIATIVE_PLAYBOOK,
   modelSpecSchema,
   parsePlaybook,
   parseProjectFile,
@@ -116,7 +117,7 @@ import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
-import { advanced, adoptedBySource, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, observedStall, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { advanced, adoptedBySource, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, observedStall, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, repinInitiativeSpecText, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedEscalations, routedTo, type EscalationsContext } from "./escalations.js";
@@ -5053,17 +5054,61 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- the reconcile loop ------------------------------------------------------------------
 
-    /** The spec hash a binding's approval is pinned to, counting the user's own spec comments. */
-    const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.source === "local" ? entity.viewer : null);
+    /** The spec hash a binding's approval is pinned to, counting the user's own spec comments. An initiative pins only its Outcome and Criteria (BB-408). */
+    const specHashFor = (b: Pick<Binding, "threadId" | "playbook">, entity: EntitySnapshot): string => specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.source === "local" ? entity.viewer : null, b.playbook);
 
     /** The text a binding's approval pins, stored as `approvedText` so BB-249 can diff a later edit against it. */
-    const specTextFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specText(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.source === "local" ? entity.viewer : null);
+    const specTextFor = (b: Pick<Binding, "threadId" | "playbook">, entity: EntitySnapshot): string => specText(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.source === "local" ? entity.viewer : null, b.playbook);
+
+    /**
+     * BB-408: an initiative's approval covers only its Outcome and Criteria
+     * sections. Before BB-408 the pinned text was the whole description, so an
+     * approval (and a decline) stored then has a hash that no longer matches
+     * the new-form text even when the sections are unchanged. When the gate is
+     * evaluated and the stored hash differs from the new one, rewrite such an
+     * approval to the new form and keep it; a changed or unreadable one is left
+     * stale and asked for as today. A declined spec's hash is re-pinned the
+     * same way, so a declined initiative is not asked again until its sections
+     * change. Non-initiative bindings and hashes already in the new form are
+     * untouched.
+     */
+    function repinInitiativeApproval(b: Binding, entity: EntitySnapshot): Binding {
+      if (b.playbook !== INITIATIVE_PLAYBOOK) return b;
+      const approval = b.ready.approval;
+      const declinedSpecHash = b.ready.declinedSpecHash;
+      if (approval === null && declinedSpecHash === null) return b;
+      const currentHash = specHashFor(b, entity);
+      // The legacy whole-description hash, computed only when a stored hash needs it.
+      const legacyHash = () => specHash(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), entity.source === "local" ? entity.viewer : null);
+      let next: ReadyState | null = null;
+      if (approval !== null && approval.specHash !== currentHash) {
+        const currentText = specTextFor(b, entity);
+        let repinned: string | null;
+        if (approval.approvedText !== null) {
+          // The stored text is the old whole-description form; derive the new
+          // form from it, keeping its spec comments.
+          repinned = repinInitiativeSpecText(approval.approvedText, b.playbook);
+        } else {
+          // An approval made before BB-249 carries no text. Its hash pins the
+          // old whole-description form; if it still matches, nothing changed
+          // since it was approved, so re-pin.
+          repinned = approval.specHash === legacyHash() ? currentText : null;
+        }
+        if (repinned !== null && repinned === currentText) next = { ...b.ready, approval: { ...approval, specHash: currentHash, approvedText: currentText } };
+      }
+      // A declined spec is not asked again until the spec changes; its stored
+      // hash is the old whole-description form too.
+      if (declinedSpecHash !== null && declinedSpecHash !== currentHash && declinedSpecHash === legacyHash()) {
+        next = { ...(next ?? b.ready), declinedSpecHash: currentHash };
+      }
+      return next === null ? b : store.patch(b.id, { ready: next });
+    }
 
     /** The escalation-routing helpers bound to this server's store and wakes (escalations.ts). */
     const escalationsCtx: EscalationsContext = { store, scheduleReconcile, wakeProject };
 
     /** The ready-gate helpers bound to this server's store and spec readers (ready-gate.ts). */
-    const readyGateCtx: ReadyGateContext = { store, specHashFor, specTextFor, specDiff, log: (message) => bb.log.info(message) };
+    const readyGateCtx: ReadyGateContext = { store, specHashFor, specTextFor, approvedTextFor: (b, stored) => repinInitiativeSpecText(stored, b.playbook), specDiff, log: (message) => bb.log.info(message) };
 
     const ownThreads = (b: Binding) => new Set([b.threadId, ...store.workers(b.id).map((w) => w.threadId)].filter((t): t is string => t !== null));
 
@@ -5920,6 +5965,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       const { phase, stage } = phaseAndStage(playbook, entity.state, entity.labels);
+      // BB-408: an initiative approval stored in the pre-BB-408 whole-description
+      // form is re-pinned to the new form here, before the gate reads it, when
+      // its sections are unchanged. A changed one stays stale and is asked for.
+      b = repinInitiativeApproval(b, entity);
       const currentSpec = specHashFor(b, entity);
       const changes: Change[] = [];
       let ready = b.ready;
@@ -9667,7 +9716,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const prior = b.ready.approval;
       const approvedText = prior?.approvedText ?? b.ready.voidedApprovedText;
       const approvedAt = prior?.at ?? b.ready.voidedApprovedAt;
-      const reapproval = approvedText !== null && approvedAt !== null ? specDiff(approvedText, currentText) : null;
+      const reapproval = approvedText !== null && approvedAt !== null ? specDiff(repinInitiativeSpecText(approvedText, b.playbook), currentText) : null;
       const specComment = reapproval === null || approvedAt === null ? null : newestEditComment(entity, b.threadId, (threadId) => isUserThread(approvalsCtx, threadId), approvedAt);
       const what =
         reapproval === null
@@ -9823,6 +9872,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // ask the project steward whether it covers an open escalation.
       const needsBefore = new Set(store.openNeeds(b.id).map((n) => n.id));
       const mode = playbook.ready?.approval ?? null;
+      // BB-408: re-pin a pre-BB-408 initiative approval whose sections are
+      // unchanged, so this gate evaluation does not read it as stale. A
+      // `syncNeedsFresh` call on a just-read entity re-pins here too.
+      b = repinInitiativeApproval(b, observed.entity);
       const current = specHashFor(b, observed.entity);
       const gate = gateState(playbook, b.ready, current);
       // A forwarded approval escalation is with the user, so the page's
