@@ -63,6 +63,8 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   overdue: false,
   overdueMs: null,
   noWakeSource: false,
+  idleInitiativeSince: null,
+  idleInitiativeUnmet: null,
   wakeFailure: null,
   workers: [],
   needsUser: false,

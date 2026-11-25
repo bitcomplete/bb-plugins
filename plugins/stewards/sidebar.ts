@@ -11,6 +11,7 @@
 // lifecycle owner. Since BB-72 a worker's parent is its steward and a
 // reviewer's is its worker, so the fallback and the records agree.
 
+import { formatAge } from "./duration.js";
 import type { DeployState } from "./deploy.js";
 import type { Wait } from "./wait.js";
 
@@ -41,6 +42,10 @@ export interface SidebarBinding {
   noWakeSource: boolean;
   /** BB-392: the binding's only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
   reviewerRoundMissing?: boolean;
+  /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. Optional so a client built from the previous image still validates. */
+  idleInitiativeSince?: number | null;
+  /** BB-406: the initiative's unmet criteria count, for the chip's tooltip; null when it cannot be read. */
+  idleInitiativeUnmet?: number | null;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
   wakeFailure: string | null;
   needsUser: boolean;
@@ -151,6 +156,10 @@ export interface SidebarEffort {
   noWakeSource: boolean;
   /** BB-392: the binding's only unmet gate piece is the reviewer round, so the row names it. */
   reviewerRoundMissing?: boolean;
+  /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. */
+  idleInitiativeSince: number | null;
+  /** BB-406: the initiative's unmet criteria count, for the chip's tooltip; null when it cannot be read. */
+  idleInitiativeUnmet: number | null;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
   wakeFailure: string | null;
   /** The binding's worker records, so a wait on a finished one reads as a lost hand-off (BB-152). */
@@ -293,6 +302,10 @@ export interface EffortStatus {
   noWakeSource?: boolean;
   /** BB-392: the binding's only unmet gate piece is the reviewer round, so the row names it. */
   reviewerRoundMissing?: boolean;
+  /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. */
+  idleInitiativeSince?: number | null;
+  /** BB-406: the initiative's unmet criteria count, for the chip's tooltip; null when it cannot be read. */
+  idleInitiativeUnmet?: number | null;
   /** A failed wake's phrase, `wake failed: <reason>` (BB-255); null when the last wake landed. */
   wakeFailure?: string | null;
   /** The binding's workers, so a wait on a finished one reads as a lost hand-off (BB-152). */
@@ -437,10 +450,22 @@ export function waitingOnNamesFinishedWorker(
  * value is the wait's age; a live wait past its budget reads `<phrase>,
  * overdue <duration>`.
  */
-export function overduePhrase(ms: number): string {
-  if (ms >= 86_400_000) return `${Math.round(ms / 86_400_000)}d`;
-  if (ms >= 3_600_000) return `${Math.round(ms / 3_600_000)}h`;
-  return `${Math.max(1, Math.round(ms / 60_000))}m`;
+export const overduePhrase = formatAge;
+
+/**
+ * BB-406: the `idle <duration>` chip an initiative row shows, with its unmet
+ * count as the tooltip; null for a binding that is not idle. The duration is
+ * read from the stored clock at render time.
+ */
+export function idleInitiativeChip(e: Pick<EffortStatus, "idleInitiativeSince" | "idleInitiativeUnmet" | "hold">, now: number): { text: string; title: string } | null {
+  const since = e.idleInitiativeSince;
+  if (since === null || since === undefined) return null;
+  // A held initiative is listed as held, never as idle, even before the next
+  // reconcile clears the stored clock.
+  if (e.hold !== null && e.hold !== undefined) return null;
+  const unmet = e.idleInitiativeUnmet;
+  const title = unmet === null || unmet === undefined ? "unmet criteria unknown" : `${unmet} unmet criteria`;
+  return { text: `idle ${formatAge(Math.max(0, now - since))}`, title };
 }
 
 /** A short relative time to a future moment, for `next look <time>` (BB-83). */
@@ -560,6 +585,8 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     overdueMs: null,
     noWakeSource: false,
     reviewerRoundMissing: false,
+    idleInitiativeSince: null,
+    idleInitiativeUnmet: null,
     wakeFailure: null,
     workers: [],
     needsUser: false,
@@ -786,6 +813,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       overdueMs: b.overdueMs,
       noWakeSource: b.noWakeSource,
       reviewerRoundMissing: b.reviewerRoundMissing ?? false,
+      idleInitiativeSince: b.idleInitiativeSince ?? null,
+      idleInitiativeUnmet: b.idleInitiativeUnmet ?? null,
       wakeFailure: b.wakeFailure,
       workers: b.workers,
       needsUser: b.needsUser,
@@ -888,6 +917,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       overdue: false,
       overdueMs: null,
       noWakeSource: false,
+      idleInitiativeSince: null,
+      idleInitiativeUnmet: null,
       wakeFailure: null,
       workers: [],
       needsUser: false,

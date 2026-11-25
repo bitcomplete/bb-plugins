@@ -2178,6 +2178,71 @@ describe("initiative endings end the binding (BB-243)", () => {
   });
 });
 
+// BB-406: the idle clock is written by the reconcile itself, not by a test's
+// `store.patch`, so these drive real reconcile passes and pin the flip.
+describe("the initiative idle clock is written on a reconcile (BB-406)", () => {
+  const INITIATIVE = LINEAR_TICKETS.replace("name: linear-tickets", "name: initiative");
+  const description = ["## Criteria", "", "- [ ] One", "- [ ] Two", "- [ ] Three"].join("\n");
+  const initiative = (over: Partial<EntitySnapshot> = {}) => issue({ labels: ["bb-managed", "initiative"], state: "In Progress", stateType: "started", description, ...over });
+  const met = (text: string, id: string) => comment({ id, body: `**Met:** ${text}` });
+  const child = { id: "c1", key: "ENG-13", title: "Child", state: "In Progress", stateType: "started", labels: [] };
+  async function idleInitiative() {
+    const t = await setup();
+    const file = JSON.parse(t.files[PROJECT_FILE]!) as { playbooks?: Record<string, string> };
+    file.playbooks = { ticket: "initiative" };
+    t.files[PROJECT_FILE] = JSON.stringify(file);
+    t.files[playbookPath("initiative")] = INITIATIVE;
+    t.entities.set("uuid-12", initiative());
+    await t.ring("linear", "uuid-12");
+    return t;
+  }
+
+  it("stamps on the first idle look, leaves the value on a second, and clears when the initiative stops being idle", async () => {
+    const t = await idleInitiative();
+    const b = () => t.hooks.store.find("ENG-12", "p1")!;
+    const first = b().idleInitiativeSince;
+    expect(first).toEqual(expect.any(Number));
+    // A second idle look leaves the same value: the clock is not rewritten.
+    t.advance(3_600_000);
+    await t.hooks.reconcilePass("p1");
+    expect(b().idleInitiativeSince).toBe(first);
+    // Every criterion carrying a `**Met:**` comment flips the predicate false.
+    t.entities.set("uuid-12", initiative({ comments: [met("One", "m1"), met("Two", "m2"), met("Three", "m3")] }));
+    await t.ring("linear", "uuid-12");
+    expect(b().idleInitiativeSince).toBeNull();
+    // Back to idle, then an open child flips it false and clears the column.
+    t.entities.set("uuid-12", initiative());
+    await t.ring("linear", "uuid-12");
+    expect(b().idleInitiativeSince).toEqual(expect.any(Number));
+    t.entities.set("uuid-12", initiative({ children: [child] }));
+    await t.ring("linear", "uuid-12");
+    expect(b().idleInitiativeSince).toBeNull();
+  });
+
+  it("clears the clock when a hold is set and when a live typed wait is reported", async () => {
+    const t = await idleInitiative();
+    const b = () => t.hooks.store.find("ENG-12", "p1")!;
+    expect(b().idleInitiativeSince).toEqual(expect.any(Number));
+    // The project steward sets and lifts the hold; a binding's own steward
+    // cannot lift its own hold. The set clears the clock at once.
+    const project = t.spawns[0]!.id;
+    await t.tool("steward_update", { binding: "ENG-12", hold: "a freeze" }, project);
+    expect(b().idleInitiativeSince).toBeNull();
+    // Lift the hold; the next look stamps a fresh clock.
+    await t.tool("steward_update", { binding: "ENG-12", hold: "" }, project);
+    await t.hooks.reconcilePass("p1");
+    const second = b().idleInitiativeSince;
+    expect(second).toEqual(expect.any(Number));
+    // A live typed wait reported through steward_report clears it too.
+    await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "steward", wait: { kind: "pull", ref: "acme/web#7" } }, t.spawns[1]!.id);
+    expect(b().idleInitiativeSince).toBeNull();
+    // A `date` wait is idle time and leaves a set clock alone.
+    t.hooks.store.patch(b().id, { idleInitiativeSince: second });
+    await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "steward", wait: { kind: "date", ref: "2027-01-01" } }, t.spawns[1]!.id);
+    expect(b().idleInitiativeSince).toBe(second);
+  });
+});
+
 describe("terminal states and follow-through", () => {
   /** A ticket in progress with its steward and one worker at work. */
   async function working() {

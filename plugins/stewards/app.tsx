@@ -46,7 +46,7 @@ import { usePortalScopeProps } from "./lib/portal-scope.js";
 import { setBoardRoute, useBoardRoute } from "./board-route.js";
 import { setStewardsSidebarCommand, getStewardsSidebarCommand } from "./sidebar-command.js";
 import { readLastPlace, writeLastPlace } from "./last-place.js";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortHasUnread, effortPhrase, effortSection, effortState, effortTitle, familySection, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortHasUnread, effortPhrase, effortSection, effortState, effortTitle, familySection, hasUnread, idleInitiativeChip, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import {
   AUTOMATIC_NAVIGATION_PROVIDER,
   AUTOMATIC_THREAD_LIST_PROVIDER,
@@ -374,10 +374,10 @@ function ThreadLink({ threadId, children }: { threadId: string; children: ReactN
   );
 }
 
-function Badge({ children, tone = "muted" }: { children: ReactNode; tone?: "muted" | "warn" | "bad" }) {
+function Badge({ children, tone = "muted", title }: { children: ReactNode; tone?: "muted" | "warn" | "bad"; title?: string }) {
   const colors =
     tone === "bad" ? "border-destructive/40 text-destructive" : tone === "warn" ? "border-amber-500/40 text-attention" : "border-border text-muted-foreground";
-  return <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] ${colors}`}>{children}</span>;
+  return <span title={title} className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] ${colors}`}>{children}</span>;
 }
 
 function EntityLink({ entityKey, url }: { entityKey: string; url: string | null }) {
@@ -673,6 +673,8 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     requeueAt: s.requeueAt,
     noWakeSource: s.noWakeSource,
     reviewerRoundMissing: s.reviewerRoundMissing ?? false,
+    idleInitiativeSince: s.idleInitiativeSince,
+    idleInitiativeUnmet: s.idleInitiativeUnmet,
     wakeFailure: s.wakeFailure,
   };
 }
@@ -710,6 +712,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
   const status = overviewEffortStatus(s);
   const state = effortState(status);
   const phrase = effortPhrase(status, now);
+  const idle = idleInitiativeChip(status, now);
   return (
     <li className="flex flex-col gap-1 p-3">
       <StewardHeader
@@ -724,6 +727,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
           <>
             {s.roles !== undefined && s.roles.length > 0 ? <Badge tone="muted">role {s.roles.join(", ")}</Badge> : null}
             {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
+            {idle === null ? null : <Badge tone="warn" title={idle.title}>{idle.text}</Badge>}
             {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
             {s.escalations.length > 0 ? <Badge tone={mine.length > 0 ? "bad" : "warn"}>{s.escalations.length === 1 ? "1 escalation" : `${s.escalations.length} escalations`}</Badge> : null}
           </>
@@ -1324,6 +1328,8 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     requeueAt: s.requeueAt,
     noWakeSource: s.noWakeSource,
     reviewerRoundMissing: s.reviewerRoundMissing ?? false,
+    idleInitiativeSince: s.idleInitiativeSince,
+    idleInitiativeUnmet: s.idleInitiativeUnmet,
     wakeFailure: s.wakeFailure,
   };
 }
@@ -1589,7 +1595,7 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
   const delegateStuck = stuckEntries.find((x) => x.kind === "delegate") ?? null;
   return (
     <>
-      <EffortHeading board={b} effort={effort} />
+      <EffortHeading board={b} effort={effort} now={now} />
       <LocalTicketDetail effortKey={effortKey} />
       <Section title="Needs you" count={effort.items.length}>
         {effort.items.length === 0 ? (
@@ -1755,9 +1761,10 @@ function LocalTicketDetail({ effortKey }: { effortKey: string }) {
 }
 
 /** The detail heading: the sidebar's two-line effort row one size up, with a crumb back. */
-function EffortHeading({ board: b, effort }: { board: Board; effort: BoardEffort }) {
+function EffortHeading({ board: b, effort, now }: { board: Board; effort: BoardEffort; now: number }) {
   const navigate = useBbNavigate();
   const s = effort.steward;
+  const idle = idleInitiativeChip(boardEffortStatus(s), now);
   return (
     <div className="flex flex-col gap-2">
       <button
@@ -1773,6 +1780,7 @@ function EffortHeading({ board: b, effort }: { board: Board; effort: BoardEffort
           <EntityLink entityKey={shortBindingKey(s.key)} url={s.url} />
           {s.title === null ? null : <span className="min-w-0 flex-1 truncate text-lg font-medium">{s.title}</span>}
           {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
+          {idle === null ? null : <Badge tone="warn" title={idle.title}>{idle.text}</Badge>}
           {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
           {/* BB-303: the binding's own board row starts a stand-up scoped to it. */}
           {b.standup?.available === true ? <StandupButton projectId={b.projectId} binding={s.key} /> : null}
@@ -2803,6 +2811,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
   const count = countThreads(effort.children);
   const hasChildren = count > 0 || effort.nested.length > 0;
   const mine = needs.filter((item) => item.bindingKey !== null && item.bindingKey === key);
+  const idle = idleInitiativeChip(effort, Date.now());
   const selected = activeKey !== null && activeKey === key;
   const revealed = openThreads.has(effort.rootThreadId);
   useEffect(() => {
@@ -2858,6 +2867,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
         {effort.phase !== null ? ` · ${effort.phase}` : ""}
         {" · "}
         <span className={phraseClass(effort.state)}>{effort.phrase}</span>
+        {idle === null ? null : <span title={idle.title} className="ml-1 inline-flex items-center rounded-full border border-amber-500/40 px-1.5 text-[10px] text-attention">{idle.text}</span>}
         {effort.parentTitle !== null ? <span className="text-muted-foreground"> · in {effort.parentTitle}</span> : null}
       </p>
     </div>

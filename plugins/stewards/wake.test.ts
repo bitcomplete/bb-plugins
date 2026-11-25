@@ -5,10 +5,10 @@ import { parsePlaybook } from "./config.js";
 import { explainDecision, formatDecisionListing } from "./decisions.js";
 import { comment, issue, parkedWorker, pull } from "./fixtures.js";
 import { gateState } from "./ready-gate.js";
-import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
+import { MIGRATIONS, RESOLUTION_KINDS, createStore, type BindingPatch } from "./store.js";
 import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, PLAYBOOK_TEMPLATES } from "./templates.js";
 import { assessedPullGate } from "./assessed-gate.js";
-import { STANDING_RULES, BRIEF_PREFIX, formatBacklogWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, initiativeProgress, initiativeProgressFlag, spawnCommand, WAKE_MAX_CHARS, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { STANDING_RULES, BRIEF_PREFIX, formatBacklogWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatRecords, formatWake, idleInitiativeLine, initiativeIdle, initiativeIdleWakeLine, initiativeProgress, initiativeProgressFlag, initiativeUnmet, spawnCommand, WAKE_MAX_CHARS, workerFinishNote, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 import { BRIEF_MAX_CHARS } from "./server.js";
 import type { OpsFinding } from "./ops.js";
 import type { DepsFinding } from "./deps.js";
@@ -1045,6 +1045,105 @@ describe("initiative progress (BB-243)", () => {
     expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\), moved .*\[criteria 2\/3\]/u);
     expect(wake).toMatch(/- ENG-12: on hold: .*\[criteria 2\/3\]/u);
     expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\): waiting with no wake source.*\[criteria 2\/3\]/u);
+  });
+});
+
+describe("initiative idle (BB-406)", () => {
+  const description = [
+    "## Outcome",
+    "",
+    "The year's claim is filed.",
+    "",
+    "## Criteria",
+    "",
+    "- [ ] Scope memo approved (owner)",
+    "- [ ] Expenses gathered (check: npm run expenses)",
+    "- [ ] Claim filed (owner)",
+  ].join("\n");
+  const initiative = (over: Partial<EntitySnapshot> = {}) => issue({ labels: ["bb-managed", "initiative"], state: "In Progress", stateType: "started", description, ...over });
+  const met = (text: string, id = text) => comment({ id, body: `**Met:** ${text}` });
+  const child = (over: Record<string, unknown> = {}) => ({ id: "c1", key: "ENG-13", title: "Child", state: "In Progress", stateType: "started", labels: [], ...over });
+  const idle = (over: BindingPatch = {}, entityOver: Partial<EntitySnapshot> = {}, children: unknown[] = []) => {
+    const { s, bind } = world();
+    return s.patch(bind("ENG-12").id, { playbook: "initiative", lastSnapshot: { entity: initiative({ children: children as never, ...entityOver }), pulls: [] }, ...over });
+  };
+  const observedFor = (b: ReturnType<typeof idle>) => ({ entity: b.lastSnapshot!.entity, pulls: [] });
+
+  it("is true for an initiative with an unmet criterion, no open child and no wait", () => {
+    const b = idle({}, { comments: [met("Scope memo approved (owner)")] });
+    expect(initiativeUnmet(b)).toBe(2);
+    expect(initiativeIdle(b, [], null)).toBe(true);
+  });
+
+  it("is false with an open child, and true when every child is completed or canceled", () => {
+    const b = idle();
+    expect(initiativeIdle(b, [child({ stateType: "started" })], null)).toBe(false);
+    expect(initiativeIdle(b, [child({ stateType: null })], null)).toBe(false);
+    expect(initiativeIdle(b, [child({ stateType: "completed" })], null)).toBe(true);
+    expect(initiativeIdle(b, [child({ stateType: "canceled" })], null)).toBe(true);
+  });
+
+  it("is false with a live deployment wait, and true when the same wait is not live", () => {
+    const b = idle({ wait: { kind: "deployment", ref: "acme/web#7" } });
+    expect(initiativeIdle(b, [], true)).toBe(false);
+    expect(initiativeIdle(b, [], false)).toBe(true);
+  });
+
+  it("is idle with a date or external wait, and with no wait", () => {
+    const date = idle({ wait: { kind: "date", ref: "2026-12-01" }, requeueUntil: T + DAY });
+    expect(initiativeIdle(date, [], true)).toBe(true);
+    const external = idle({ wait: { kind: "external", ref: "a stakeholder" } });
+    expect(initiativeIdle(external, [], true)).toBe(true);
+    expect(initiativeIdle(idle(), [], null)).toBe(true);
+  });
+
+  it("is false when held, when all criteria are met, and for a non-initiative", () => {
+    expect(initiativeIdle(idle({ hold: "a freeze" }), [], null)).toBe(false);
+    const allMet = idle({}, { comments: [met("Scope memo approved (owner)"), met("Expenses gathered (check: npm run expenses)"), met("Claim filed (owner)")] });
+    expect(initiativeUnmet(allMet)).toBe(0);
+    expect(initiativeIdle(allMet, [], null)).toBe(false);
+    const plain = idle({ playbook: "linear-tickets" }, { labels: ["bb-managed"] });
+    expect(initiativeIdle(plain, [], null)).toBe(false);
+  });
+
+  it("renders the idle line with duration, unmet count and the wait", () => {
+    const b = idle({ idleInitiativeSince: T - 5 * 3_600_000 }, { comments: [met("Scope memo approved (owner)")] });
+    expect(idleInitiativeLine(b, T)).toBe("ENG-12: idle 5h — 2 unmet criteria");
+    const withWait = idle({ idleInitiativeSince: T - 2 * DAY, wait: { kind: "external", ref: "a stakeholder" } });
+    expect(idleInitiativeLine(withWait, T)).toBe("ENG-12: idle 2d — 3 unmet criteria, waiting on external a stakeholder");
+    const withDate = idle({ idleInitiativeSince: T - DAY, wait: { kind: "date", ref: "2026-12-01" }, requeueUntil: T + DAY });
+    expect(idleInitiativeLine(withDate, T)).toBe(`ENG-12: idle 1d — 3 unmet criteria, waiting on ${new Date(T + DAY).toISOString()}`);
+    expect(idleInitiativeLine(idle(), T)).toBeNull();
+  });
+
+  it("rounds a real elapsed time, never rendering an over-an-hour age as minutes (BB-406)", () => {
+    const b = idle({ idleInitiativeSince: T - (5 * 3_600_000 + 13 * 60_000 + 4_000) });
+    expect(idleInitiativeLine(b, T)).toBe("ENG-12: idle 5h — 3 unmet criteria");
+  });
+
+  it("does not render an idle line for a held initiative even if the clock is set (BB-406)", () => {
+    const held = idle({ idleInitiativeSince: T - 5 * 3_600_000, hold: "a freeze" });
+    expect(idleInitiativeLine(held, T)).toBeNull();
+  });
+
+  it("carries the idle line in the initiative's own wake only while idle", () => {
+    const b = idle({ idleInitiativeSince: T - 3 * DAY }, { comments: [met("Scope memo approved (owner)")] });
+    expect(initiativeIdleWakeLine(b, T)).toBe("- **This initiative has been idle for 3d:** 2 unmet criteria, no open child, nothing live it waits on.");
+    const wake = formatWake(wakeInput({ binding: b, observed: observedFor(b) }));
+    expect(wake).toContain("- **This initiative has been idle for 3d:** 2 unmet criteria, no open child, nothing live it waits on.");
+    const notIdle = idle();
+    expect(initiativeIdleWakeLine(notIdle, T)).toBeNull();
+    expect(formatWake(wakeInput({ binding: notIdle, observed: observedFor(notIdle) }))).not.toContain("has been idle for");
+  });
+
+  it("renders the idle line in the digest's stuck-or-held section", () => {
+    const b = idle({ idleInitiativeSince: T - 5 * 3_600_000 }, { comments: [met("Scope memo approved (owner)")] });
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [], idle: [b] };
+    const text = formatRecords(records, [], "UTC", T).join("\n");
+    expect(text).toContain("ENG-12: idle 5h — 2 unmet criteria");
+    // With no idle initiative the section is exactly as before.
+    const none = formatRecords({ ...records, idle: [] }, [], "UTC", T).join("\n");
+    expect(none).not.toContain("idle ");
   });
 });
 

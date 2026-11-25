@@ -492,6 +492,14 @@ describe("buildStandupInstructions (BB-300)", () => {
     expect(line).not.toContain("days");
   });
 
+  it("renders an idle initiative's line in the stuck-or-held section (BB-406)", () => {
+    const entity = issue({ labels: ["bb-managed", "initiative"], description: "## Criteria\n\n- [ ] One\n- [ ] Two", state: "In Progress" });
+    const idle = binding({ id: "b-idle", entityKey: "ENG-30", idleInitiativeSince: 10_000 - 3 * 3_600_000, lastSnapshot: { entity, pulls: [] } });
+    const brief = briefing({ stuck: { stuck: [], held: [], noWakeSource: [], stall: [], datedWaits: [], idle: [idle] } });
+    const text = buildStandupInstructions(brief, "Acme", 10_000);
+    expect(text).toContain("ENG-30: idle 3h — 2 unmet criteria");
+  });
+
   it("carries a gate item's pull title, steward summary and review verdict (BB-309)", () => {
     const need = { what: "Approve acme/web#7 on GitHub", kind: "approve-pr", createdAt: 1, url: "https://github.com/acme/web/pull/7" } as never;
     const linked = pull({ comments: [comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=owner-reviewed approver=owner -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" })] });

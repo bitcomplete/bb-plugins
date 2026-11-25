@@ -16,6 +16,7 @@ import type { EntitySnapshot, SearchIssue } from "./source-contract.js";
 import type { GuidanceUnit } from "./guidance.js";
 import { parsePullRef } from "./github.js";
 import { latestReviewMarker } from "./gate.js";
+import { idleInitiativeLine } from "./wake.js";
 
 /** One function tool, shaped the way the Realtime API's `realtime.open` expects. */
 export type StandupTool = {
@@ -770,6 +771,11 @@ function stuckLines(briefing: Briefing, now: number): string[] {
   for (const b of briefing.stuck.held) out.push(`${b.entityKey}: on hold${b.hold === null ? "" : ` — ${b.hold}`}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`);
   for (const b of briefing.stuck.noWakeSource) out.push(`${b.entityKey}: waiting with nothing the plugin tracks to wake it`);
   for (const b of briefing.stuck.datedWaits) out.push(`${b.entityKey}: waiting until ${b.requeueUntil === null ? "?" : new Date(b.requeueUntil).toISOString()}`);
+  // BB-406: an idle initiative, with its duration and unmet count.
+  for (const b of briefing.stuck.idle ?? []) {
+    const line = idleInitiativeLine(b, now);
+    if (line !== null) out.push(line);
+  }
   return out;
 }
 

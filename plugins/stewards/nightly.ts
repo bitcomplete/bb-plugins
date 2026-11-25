@@ -108,6 +108,8 @@ export type Briefing = {
     noWakeSource: Binding[];
     stall: Array<{ escalation: Escalation; from: Binding }>;
     datedWaits: Binding[];
+    /** BB-406: idle initiatives, rendered as one `idle <duration>` line each. Optional so a briefing literal from before this field still type-checks. */
+    idle?: Binding[];
   };
   /** 4. What merged or deployed since, and the questions answered in the window. */
   done: {
@@ -166,6 +168,10 @@ export function createBriefing(store: Store, now: () => number): (projectId: str
         stall: openWith((x) => x.kind === "stall"),
         // BB-247: the dated waits still ahead, listed separately from stalls.
         datedWaits: open.filter((b) => b.requeueUntil !== null && b.requeueUntil > now()),
+        // BB-406: an initiative the reconcile marked idle, however long ago. A
+        // held binding is listed as held, not idle, even before the next
+        // reconcile clears the stored clock.
+        idle: open.filter((b) => b.idleInitiativeSince !== null && b.hold === null),
       },
       done:
         scoped === null
@@ -215,6 +221,7 @@ export function toDigestRecords(briefing: Briefing): DigestRecords {
     stall: briefing.stuck.stall,
     datedWaits: briefing.stuck.datedWaits,
     held: briefing.stuck.held,
+    idle: briefing.stuck.idle,
     nonActions: briefing.nonActions,
   };
 }
