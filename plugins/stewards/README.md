@@ -93,11 +93,12 @@ install on a stock bb: one repository, no Linear, no hooks service.
   Merge item to the replacement instead of ending it with the bot's. Reading
   alerts needs the token's alert access; a server whose login cannot read
   them skips the targets, and `bb stewards check` says which. DESIGN.md §19.
-- **Backlog stewards.** A `backlog` role watches one Linear team's whole open
-  backlog (unlabelled and unassigned included) through the `sourceBacklog`
-  read and contributes a **Backlog** section to the morning digest: size, age
-  distribution, inflow and outflow, likely duplicates, stale tickets and the
-  proposed next three. It is read-only until the project sets
+- **Backlog stewards.** A `backlog` role watches one Linear team's or one
+  GitHub repository's whole open backlog (unlabelled and unassigned included)
+  through the `sourceBacklog` read — served by both the linear and the github
+  source — and contributes a **Backlog** section to the morning digest: size,
+  age distribution, inflow and outflow, likely duplicates, stale tickets and
+  the proposed next three. It is read-only until the project sets
   `backlog.triage: true`; then the steward is offered one gated tool,
   `backlog_triage { key, addLabels?, relations?, priority?, comment?,
   proposeCancel? }`, and nothing else. The plugin, not the playbook, enforces
@@ -107,9 +108,11 @@ install on a stock bb: one repository, no Linear, no hooks service.
   ticket with an assignee); labels come from the fixed vocabulary (kind
   `bug`/`feature`/`chore`, `repo:<name>` from `repos.json`, and
   `size:S|M|L`) and never an adoption label; relations are only `duplicate`,
-  `blockedBy` and `related`, both ends in the team, add-only; a priority is
+  `blockedBy` and `related`, both ends in the team, add-only, and are refused
+  on a GitHub backlog (GitHub issues have none); a priority is
   set only when it is unset or was last set by the steward, never a hand-set
-  one; and a comment is signed, within `backlog.commentsPerWeek` per ticket
+  one, and is likewise refused on a GitHub backlog; and a comment is signed,
+  within `backlog.commentsPerWeek` per ticket
   over a rolling seven days, with one open question per ticket and the
   stale-cancel proposal only after `backlog.staleDays`. Every accepted write
   and every refusal is appended to a stored ledger ([backlog-triage.ts](backlog-triage.ts),
@@ -118,15 +121,20 @@ install on a stock bb: one repository, no Linear, no hooks service.
   a ticket, ledger or configuration that cannot be read refuses and writes
   nothing. Stage 3 adds a second opt-in, `backlog.promote: true`, and with it
   the gated `backlog_promote { key }` tool ([backlog-promote.ts](backlog-promote.ts)):
-  it moves one ticket to Todo, adds the adoption label and assigns it to this
+  it moves one ticket to Todo (`status:todo` on GitHub), adds the adoption
+  label and assigns it to this
   server, then the ordinary ticket steward adopts it. The plugin, not the
-  model, picks the ticket — the top-ordered ready-looking un-adopted Backlog
-  ticket, by the owner's priority and then oldest `createdAt` first, with the
+  model, picks the ticket — the top-ordered ready-looking un-adopted ticket,
+  by the owner's priority and then oldest `createdAt` first, with the
   key as a final tiebreak (Linear returns newest first, so the tiebreak is
-  explicit) — and ignores a `key` that is not that ticket. It refuses when Todo plus In Progress is at
-  or over `backlog.wipLimit`, never edits a description, cancels, closes or
+  explicit; GitHub has no priority, so a GitHub backlog is oldest first) — and
+  ignores a `key` that is not that ticket. It refuses when the target's WIP is at
+  or over `backlog.wipLimit` (Todo plus In Progress on Linear, `status:todo`
+  plus `status:in-progress`, and any open issue already adopted, on GitHub),
+  never edits a description, cancels, closes or
   changes a priority, and never promotes an adopted ticket, one in a
-  non-Backlog state, or one with an open `blockedBy` (the linear snapshot now
+  non-Backlog state (on GitHub, one that is not an open issue with no status
+  label), or one with an open `blockedBy` (the snapshot
   carries the open blocker keys). Each promotion is its own digest line; a
   WIP-full or no-candidate refusal repeated for an unchanged reason collapses
   to one. The `.bb` keys land in a later, owner-reviewed pull request.

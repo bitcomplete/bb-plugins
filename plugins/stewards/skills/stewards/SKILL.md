@@ -257,10 +257,11 @@ Two tools are yours; everything else you do with the tools every thread has.
   synthesised `status:*` state is unchanged, so a GitHub playbook may key on
   either form.
 - **A ticket the backlog steward promoted.** A ticket may arrive already
-  promoted: the backlog steward moved it from Backlog to Todo, added the
-  project's adoption label (default `bb-managed`) and assigned it to this
-  server, so this server adopts it as an ordinary labelled ticket and you
-  specify it the usual way. The backlog steward may also have triaged it
+  promoted: the backlog steward moved it from Backlog to Todo (`status:todo`
+  on GitHub), added the project's adoption label (default `bb-managed`) and
+  assigned it to this server, so this server adopts it as an ordinary
+  labelled ticket and you specify it the usual way. The backlog steward may
+  also have triaged it
   first — kind, `repo:` and `size:` labels, `duplicate`/`blockedBy`/`related`
   relations, or a priority, and signed comments within the project's comment
   budget (a question, or a stale-cancel proposal) — and it touches
@@ -590,30 +591,36 @@ and `ticket_comment` sign for you; add no signature to what you pass them.
 
 ## If you are a backlog steward
 
-The backlog role reads a whole Linear team's open backlog through
-`sourceBacklog`, which only the linear source serves, so the project must
-list a Linear team (`linear.teams`); the role's `backlog.team` names which
-one is read. A project with no `linear.teams` cannot run it, and
-`bb stewards check` reports "backlog needs a Linear team; the backlog role
-is Linear-only" even when the role names a team. The read is read-only
+The backlog role reads a whole target's open backlog through `sourceBacklog`:
+a Linear team's (`backlog.team`, one of the project's `linear.teams`) or a
+GitHub repository's (`backlog.repos`). Both the linear and the github source
+serve the read. A project with no `linear.teams` cannot run a Linear backlog,
+and `bb stewards check` reports "backlog needs a Linear team; the backlog
+role is Linear-only" for a Linear backlog with no Linear team; a GitHub-only
+backlog does not trigger it. The read is read-only
 unless `backlog.triage` is on, in which case `backlog_triage` adds labels,
-relations, a priority or one signed comment, and unless `backlog.promote` is
-on, in which case `backlog_promote { key }` moves one ticket forward. Both
-are gated, both are re-read on every call, and the plugin — not the
-playbook and not the model — enforces the limits.
+relations, a priority or one signed comment (GitHub issues have no priority
+and no relations, so those two writes are refused on a GitHub backlog), and
+unless `backlog.promote` is on, in which case `backlog_promote { key }` moves
+one ticket forward. Both are gated, both are re-read on every call, and the
+plugin — not the playbook and not the model — enforces the limits.
 
-**Promotion (Stage 3, `backlog.promote`).** While Todo plus In Progress is
-under `backlog.wipLimit`, `backlog_promote` moves at most one ticket per
-pass to Todo, adds the adoption label and assigns it to this server's login,
-so the ordinary ticket steward adopts and specifies it with no hand step.
-The plugin picks the ticket: the top-ordered ready-looking un-adopted Backlog
-ticket, ordered by the owner's priority (urgent, high, medium, low, then
-none) and then oldest `createdAt` first, with the key as a final tiebreak,
-so it never ranks a ticket above what the owner set by hand. It ignores a
-`key` that is not that ticket. It never
+**Promotion (Stage 3, `backlog.promote`).** While the target's WIP is under
+`backlog.wipLimit` — Todo plus In Progress on Linear, `status:todo` plus
+`status:in-progress` (and any open issue already adopted) on GitHub —
+`backlog_promote` moves at most one ticket per pass to Todo, adds the
+adoption label and assigns it to this server's login, so the ordinary ticket
+steward adopts and specifies it with no hand step. On a GitHub backlog the
+move sets `status:todo` instead of a workflow state. The plugin picks the
+ticket: the top-ordered ready-looking un-adopted ticket, ordered by the
+owner's priority (urgent, high, medium, low, then none) and then oldest
+`createdAt` first, with the key as a final tiebreak (GitHub has no priority,
+so a GitHub backlog is oldest first), so it never ranks a ticket above what
+the owner set by hand. It ignores a `key` that is not that ticket. It never
 promotes a ticket that already carries an adoption label, has any assignee or
-is an initiative; one in a non-Backlog state; one with an open `blockedBy`;
-or one whose title or description is empty. It never edits a description,
+is an initiative; on Linear one in a non-Backlog state; on GitHub one that
+is not an open issue with no status label; one with an open `blockedBy`; or
+one whose title or description is empty. It never edits a description,
 cancels or closes, and never changes a priority. Each accepted promotion and
 each refusal is written to the ledger and shown in the digest's Backlog
 section; a WIP-full or no-candidate refusal repeated for an unchanged reason
