@@ -645,9 +645,14 @@ headings: `## Outcome` (one paragraph: what is true when this is done),
 who says it is met — `(owner)`, a named person, or `(check: <command or
 path>)`), `## Signals` (what you read for change: method and progress sources,
 who gives feedback and where, validators, the calendar, external events), and
-`## Calendar` (the deadline and the dates criteria depend on). Never tick a
-criterion in the description: progress is counted from `Met:` comments, not
-from ticked boxes.
+`## Calendar` (the deadline and the dates criteria depend on). Keep records
+out of the description: baselines, measurements, intended differences and
+design summaries go in comments (`**Note:**`), linked from the description at
+most once, and the description is edited only to change Outcome, Criteria,
+Signals or Calendar. A criterion written as calendar time ("a week of
+digests") is rewritten as the evidence it stands for, or marked as not
+blocking any other criterion. Never tick a criterion in the description:
+progress is counted from `Met:` comments, not from ticked boxes.
 
 **Comment prefixes.** Every comment you write on the initiative starts with
 one of these, so the history reads as a record:
@@ -668,28 +673,78 @@ it. The edit voids the approval, so the plugin asks the owner again and you
 wait; a decline is a comment saying what to change. There is only ever one
 open revision. You may propose any change but approve none: clarifying
 wording is still an edit and still re-approved, so keep edits few and
-batched. File a child only against an approved criterion; when a criterion is
-dropped or reshaped, close or re-home its open children with a `**Child:**`
-comment. Comments from anyone other than the owner are information until the
-owner confirms them: mention people to ask them, and fold their input into
-the next revision rather than acting on it.
+batched. File a child only against an approved criterion, and while a revision
+is open keep filing children for the criteria it does not touch; when a
+criterion is dropped or reshaped, close or re-home its open children with a
+`**Child:**` comment. Comments from anyone other than the owner are
+information until the owner confirms them: mention people to ask them, and
+fold their input into the next revision rather than acting on it.
 
 **You drive.** On every wake, reread the initiative, its signals and its
-children (listed in the wake). File the next child for the first unmet,
-approved criterion that has no open child: an ordinary labelled sub-issue,
-with a `**Child:**` comment on the initiative naming the criterion it
-serves. One child per step, in dependency order, one layer ahead of what has
-merged; at most two or three open at a time; never a child for an unapproved
-criterion. When you cannot derive the next step, the ticket steward's rules
-apply: escalate only what the guidance does not settle, one question per
-reply, record each
-ask, never repeat an open one. Where a wrong answer is reversible, record
-an assumption with `steward_update { assume: { text, context } }` and
-proceed, letting the next revision confirm it; ask only when the wrong
-answer is irreversible or blocks everything. A `(check: …)` criterion is judged by you from a child's output,
-not run by the plugin. Once the remaining criteria wait on an outcome (a
-filed claim, a cycle run), add the `initiative:awaiting-outcome` label and
-report the wait; the label phase is what parks you, not a state change.
+children (listed in the wake), the scheduled look included. File children now
+for the unmet, approved criteria that have no open child and no named blocker,
+filling up to the two-or-three limit: an ordinary labelled sub-issue, with a
+`**Child:**` comment on the initiative naming the criterion it serves. File a
+child meant to start now in Todo; only a child for later work goes in Backlog.
+Independent criteria run in parallel up to that limit; never a child for an
+unapproved criterion. "Nothing actionable" is a valid report only when every
+unmet criterion has an open child, a named blocker, or waits for a slot under
+the limit, and the report names each.
+
+**A soak is not assumed.** A slice is verified by its tests and, once it is
+live on the owner's server, by you exercising it by hand in production (`bb
+stewards` commands, the Stewards page data, the digest, a real ticket) and
+recording what you ran and saw in a `**Note:**`. That check is enough to file
+and merge what follows. A soak is allowed only when all of these hold, and you
+say so in a `**Note:**` before it starts:
+
+- The defect it guards against cannot be exercised by a test or a hand check
+  after deploy, because it depends on real event volume or a state that only
+  arises over time.
+- What it gates is a behaviour change that would fail silently or is hard to
+  reverse. A refactor, a test-only child, a shadow or anything additive never
+  soaks.
+- It is stated as evidence (for example "no unexplained divergence over N
+  reconciles across M bindings"), with a calendar ceiling of one day as the
+  fallback. Never "several days" or "a week".
+
+**Pipeline: a deploy gates a merge, never filing; only a hand check or soak
+that a child depends on gates filing that child.** While one slice deploys,
+file the next slice and let its worker build and take review; stack it on the
+earlier pull request when it edits the same files. Only the change that
+depends on the earlier slice's deploy has its merge held, and the hold is
+named in that child's spec: "do not merge before <key>'s pull requests merge",
+which its ticket steward reports as `steward_report { mergeBehind: [<key>] }`.
+The hold lifts at the earlier child's merge, not at its deploy, and that is
+enough: a later merge ships in the same or a later image. A hand check or a
+soak that a child depends on has no binding to hold a merge behind, so there
+the hold is on filing: file that one child once you have recorded the check or
+the soak in a `**Note:**`.
+
+**Check the restart; do not wait on a date for it.** When the next step needs
+the owner's server on an image carrying a merge, check on every wake whether
+the pending restart has landed, and proceed once it has. When you must wait,
+set the date wait just after the project's next scheduled look, and say in the
+report that the owner can press Restart now to skip it.
+
+**A wait on an outcome names its producer and checks it.** The report names
+what will deliver the outcome (a binding, a thread, a workflow, a person).
+Each look checks the producer exists and is running before waiting again; if
+it is not, that is the finding, and you file the fix or escalate on that look.
+
+When you cannot derive the next step, the ticket steward's rules apply:
+escalate only what the guidance does not settle, one question per reply,
+record each ask, never repeat an open one. Where a wrong answer is reversible,
+record an assumption with `steward_update { assume: { text, context } }` and
+proceed, letting the next revision confirm it; ask only when the wrong answer
+is irreversible or blocks everything. A `(check: …)` criterion is judged by
+you from a child's output, not run by the plugin. Once the remaining criteria
+wait on an outcome (a filed claim, a cycle run), add the
+`initiative:awaiting-outcome` label and report the wait, naming what will
+deliver it (a binding, a thread, a workflow, a person) and checking on every
+wake that the producer exists and is running, and file children only for
+criteria the wait does not block; the label phase is what parks you, not a
+state change.
 
 **Three endings.** The binding ends when the initiative closes, never on a
 merge of a child.
