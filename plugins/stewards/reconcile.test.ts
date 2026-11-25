@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, idleInActiveStage, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, mentionsOwnerOrUser, newestEditComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { answerDiffers, anyWorkerInFlight, asksForOpenApproval, checksPhrase, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, idleInActiveStage, initiativeSpecBody, isCommentNews, isOwnStageChange, isOwnStageMove, lifecycle, markerLaneChange, mechanicalStatus, mentionsOwnerOrUser, newestEditComment, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, repinInitiativeSpecText, sectionText, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
 import { approvalMarkerLine, classifyApproval, ownerApproval, prGate, productReason, projectApprovalMarker, reviewMarker, reviewWorkerThread, UNREADABLE_VERDICT, type ProjectApprovalRecord } from "./gate.js";
 import { approvalWanted, gateState, resolveChecklistItem } from "./ready-gate.js";
 import { readyStateSchema, statusRecordSchema } from "./store.js";
@@ -488,6 +488,96 @@ describe("the spec text and its re-approval diff (BB-249)", () => {
     // Unsigned, non-edit and linkless comments never match.
     const ignored = [comment({ id: "u", body: "Spec: no signature", url: "https://x", createdAt: "2026-10-06T00:00:00Z" }), comment({ id: "n", body: "note", signedBy: "thr_s", url: "https://x", createdAt: "2026-10-06T00:00:00Z" }), comment({ id: "l", body: "Spec: no link", signedBy: "thr_s", url: null, createdAt: "2026-10-06T00:00:00Z" })];
     expect(newestEditComment(issue({ comments: ignored }), "thr_s", undefined, approvedAt)).toBeNull();
+  });
+});
+
+// BB-408: an initiative's approval covers only its `## Outcome` and
+// `## Criteria` sections. Every other binding is byte for byte what it was.
+describe("an initiative's spec is only its Outcome and Criteria (BB-408)", () => {
+  const description = [
+    "## Outcome",
+    "",
+    "Users can log in.",
+    "",
+    "## Criteria",
+    "",
+    "- [ ] Login works",
+    "- [ ] SSO works",
+    "",
+    "## Signals",
+    "",
+    "| Metric | Value |",
+    "| --- | --- |",
+    "| logins | 3 |",
+    "",
+    "## Calendar",
+    "",
+    "2027-01-01",
+  ].join("\n");
+  const initiative = (over: Partial<EntitySnapshot> = {}) => issue({ description, ...over });
+  const initHash = (e: EntitySnapshot) => specHash(e, "thr_s", undefined, null, "initiative");
+  const initText = (e: EntitySnapshot) => specText(e, "thr_s", undefined, null, "initiative");
+
+  it("pins a non-initiative ticket's hash to its literal, byte for byte", () => {
+    expect(specHash(issue(), "thr_s")).toBe("d26047818ecdce33");
+    expect(specText(issue(), "thr_s")).toBe("Users cannot log in.");
+  });
+
+  it("takes the two sections in place of the whole description, case-insensitively", () => {
+    expect(initiativeSpecBody(description)).toBe(`${sectionText(description, "Outcome")}\n\u0000\n${sectionText(description, "Criteria")}`);
+    expect(initText(initiative())).not.toContain("| logins | 3 |");
+    expect(initText(initiative())).toContain("## Outcome");
+    // A heading matched case-insensitively still bounds the section, so the
+    // Signals table stays out even when the heading is not title case.
+    const lower = initiative({ description: description.replace("## Outcome", "## outcome").replace("## Criteria", "## criteria") });
+    expect(initText(lower)).not.toContain("| logins | 3 |");
+  });
+
+  it("keeps an approval when a status table or an outside section changes", () => {
+    const base = initHash(initiative());
+    expect(initHash(initiative({ description: description.replace("| logins | 3 |", "| logins | 999 |") }))).toBe(base);
+    expect(initHash(initiative({ description: description.replace("## Signals", "## Notes\n\nWorking notes.\n\n## Signals") }))).toBe(base);
+    expect(initHash(initiative({ description: `${description}\n\n## Appendix\n\nMore.` }))).toBe(base);
+  });
+
+  it("voids the approval when the outcome or a criterion changes, and the diff is only that section", () => {
+    const base = initHash(initiative());
+    const outcomeEdit = initiative({ description: description.replace("Users can log in.", "Users can log in with SSO.") });
+    expect(initHash(outcomeEdit)).not.toBe(base);
+    const outcomeDiff = specDiff(initText(initiative()), initText(outcomeEdit));
+    expect(outcomeDiff.diff).toContain("-Users can log in.");
+    expect(outcomeDiff.diff).toContain("+Users can log in with SSO.");
+    expect(outcomeDiff.diff).not.toContain("| logins |");
+    expect(outcomeDiff.diff).not.toContain("2027-01-01");
+
+    const criteriaEdit = initiative({ description: description.replace("- [ ] SSO works", "- [ ] SSO works with Okta") });
+    expect(initHash(criteriaEdit)).not.toBe(base);
+    const criteriaDiff = specDiff(initText(initiative()), initText(criteriaEdit));
+    expect(criteriaDiff.diff).toContain("- [ ] SSO works");
+    expect(criteriaDiff.diff).toContain("+- [ ] SSO works with Okta");
+    expect(criteriaDiff.diff).not.toContain("| logins |");
+  });
+
+  it("falls back to the whole description when either heading is missing, so removing or renaming one voids the approval", () => {
+    const base = initHash(initiative());
+    const renamedCriteria = initiative({ description: description.replace("## Criteria", "## Acceptance") });
+    expect(initHash(renamedCriteria)).not.toBe(base);
+    expect(initText(renamedCriteria)).toContain("| logins | 3 |");
+    const removedOutcome = initiative({ description: description.replace("## Outcome\n", "") });
+    expect(initHash(removedOutcome)).not.toBe(base);
+    expect(initText(removedOutcome)).toContain("| logins | 3 |");
+  });
+
+  it("derives the new form from a stored old-form text, keeping its spec comments; other playbooks are untouched", () => {
+    const entity = initiative({ comments: [comment({ id: "s1", body: "**Spec:** acceptance criteria", signedBy: "thr_s" })] });
+    const oldForm = specText(entity, "thr_s");
+    expect(oldForm).toContain("| logins | 3 |");
+    expect(repinInitiativeSpecText(oldForm, "initiative")).toBe(initText(entity));
+    expect(repinInitiativeSpecText(oldForm, "linear-tickets")).toBe(oldForm);
+    expect(repinInitiativeSpecText(oldForm)).toBe(oldForm);
+    // The fallback rule applies to the stored description too.
+    const noCriteria = initiative({ description: description.replace("## Criteria", "## Acceptance") });
+    expect(repinInitiativeSpecText(specText(noCriteria, "thr_s"), "initiative")).toBe(specText(noCriteria, "thr_s"));
   });
 });
 

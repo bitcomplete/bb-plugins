@@ -74,8 +74,10 @@ export const approvalWanted = (gate: GateState): boolean => !gate.none && gate.c
  */
 export type ReadyGateContext = {
   store: Store;
-  specHashFor: (b: Pick<Binding, "threadId">, entity: EntitySnapshot) => string;
-  specTextFor: (b: Pick<Binding, "threadId">, entity: EntitySnapshot) => string;
+  specHashFor: (b: Pick<Binding, "threadId" | "playbook">, entity: EntitySnapshot) => string;
+  specTextFor: (b: Pick<Binding, "threadId" | "playbook">, entity: EntitySnapshot) => string;
+  /** The BB-408 form of a stored approved text, so a re-approval diff compares like with like. */
+  approvedTextFor: (b: Pick<Binding, "playbook">, stored: string) => string;
   specDiff: (before: string, after: string, context?: number) => SpecDiff;
   log: (message: string) => void;
 };
@@ -128,7 +130,7 @@ export async function syncApprovalRequest(ctx: ReadyGateContext, b: Binding, pla
   // item does, so the project steward reads a change rather than a document.
   const prior = b.ready.approval;
   const approvedText = prior?.approvedText ?? b.ready.voidedApprovedText;
-  const reapproval = approvedText !== null ? ctx.specDiff(approvedText, ctx.specTextFor(b, b.lastSnapshot.entity)) : null;
+  const reapproval = approvedText !== null ? ctx.specDiff(ctx.approvedTextFor(b, approvedText), ctx.specTextFor(b, b.lastSnapshot.entity)) : null;
   const x = ctx.store.escalate({
     bindingId: b.id,
     kind: "approval",
