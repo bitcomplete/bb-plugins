@@ -965,7 +965,15 @@ export const REVIEWER_ROUND_WAKE_MIGRATIONS = [
   `ALTER TABLE bindings ADD COLUMN reviewer_round_missing INTEGER NOT NULL DEFAULT 0`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS, ...REHOME_MARK_MIGRATIONS, ...REVIEWER_ROUND_WAKE_MIGRATIONS];
+// BB-406: the initiative idle clock. `idle_initiative_since` is when the
+// reconcile first saw an initiative idle (in its build phase, with an unmet
+// criterion, no open child and no live typed wait) and is cleared the moment
+// the predicate goes false. NULL means not idle, so a row from before this
+// group reads as not idle and no surface renders an idle line for it. Additive
+// and nullable: a pre-migration build never reads the column.
+export const INITIATIVE_IDLE_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN idle_initiative_since INTEGER`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS, ...REHOME_MARK_MIGRATIONS, ...REVIEWER_ROUND_WAKE_MIGRATIONS, ...INITIATIVE_IDLE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1231,6 +1239,8 @@ export type Binding = {
   deployments: Deployments;
   /** When the binding became idle in an active stage, or null (BB-83). */
   idleSince: number | null;
+  /** When an initiative was first observed idle, or null (BB-406). NULL reads as not idle. */
+  idleInitiativeSince: number | null;
   /** When the plugin last woke the steward for being idle in an active stage (BB-83). */
   idleWokenAt: number | null;
   /** A worker finish asked for an idle look at once, without the grace (BB-83). */
@@ -1337,6 +1347,7 @@ function rowToBinding(r: BindingRow): Binding {
     nonActions: json(nonActionsSchema, str("assessment_non_actions"), {}),
     deployments: json(deploymentsSchema, str("deployments"), {}),
     idleSince: num("idle_since"),
+    idleInitiativeSince: num("idle_initiative_since"),
     idleWokenAt: num("idle_woken_at"),
     idleWakeNow: Number(r.idle_wake_now ?? 0) === 1,
     noWakeSource: Number(r.no_wake_source ?? 0) === 1,
@@ -1422,6 +1433,7 @@ const COLUMNS = {
   waitSlackedAt: "wait_slacked_at",
   deployments: "deployments",
   idleSince: "idle_since",
+  idleInitiativeSince: "idle_initiative_since",
   idleWokenAt: "idle_woken_at",
   idleWakeNow: "idle_wake_now",
   noWakeSource: "no_wake_source",
@@ -1471,6 +1483,8 @@ const VISIBLE_COLUMNS = [
   "no_wake_source",
   // BB-392: the missing-reviewer-round mark changes line two's phrase too.
   "reviewer_round_missing",
+  // BB-406: the initiative idle clock changes line two's chip.
+  "idle_initiative_since",
   // BB-247: a dated wait changes line two's phrase too.
   "requeue_until",
   // BB-333: the typed wait renders on the card and in `bb stewards show`.

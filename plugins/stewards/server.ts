@@ -162,7 +162,7 @@ import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, LOCAL_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { templateWarnings, type CheckFinding } from "./template-stamp.js";
 import type { DeploymentTarget } from "./config.js";
-import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBacklogWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, noWakeSourceReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBacklogWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, initiativeIdle, initiativeUnmet, noWakeSourceReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
@@ -775,6 +775,10 @@ export const rpcContract = defineRpcContract({
               noWakeSource: z.boolean(),
               /** BB-392: the only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
               reviewerRoundMissing: z.boolean().optional(),
+              /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. Optional so a client built from the previous image still validates. */
+              idleInitiativeSince: z.number().nullable().optional(),
+              /** BB-406: the initiative's unmet criteria count, for the chip's tooltip; null when it cannot be read. */
+              idleInitiativeUnmet: z.number().nullable().optional(),
               /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
               wakeFailure: z.string().nullable(),
               priority: z.string().nullable(),
@@ -941,6 +945,10 @@ export const rpcContract = defineRpcContract({
               noWakeSource: z.boolean(),
               /** BB-392: the only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
               reviewerRoundMissing: z.boolean().optional(),
+              /** BB-406: when an initiative was first seen idle, or null; the card shows `idle <duration>`. Optional so a client built from the previous image still validates. */
+              idleInitiativeSince: z.number().nullable().optional(),
+              /** BB-406: the initiative's unmet criteria count, for the chip's tooltip; null when it cannot be read. */
+              idleInitiativeUnmet: z.number().nullable().optional(),
               /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
               wakeFailure: z.string().nullable(),
               priority: z.string().nullable(),
@@ -1062,6 +1070,10 @@ export const rpcContract = defineRpcContract({
           noWakeSource: z.boolean(),
           /** BB-392: the only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
           reviewerRoundMissing: z.boolean().optional(),
+          /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. Optional so a client built from the previous image still validates. */
+          idleInitiativeSince: z.number().nullable().optional(),
+          /** BB-406: the initiative's unmet criteria count, for the chip's tooltip; null when it cannot be read. */
+          idleInitiativeUnmet: z.number().nullable().optional(),
           /** BB-255: a failed wake's phrase, `wake failed: <reason>`; null when the last wake landed. */
           wakeFailure: z.string().nullable(),
           needsUser: z.boolean(),
@@ -6151,6 +6163,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
       signalNeedActionability(b, observed, ready);
       b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready, ...(assessment === null ? {} : { noWakeSource: assessment.liveness.stalled }) });
+      // BB-406: the initiative idle clock. The predicate reads only rows this
+      // look already holds — the fresh snapshot's children and the composed
+      // typed-wait liveness — so it adds no store read or source call. The
+      // column is written only when the answer flips: false->true stamps the
+      // moment, true->false clears it, and an unchanged answer leaves the
+      // stored time alone so the duration is stable across sweeps. A look with
+      // no assessment leaves the clock untouched rather than clearing it.
+      if (assessment !== null) {
+        const idleInitiative = initiativeIdle(b, observed.entity.children, assessment.liveness.waitLive);
+        const idleInitiativeSince = idleInitiative ? (b.idleInitiativeSince ?? now()) : null;
+        if (idleInitiativeSince !== b.idleInitiativeSince) b = store.patch(b.id, { idleInitiativeSince });
+      }
       // BB-54 item 4: a ticket that links a new pull request re-runs the
       // overlap check, even past its ready gate, and a new pull request clears
       // a "no more coming" report. The report path clears it too, when a
@@ -8592,7 +8616,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
       const assumptions = store.openAssumptionsForProject(projectId).map((assumption) => ({ assumption, binding: assumption.bindingId === null ? null : (store.binding(assumption.bindingId) ?? null) }));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), refreshes: store.playbookRefreshes(projectId), guidance: await wakeGuidance(projectId, null), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, localFiling: filingTargetFor(config)?.source === "local", ...(records === undefined ? {} : { records }) });
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, assumptions, lessons: store.allLessons(projectId), refreshes: store.playbookRefreshes(projectId), guidance: await wakeGuidance(projectId, null), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, now: now(), label: config.file.label, localFiling: filingTargetFor(config)?.source === "local", ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.
@@ -11860,6 +11884,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
               reviewerRoundMissing: b.reviewerRoundMissing,
+              idleInitiativeSince: b.idleInitiativeSince,
+              idleInitiativeUnmet: b.idleInitiativeSince === null ? null : initiativeUnmet(b),
               wakeFailure: b.wakeFailure,
               priority: b.priority,
               ...presentationHold(b),
@@ -12001,6 +12027,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
               reviewerRoundMissing: b.reviewerRoundMissing,
+              idleInitiativeSince: b.idleInitiativeSince,
+              idleInitiativeUnmet: b.idleInitiativeSince === null ? null : initiativeUnmet(b),
               wakeFailure: b.wakeFailure,
               priority: b.priority,
               ...presentationHold(b),
@@ -12121,6 +12149,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
               reviewerRoundMissing: b.reviewerRoundMissing,
+              idleInitiativeSince: b.idleInitiativeSince,
+              idleInitiativeUnmet: b.idleInitiativeSince === null ? null : initiativeUnmet(b),
               wakeFailure: b.wakeFailure,
               needsUser: needsUser.has(b.id),
               stuck: stuck.has(b.id),

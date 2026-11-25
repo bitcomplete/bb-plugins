@@ -62,6 +62,10 @@ describe("briefing", () => {
     store.patch(dated.id, { requeueUntil: SINCE + 86_400_000 });
     const ended = binding("ENG-5");
     store.patch(ended.id, { endedAt: SINCE + 20, endReason: "merged" });
+    // BB-406: an initiative the reconcile marked idle, and one that is not.
+    const idleInit = binding("ENG-6");
+    store.patch(idleInit.id, { idleInitiativeSince: SINCE - 3_600_000 });
+    const notIdle = binding("ENG-7");
 
     const userEsc = store.escalate({ bindingId: moved.id, kind: "decision", question: "Ship it?", meanwhile: "Wait.", route: "user", recommendation: null, projectId: "p1" });
     const projectEsc = store.escalate({ bindingId: moved.id, kind: "decision", question: "Which model?", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1" });
@@ -73,7 +77,7 @@ describe("briefing", () => {
     const question = store.ask({ projectId: "p1", bindingId: moved.id, escalationId: null, question: "File an a11y ticket?", context: null });
     store.answer(question.id, "Yes.", "user");
     store.patchProject("p1", { digest: "Old digest.", digestAt: SINCE - 1000 });
-    return { store, now, moved, held, noWake, dated, ended, userEsc, projectEsc, stuckEsc, stallEsc, need, assumption, question };
+    return { store, now, moved, held, noWake, dated, ended, idleInit, notIdle, userEsc, projectEsc, stuckEsc, stallEsc, need, assumption, question };
   }
 
   it("reads the four sections the stand-up ranks, since the given moment", () => {
@@ -89,6 +93,7 @@ describe("briefing", () => {
     expect(b.stuck.held.map((x) => x.id)).toEqual([f.held.id]);
     expect(b.stuck.noWakeSource.map((x) => x.id)).toEqual([f.noWake.id]);
     expect(b.stuck.datedWaits.map((x) => x.id)).toEqual([f.dated.id]);
+    expect((b.stuck.idle ?? []).map((x) => x.id)).toEqual([f.idleInit.id]);
     expect(b.done.moved.map((x) => x.id)).toEqual([f.moved.id]);
     expect(b.done.ended.map((x) => x.id)).toEqual([f.ended.id]);
     expect(b.done.answered.map((x) => x.id)).toEqual([f.question.id]);
@@ -134,6 +139,7 @@ describe("briefing", () => {
       stall: [{ escalation: f.store.escalation(f.stallEsc.id)!, from: f.store.binding(f.noWake.id)! }],
       datedWaits: [f.store.binding(f.dated.id)!],
       held: [f.store.binding(f.held.id)!],
+      idle: [f.store.binding(f.idleInit.id)!],
       nonActions: [],
     });
     // `formatRecords` is untouched, so rendering the extracted record is the

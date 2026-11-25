@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { UNIT_MS } from "./duration.js";
 import { decideEntrySchema, defaultDecideList, globError } from "./decisions.js";
 import { ALERTMANAGER_NAMESPACE, SENTRY_SLUG, type AlertmanagerTarget, type BacklogTarget, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { DEPENDABOT_SEVERITIES, REPO_NAME } from "./source-contract.js";
@@ -39,7 +40,6 @@ export const DEPENDENCY_BOTS = new Set(["dependabot", "dependabot[bot]"]);
 // ---- durations ------------------------------------------------------------------
 
 const DURATION = /^(\d+(?:\.\d+)?)\s*(m|min|h|d|w)$/u;
-const UNIT_MS: Record<string, number> = { m: 60_000, min: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 
 /** "45m", "3h", "2d", "1w", or { days, hours, minutes }. */
 export const durationSchema = z
@@ -56,11 +56,7 @@ export const durationSchema = z
   })
   .refine((ms) => ms >= 60_000, "at least one minute");
 
-export function formatDuration(ms: number): string {
-  if (ms % UNIT_MS.d! === 0) return `${ms / UNIT_MS.d!}d`;
-  if (ms % UNIT_MS.h! === 0) return `${ms / UNIT_MS.h!}h`;
-  return `${Math.round(ms / UNIT_MS.m!)}m`;
-}
+export { formatDuration } from "./duration.js";
 
 /**
  * BB-247: how far out a dated wait may be before the project steward is told

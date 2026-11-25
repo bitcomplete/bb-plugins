@@ -22,7 +22,8 @@ import { newHumanComments } from "./reconcile.js";
 import { reportedItem, type GateState } from "./ready-gate.js";
 import { currentStoredGate, type StoredGate } from "./assessed-gate.js";
 import { conflictsOf, openPull, type Conflict } from "./schedule.js";
-import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotComment, type Source, type WorkflowRun } from "./source-contract.js";
+import { SNAPSHOT_COMMENTS_MAX, type EntitySnapshot, type SessionWake, type SnapshotChild, type SnapshotComment, type Source, type WorkflowRun } from "./source-contract.js";
+import { waitPhrase, type WaitKind } from "./wait.js";
 import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Assumption, type Binding, type DepsDecision, type Escalation, type Lesson, type Need, type Observed, type PlaybookRefresh, type Question, type Worker } from "./store.js";
 import type { CheckFinding } from "./template-stamp.js";
 
@@ -645,6 +646,8 @@ export function formatWake(input: WakeInput): string {
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
+  const idleWake = initiativeIdleWakeLine(binding, input.now);
+  if (idleWake !== null) out.push(idleWake);
   if (binding.mergeBehind.length > 0) out.push(mergeHoldLine(binding));
   if (binding.stackedPulls.length > 0) out.push(stackedPullsLine(binding));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
@@ -1679,6 +1682,85 @@ export function initiativeProgressFlag(binding: Pick<Binding, "kind" | "playbook
 }
 
 /**
+ * BB-406: the typed-wait kinds whose live producer keeps an initiative from
+ * reading idle. A `date`, `external` or absent wait never suppresses idle; a
+ * `date` wait is idle time, shown with its date.
+ */
+const INITIATIVE_LIVE_WAIT_KINDS: ReadonlySet<WaitKind> = new Set(["pull", "review", "deployment", "worker", "binding", "person"]);
+
+/**
+ * BB-406: the number of an initiative's criteria still unmet, or null when the
+ * count cannot be read (the description has no criteria section). A null `met`
+ * means no `**Met:**` comment could be read, so every criterion is unmet. Null
+ * for a binding that is not an initiative.
+ */
+export function initiativeUnmet(binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot">): number | null {
+  const p = initiativeProgress(binding);
+  if (p === null) return null;
+  if (p.met === null) return p.criteria;
+  if (p.criteria === null) return null;
+  return Math.max(0, p.criteria - p.met);
+}
+
+/**
+ * BB-406: whether an initiative is idle — in its build phase, not held, with at
+ * least one criterion unmet, no child still open and no live typed wait. Pure:
+ * `children` is the fresh snapshot's child list and `waitLive` the composer's
+ * typed-wait liveness, both of which the reconcile already holds; nothing here
+ * reads a source or a clock.
+ *
+ * A `date`, `external` or absent wait never suppresses idle; a live `pull`,
+ * `review`, `deployment`, `worker`, `binding` or `person` wait does. An
+ * initiative whose criteria count cannot be read is not "all met", so it can
+ * read idle.
+ */
+export function initiativeIdle(
+  binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot" | "stage" | "hold" | "wait">,
+  children: readonly SnapshotChild[],
+  waitLive: boolean | null,
+): boolean {
+  if (initiativeProgress(binding) === null) return false;
+  if (binding.stage !== "build") return false;
+  if (binding.hold !== null) return false;
+  // An unreadable count (null) is not "all met", so it still reads idle.
+  if (initiativeUnmet(binding) === 0) return false;
+  // Anything but completed or canceled is an open child, including a null type.
+  if (children.some((c) => c.stateType !== "completed" && c.stateType !== "canceled")) return false;
+  const wait = binding.wait ?? null;
+  if (wait !== null && INITIATIVE_LIVE_WAIT_KINDS.has(wait.kind) && waitLive === true) return false;
+  return true;
+}
+
+/**
+ * BB-406: the `idle <duration>` line an idle initiative shows in the digest and
+ * stand-up, or null when it is not idle (or not an initiative). The duration is
+ * read from the stored clock at render time; a date wait shows its date and any
+ * other wait its `kind ref` phrase.
+ */
+export function idleInitiativeLine(binding: Binding, now: number): string | null {
+  if (binding.idleInitiativeSince === null) return null;
+  if (initiativeProgress(binding) === null) return null;
+  const unmet = initiativeUnmet(binding);
+  const criteria = unmet === null ? "unmet criteria unknown" : `${unmet} unmet criteria`;
+  const wait = binding.wait ?? null;
+  const waiting =
+    wait === null
+      ? ""
+      : wait.kind === "date"
+        ? `, waiting on ${binding.requeueUntil === null ? wait.ref : new Date(binding.requeueUntil).toISOString()}`
+        : `, waiting on ${waitPhrase(wait)}`;
+  return `${binding.entityKey}: idle ${formatDuration(Math.max(0, now - binding.idleInitiativeSince))} — ${criteria}${waiting}`;
+}
+
+/** BB-406: the one line an idle initiative's own wake carries, or null when it is not idle. */
+export function initiativeIdleWakeLine(binding: Binding, now: number): string | null {
+  if (binding.idleInitiativeSince === null) return null;
+  const unmet = initiativeUnmet(binding);
+  const criteria = unmet === null ? "an unknown number of unmet criteria" : `${unmet} unmet criteria`;
+  return `- **This initiative has been idle for ${formatDuration(Math.max(0, now - binding.idleInitiativeSince))}:** ${criteria}, no open child, nothing live it waits on.`;
+}
+
+/**
  * The re-approval diff an approval escalation carries (BB-249), as a fenced
  * code block, or a line saying the change was whitespace only; null when the
  * escalation has no prior approved text to diff against.
@@ -1720,6 +1802,8 @@ export function formatProjectWake(input: {
   records?: DigestRecords;
   /** The project's nightly time zone, which dates are given in; UTC when absent. */
   timeZone?: string;
+  /** The clock the digest's durations (an idle initiative's) are measured from; the wall clock when absent. */
+  now?: number;
   /** The adoption label, for adopting what an ops steward filed. */
   label?: string;
   /**
@@ -1849,7 +1933,7 @@ export function formatProjectWake(input: {
   out.push(...guidanceUnitLines(input.guidance ?? []));
   const bindings = out.splice(0);
   if (input.digestDue) {
-    if (input.records !== undefined) out.push("", ...formatRecords(input.records, questions, input.timeZone));
+    if (input.records !== undefined) out.push("", ...formatRecords(input.records, questions, input.timeZone, input.now));
     out.push(
       "",
       "Adjust priority and holds with steward_update first if they need it. Then reply with the morning digest, and nothing else: what moved overnight, what is waiting on the user, what is stuck (including any binding listed as waiting with no wake source or with a stall escalation: name what will deliver the wait, hold it behind something real, or resolve it), and today's priorities. " +
@@ -1979,6 +2063,8 @@ export type DigestRecords = {
   datedWaits?: Binding[];
   /** Open bindings on hold. */
   held: Binding[];
+  /** BB-406: idle initiatives, rendered as one `idle <duration>` line each. */
+  idle?: Binding[];
   /** BB-335: open bindings with recorded non-actions, for the digest's Non-actions section. */
   nonActions?: Array<{ binding: Binding; nonActions: NonActions }>;
   /**
@@ -2029,7 +2115,7 @@ function capped(lines: string[], none: string): string[] {
  * The project steward writes prose on top; after a compaction this is what
  * it starts from rather than its summary of itself.
  */
-export function formatRecords(r: DigestRecords, questions: Array<{ question: Question; about: Binding | null }>, timeZone = "UTC"): string[] {
+export function formatRecords(r: DigestRecords, questions: Array<{ question: Question; about: Binding | null }>, timeZone = "UTC", now: number = Date.now()): string[] {
   const day = dayIn(timeZone);
   const out: string[] = [
     `## The record since ${iso(r.since)}`,
@@ -2093,6 +2179,8 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   const stuck = [
     ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}${choicesNote(x.choices)}`),
     ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}${initiativeFlag(b)}`),
+    // BB-406: an idle initiative is reported with how long it has been idle.
+    ...(r.idle ?? []).map((b) => idleInitiativeLine(b, now)).filter((line): line is string => line !== null),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."), "");
 
