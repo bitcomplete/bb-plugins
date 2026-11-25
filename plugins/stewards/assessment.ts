@@ -171,7 +171,7 @@ export type AssessmentInput = {
 const lc = (s: string | null | undefined): string => (s ?? "").toLowerCase();
 
 /** Whether an observed entity is one of the binding's own pull requests (BB-52 rule 0). */
-const isOwn = (e: EntitySnapshot, own: ReadonlySet<string>): boolean =>
+export const isOwn = (e: EntitySnapshot, own: ReadonlySet<string>): boolean =>
   (e.key !== "" && own.has(lc(e.key))) || (e.url !== null && e.url !== "" && own.has(lc(e.url)));
 
 /** A pull request the plugin can see is still open (not merged or closed). */

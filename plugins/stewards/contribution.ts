@@ -19,6 +19,7 @@
 import { createHash } from "node:crypto";
 import {
   assessLiveWakeSource,
+  isOwn,
   ownPullEntities,
   pullIsOpen,
   typedWaitLive,
@@ -261,7 +262,12 @@ function pullContributions(input: AssessmentInput): { gate: GateContribution[]; 
     const inputs = gateInputKey(binding, e, g.decision, projectApprovals, remembered, reRequested);
     const assessed: AssessedGate = { ...g, pull: e.key, met: g.gateMet, key: inputs };
     gate.push({ source: "github", subject: { kind: "pull", id: e.key }, id: "merge", met: g.gateMet, missing: g.missing, lane: g.decision, escalated: g.escalated, product: g.reason === "product", inputs, assessed });
-    resources.push({ source: "github", id: `open-pull:${lc(e.key)}`, active: pullIsOpen(e) && !g.gateMet, subject: { kind: "pull", id: e.key } });
+    // The resource is the idle-blocking one, so it follows `idleInActiveStage`'s
+    // own-pull set, not the wider `gatePulls` the gate items use (BB-399 review
+    // round 1): a linked pull no worker has reported, or a `pr`/`review`
+    // binding's own non-worker pull, is gated but does not suppress the idle
+    // wake.
+    resources.push({ source: "github", id: `open-pull:${lc(e.key)}`, active: pullIsOpen(e) && !g.gateMet && isOwn(e, ownPulls), subject: { kind: "pull", id: e.key } });
     if (!g.gateMet && g.missing !== null) reasons.push({ source: "github", code: "gate-not-met", detail: g.missing, at: input.now });
   }
   const wait = input.binding.wait ?? null;

@@ -355,16 +355,42 @@ describe("the composed answer equals today's assess() on the C1 characterization
 describe("the composed liveness is assess()'s (BB-399)", () => {
   /**
    * Every wait kind (live and not), no wait, a live structured source, and the
-   * three hold-like rows the idle rule reads.
+   * three hold-like rows the idle rule reads. The last two rows set `gatePulls`
+   * wider than `ownPulls`, as the reconcile always does, so the idle-blocking
+   * resource must follow `ownPulls` (BB-399 review round 1).
    */
-  const livenessCases = (): Array<[string, AssessmentInput]> => [
-    ["no wait", input({ binding: binding({ status: status("the vendor") }) })],
-    ...waitCases(),
-    ["live source", waitInput({ kind: "external", ref: "the vendor" }, { workers: [{ threadId: "thr_w1", status: "running" } as never] })],
-    ["hold", input({ binding: binding({ hold: "a freeze" }) })],
-    ["ending", input({ binding: binding({ ending: "terminal" }) })],
-    ["requeue ahead", input({ binding: binding({ requeueUntil: 1_000_000 + 86_400_000 }) })],
-  ];
+  const livenessCases = (): Array<[string, AssessmentInput]> => {
+    const linkedNotOwn = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
+    const teammate = pull({ key: "acme/web#9", url: "https://github.com/acme/web/pull/9" }, { headSha: "ccccccc3" });
+    return [
+      ["no wait", input({ binding: binding({ status: status("the vendor") }) })],
+      ...waitCases(),
+      ["live source", waitInput({ kind: "external", ref: "the vendor" }, { workers: [{ threadId: "thr_w1", status: "running" } as never] })],
+      ["hold", input({ binding: binding({ hold: "a freeze" }) })],
+      ["ending", input({ binding: binding({ ending: "terminal" }) })],
+      ["requeue ahead", input({ binding: binding({ requeueUntil: 1_000_000 + 86_400_000 }) })],
+      [
+        "ticket with a linked pull the worker has not reported",
+        input({
+          binding: binding({ stage: "build", phase: "In Progress" }),
+          observed: { entity: issue({ state: "In Progress" }), pulls: [linkedNotOwn] },
+          ownPulls: new Set<string>(),
+          gatePulls: new Set([linkedNotOwn.key.toLowerCase()]),
+          decisions: new Map([[linkedNotOwn.key.toLowerCase(), "user"]]),
+        }),
+      ],
+      [
+        "review binding on a pull whose head is not a worker's branch",
+        input({
+          binding: binding({ kind: "review", stage: "review", phase: "In Review", entityKey: teammate.key }),
+          observed: { entity: teammate, pulls: [] },
+          ownPulls: new Set<string>(),
+          gatePulls: new Set([teammate.key.toLowerCase()]),
+          decisions: new Map([[teammate.key.toLowerCase(), "user"]]),
+        }),
+      ],
+    ];
+  };
 
   it("derives idle and stalled equal to assess()'s for every row", () => {
     for (const [label, i] of livenessCases()) {
