@@ -102,7 +102,7 @@ import {
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mergeWorkaroundParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
-import { composeAssessment, type ComposedAssessment } from "./contribution.js";
+import { composeAssessment, type ComposedAssessment, type HoldContribution, type ResourceContribution } from "./contribution.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { ASK_ON_SLACK_CHOICE, NOT_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackCandidateLabel, slackNameCandidates, slackPersonKey, slackPersonLabel, slackPersonNotOnSlack, waitSlackAskOnceWhat, waitSlackInstruction, waitSlackTerminalWhat, type SlackCandidate, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
@@ -5637,7 +5637,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * unchanged.
      */
     function recordAssessed(b: Binding, input: AssessmentInput, composed: ComposedAssessment, assessment: Assessment): void {
-      store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness });
+      store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness, resources: composed.resources, holds: composed.holds });
       // The shadow's `noWakeSource` divergence is retired with the flag: the
       // two agree by construction now, so `wait_divergence_state` stops being
       // written and keeps its history. The other surfaces' rows still record.
@@ -15760,6 +15760,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const conflicts = conflictsOf(b, store.open(b.projectId));
         lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; file-level overlap: ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
       }
+      // BB-412 (C6): the composed resources and holds stored beside the
+      // assessment, read-only. No stored row prints neither block.
+      const assessment = store.assessment(b.id);
+      if (assessment !== null) {
+        const resources = (assessment.resources as ResourceContribution[] | null) ?? [];
+        const holds = (assessment.holds as HoldContribution[] | null) ?? [];
+        lines.push(`Composed resources: ${resources.length === 0 ? "none" : resources.map((r) => `${r.id}${r.active ? "" : " (inactive)"}`).join(", ")}`);
+        lines.push(`Composed holds: ${holds.filter((h) => h.held).map((h) => `${h.id}${h.behind.length === 0 ? "" : ` -> ${h.behind.join(", ")}`}`).join(", ") || "none"}`);
+      }
       for (const line of deploymentLines(b.deployments)) lines.push(`Deployment ${line}`);
       for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
       // BB-335: the binding's recorded non-actions, newest day first. Information only: they never become a need, a button or a count.
@@ -16995,7 +17004,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             description: "Every place the shadow assessment disagrees with the predicate it will replace, one row per distinct (binding, surface, old, new) with a first/last seen time and a count. --binding filters by binding id or entity key, --surface by surface name. --json emits the rows. Nothing reads the log to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's divergences (binding id or entity key)" },
-              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, hasLiveWakeSource, approvals.gate, approvals.pageRefusal, noWakeSource, compose.waits, compose.holds)" },
+              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, hasLiveWakeSource, approvals.gate, approvals.pageRefusal, noWakeSource, compose.waits, compose.holds, compose.resources)" },
               project: PROJECT_OPTION,
               json: JSON_OPTION,
             },
@@ -17222,7 +17231,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               }
               const b = bindingOrThrow(key, input.options.project ?? ctx.projectId);
               const config = await loadConfig(b.projectId);
-              const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id), assumptions: store.assumptions(b.id) };
+              const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id), assumptions: store.assumptions(b.id), assessment: store.assessment(b.id) };
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ...detail, projectSource: config?.source.kind ?? null }) };
               const lines = bindingShowLines(b, config);
               return { exitCode: 0, stdout: lines.join("\n") };

@@ -10,6 +10,7 @@ import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, compare, ownPullEntities, waitOverdueMs, type AssessmentInput } from "./assessment.js";
 import { parsePlaybook, type Playbook } from "./config.js";
+import { composeAssessment } from "./contribution.js";
 import { comment, issue, parkedWorker, pull } from "./fixtures.js";
 import { approvalMarkerLine } from "./gate.js";
 import { formatDivergences } from "./server.js";
@@ -284,6 +285,63 @@ describe("the shadow assessment: the liveness (bb-plugins#294 and noWakeSource)"
     const other = pull({ key: "acme/web#9", url: "https://github.com/acme/web/pull/9" });
     const entities = ownPullEntities({ entity: issue(), pulls: [mine, other] }, own(mine));
     expect(entities.map((e) => e.key)).toEqual(["acme/web#7"]);
+  });
+});
+
+// BB-412 (C6): the composed resources and holds. Each old side is derived from
+// the raw rows, never from `composed.resources`/`composed.holds`, so a
+// hand-built composed answer that differs records a real divergence.
+describe("the composed resources and holds divergences (BB-412, C6)", () => {
+  it("records a compose.resources row when the composer has a resource the rows do not", () => {
+    const i = input();
+    const composed = composeAssessment(i);
+    const extra = { ...composed, resources: [...composed.resources, { source: "github" as const, id: "linked-pull:acme/web#99", active: true, subject: null }] };
+    const rows = compare(i, assess(i), extra).filter((d) => d.surface === "compose.resources");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.old).not.toContain("linked-pull:acme/web#99");
+    expect(rows[0]!.new).toContain("linked-pull:acme/web#99:true");
+    expect(rows[0]!.inputs).toMatchObject({ binding: "b1", linkedPulls: 0 });
+  });
+
+  it("records a compose.resources row when a resource the rows have is missing", () => {
+    const i = input();
+    const composed = composeAssessment(i);
+    const missing = { ...composed, resources: composed.resources.filter((r) => r.id !== "workers") };
+    const rows = compare(i, assess(i), missing).filter((d) => d.surface === "compose.resources");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.old).toContain("workers:false");
+    expect(rows[0]!.new).not.toContain("workers:false");
+    expect(rows[0]!.inputs).toMatchObject({ binding: "b1" });
+  });
+
+  it("records a compose.holds row when a hold disagrees", () => {
+    const i = input({ binding: binding({ mergeBehind: ["ENG-13"] }) });
+    const composed = composeAssessment(i);
+    const flipped = { ...composed, holds: composed.holds.map((h) => (h.id === "merge-behind" ? { ...h, held: false } : h)) };
+    const rows = compare(i, assess(i), flipped).filter((d) => d.surface === "compose.holds");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.old).toContain("merge-behind:true");
+    expect(rows[0]!.new).toContain("merge-behind:false");
+    // The inputs hold the ids and booleans, never the composer's output.
+    expect(rows[0]!.inputs).toMatchObject({ binding: "b1", mergeBehind: "ENG-13" });
+  });
+
+  it("names the intended difference: a linked pull no worker reported is a linked-pull resource but not idle-blocking", () => {
+    const linked = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
+    const i = input({
+      binding: binding({ stage: "build", phase: "In Progress" }),
+      observed: { entity: issue({ state: "In Progress" }), pulls: [linked] },
+      ownPulls: new Set<string>(),
+      gatePulls: new Set([linked.key.toLowerCase()]),
+      decisions: new Map([[linked.key.toLowerCase(), "user"]]),
+      workers: [parkedWorker()],
+    });
+    const composed = composeAssessment(i);
+    expect(composed.resources).toEqual(expect.arrayContaining([expect.objectContaining({ id: "linked-pull:acme/web#8", active: true })]));
+    // The linked pull is not an own pull and the parked worker is not running,
+    // so neither suppresses the idle wake, and there is no divergence.
+    expect(composed.liveness.idle).toBe(true);
+    expect(compare(i, assess(i), composed).filter((d) => d.surface.startsWith("compose."))).toEqual([]);
   });
 });
 

@@ -15,6 +15,7 @@
 import { composeAssessment, pullGate, type ComposedAssessment } from "./contribution.js";
 import { latestReviewMarker, type PrGate, type ProjectApprovalRecord } from "./gate.js";
 import { parsePullRef } from "./github.js";
+import { gateState } from "./ready-gate.js";
 import { anyWorkerInFlight, productGateOptions, runningWorkerReason, stuckDue } from "./reconcile.js";
 import { hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
@@ -117,7 +118,7 @@ export type AssessmentInput = {
   binding: Pick<
     Binding,
     "id" | "entityKey" | "kind" | "ready" | "stage" | "ending" | "hold" | "deployments" | "requeueUntil" | "noWakeSource" | "status" | "createdAt" | "advancedAt" | "phase"
-  > & { wait?: Binding["wait"]; waitSince?: number | null };
+  > & { wait?: Binding["wait"]; waitSince?: number | null; holdBehind?: Binding["holdBehind"]; mergeBehind?: Binding["mergeBehind"] };
   /**
    * Fresh snapshots of the binding's waited `pull`/`review` refs (BB-333),
    * keyed by lowercased `owner/repo#N`. Read by the look, never stored in the
@@ -170,6 +171,30 @@ export type AssessmentInput = {
 };
 
 const lc = (s: string | null | undefined): string => (s ?? "").toLowerCase();
+
+/**
+ * BB-412 (C6): the lowercased pull keys leased to a binding as linked pulls:
+ * a ticket's open linked pulls, read from the observation the look already
+ * holds. It mirrors `leasedPulls` in server.ts, which reads the stored
+ * snapshot; the composer and `compare` both derive from it so a drift is a
+ * composer bug, never a second data source.
+ */
+export function leasedLinkedPullKeys(input: Pick<AssessmentInput, "binding" | "observed">): string[] {
+  if (input.binding.kind !== "ticket") return [];
+  const pulls = input.observed.pulls;
+  const keys = new Set<string>(pulls.map((p) => p.key));
+  for (const l of input.observed.entity.linkedPulls) if (l.key !== null) keys.add(l.key);
+  return [...keys].filter((k) => {
+    const seen = pulls.find((p) => lc(p.key) === lc(k));
+    return seen === undefined || !["closed", "merged"].includes(lc(seen.state));
+  });
+}
+
+/** BB-412 (C6): the lowercased pull key a `pull`/`review` typed wait leases, or null. */
+export function waitedPullKey(wait: Wait | null): string | null {
+  if (wait === null || (wait.kind !== "pull" && wait.kind !== "review")) return null;
+  return waitPullKey(wait.ref);
+}
 
 /** Whether an observed entity is one of the binding's own pull requests (BB-52 rule 0). */
 export const isOwn = (e: EntitySnapshot, own: ReadonlySet<string>): boolean =>
@@ -383,9 +408,12 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  * `compose.holds` (BB-387/C3 retired `compose.gate`, since the gate now comes
  * from the composed answer and cannot diverge from it; BB-400/C5 retired
  * `compose.liveness`, since `assess()` now reads idle and stalled from the
- * composed answer and they cannot diverge either). The composed answer is a
+ * composed answer and they cannot diverge either). BB-412 (C6) completes
+ * `compose.holds` and adds `compose.resources`. The composed answer is a
  * refactor of today's derivation, so a row on one of them is a defect, not a
- * fixture. The comparison runs only when the caller passes the composed
+ * fixture. Each old side is derived here from the raw rows (the binding, the
+ * snapshot, the deployments and the workers), never from the composer's own
+ * output. The comparison runs only when the caller passes the composed
  * answer; the C1 characterization tests call `compare` without one and see the
  * seven surfaces they pin.
  */
@@ -464,10 +492,63 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
       if (composedWaitText !== assessedWaitText) add("compose.waits", assessedWaitText, composedWaitText, { binding: binding.id, kind: assessment.wait.kind });
     }
 
-    // The binding's holds: `idleInActiveStage` reads hold, ending and requeue.
-    const assessedHolds = [binding.hold !== null ? "hold" : null, binding.ending !== null ? "ending" : null, binding.requeueUntil !== null ? `requeue:${binding.requeueUntil > input.now}` : null].filter((x) => x !== null).join(",");
-    const composedHolds = composed.holds.map((h) => (h.id === "requeue" ? `requeue:${h.held}` : h.id)).join(",");
-    if (assessedHolds !== composedHolds) add("compose.holds", assessedHolds, composedHolds, { binding: binding.id });
+    // BB-412 (C6): the binding's holds, derived from the raw fields. The
+    // ready-gate hold is held while the binding is in the spec stage (the
+    // playbook's Todo) and the ready gate has not passed.
+    const holdBehind = binding.holdBehind ?? [];
+    const mergeBehind = binding.mergeBehind ?? [];
+    const readyPassed = gateState(input.playbook, binding.ready, input.currentSpecHash).passed;
+    const assessedHolds = [
+      `hold:${binding.hold !== null}`,
+      `ending:${binding.ending !== null}`,
+      `requeue:${binding.requeueUntil !== null && binding.requeueUntil > input.now}`,
+      `behind:${holdBehind.length > 0}`,
+      `merge-behind:${mergeBehind.length > 0}`,
+      `ready-gate:${binding.stage === "spec" && !readyPassed}`,
+    ].join(",");
+    const composedHolds = composed.holds.map((h) => `${h.id}:${h.held}`).join(",");
+    if (assessedHolds !== composedHolds) {
+      add("compose.holds", assessedHolds, composedHolds, {
+        binding: binding.id,
+        hold: binding.hold !== null,
+        ending: binding.ending !== null,
+        requeue: binding.requeueUntil !== null && binding.requeueUntil > input.now,
+        behind: holdBehind.join(","),
+        mergeBehind: mergeBehind.join(","),
+        readyPassed,
+        stage: binding.stage,
+      });
+    }
+
+    // BB-412 (C6): the composed resources against the rows. `active` is
+    // whether the resource is live; the idle wake still reads the own-pull
+    // (`open-pull`) resources, so a linked pull no worker reported, a parked
+    // worker, an unsettled deployment and a live waited pull are resources
+    // whose effect on idle is the named fixture, not a divergence. The two
+    // sides are sorted so contributor order never reads as a difference.
+    const gateMetByPull = new Map(assessment.gate.pulls.map((p) => [lc(p.pull), p.met]));
+    const assessedResources: string[] = [];
+    for (const e of ownPullEntities(observed, input.gatePulls ?? ownPulls)) {
+      assessedResources.push(`open-pull:${lc(e.key)}:${pullIsOpen(e) && !(gateMetByPull.get(lc(e.key)) ?? false) && isOwn(e, ownPulls)}`);
+    }
+    for (const key of leasedLinkedPullKeys(input)) assessedResources.push(`linked-pull:${lc(key)}:true`);
+    const waitedKey = waitedPullKey(binding.wait ?? null);
+    if (waitedKey !== null) assessedResources.push(`waited-pull:${waitedKey}:${typedWaitLive(binding.wait!, input)}`);
+    for (const [key, w] of Object.entries(binding.deployments)) assessedResources.push(`deployment:${lc(key)}:${w.state === "merged" || w.state === "deploying"}`);
+    assessedResources.push(`workers:${anyWorkerInFlight(workers)}`);
+    const composedResources = composed.resources.map((r) => `${r.id}:${r.active}`);
+    assessedResources.sort();
+    composedResources.sort();
+    if (assessedResources.join(",") !== composedResources.join(",")) {
+      add("compose.resources", assessedResources.join(","), composedResources.join(","), {
+        binding: binding.id,
+        resources: composed.resources.length,
+        workers: workers.length,
+        deployments: Object.keys(binding.deployments).length,
+        linkedPulls: leasedLinkedPullKeys(input).length,
+        waitKind: binding.wait?.kind ?? null,
+      });
+    }
   }
   return out;
 }
