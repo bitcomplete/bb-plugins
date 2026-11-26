@@ -5932,6 +5932,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (Object.values(deployments).some((w) => (w.state === "merged" || w.state === "deploying") && !isFinalDeploymentState(w.deploymentState))) scheduleDeploymentPoll(b.id);
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
       }
+      // BB-411: a stored `deployment` wait whose watch has settled is released
+      // even when the settle queued no loud line (the re-evaluation path above
+      // settles a watch with only a log). The stale wait is cleared and the
+      // change line wakes the waiter.
+      const releasedDeploymentWait = deploymentWaitRelease(b, deployments);
+      if (releasedDeploymentWait !== null) {
+        b = store.patch(b.id, { wait: null, waitSince: null, waitNudgedAt: null });
+        deploymentChanges.push({ text: releasedDeploymentWait, actionable: true });
+      }
       const awaitingDeploy = deployTargets.length > 0 && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
 
       // The assignee set follows the entity's own source: a Linear ticket the
@@ -8436,14 +8445,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // the steward only for a settled watch or the first undecidable
               // one.
               const evaluated = await evaluateAppliedDeployment(applied.deployments, before, target, moved, now());
-              b = store.patch(b.id, { deployments: evaluated.deployments });
+              // BB-411: a stored `deployment` wait whose watch settled here is
+              // released, so a quiet settlement note still wakes the waiter.
+              const released = deploymentWaitRelease(b, evaluated.deployments);
+              b = store.patch(b.id, { deployments: evaluated.deployments, ...(released === null ? {} : { wait: null, waitSince: null, waitNudgedAt: null }) });
               // BB-203 regression: a doorbell settles the watch here, so the
               // reconcile that follows sees no edge and never writes the
               // deployed status. Write it at the settle instead.
               const settled = deploymentSettled(before, evaluated.deployments);
               if (settled !== null) b = patchMechanicalStatus(b, { kind: "deployed", ...settled });
-              b = store.note(b.id, [line, ...evaluated.notes].join("; "), !evaluated.wake);
-              if (evaluated.wake) {
+              const wake = evaluated.wake || released !== null;
+              b = store.note(b.id, [line, ...evaluated.notes, ...(released === null ? [] : [released])].join("; "), !wake);
+              if (wake) {
                 bb.log.info(`stewards: deployment ${deployment.id} (${state}) on ${repo} ${target.environment} concerns ${applied.changed.join(", ")}`);
                 scheduleReconcile(b.id);
               }
@@ -9465,6 +9478,48 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         scheduleReconcile(h.id);
       }
       bb.log.info(`stewards: ${b.entityKey} ${how}; released the typed binding wait on ${waiting.map((h) => h.entityKey).join(", ")}`);
+    }
+
+    /**
+     * BB-411: wake every open binding whose stored `person` wait names the page
+     * item that just closed. A plain `qst_` close wakes only the project
+     * steward, so the binding that reported the wait would otherwise sleep to
+     * its requeue. The item's own binding is already noted and woken by the
+     * `esc_`/`need_` close path, so it is cleared without a second note. Either
+     * way the stale wait is cleared, so the next look cannot re-derive it live.
+     */
+    function releasePersonWaitsForQuestion(q: Question): void {
+      const escalationId = q.escalationId;
+      const already = escalationId === null ? null : store.escalation(escalationId)?.bindingId ?? null;
+      const refs = new Set([lc(q.id), ...(escalationId === null ? [] : [lc(escalationId)])]);
+      const waiting = store.open(q.projectId).filter((h) => h.wait?.kind === "person" && refs.has(lc(h.wait.ref)));
+      if (waiting.length === 0) return;
+      for (const h of waiting) {
+        const ref = h.wait!.ref;
+        if (h.id !== already) store.note(h.id, `${ref}, which you waited on, closed. The wait is cleared; report what you are waiting on next, or carry on.`);
+        store.patch(h.id, { wait: null, waitSince: null, waitNudgedAt: null });
+        scheduleReconcile(h.id);
+      }
+      bb.log.info(`stewards: question ${q.id} closed; released the typed person wait on ${waiting.map((h) => h.entityKey).join(", ")}`);
+    }
+
+    /**
+     * BB-411: a stored `deployment` wait is live while a watch keyed by its
+     * pull is `merged` or `deploying`. Once every such watch has settled
+     * (`deployed` or `failed`), the wait is not-live; return the actionable
+     * change line that releases it, or null when there is nothing to release.
+     * The caller clears the stale wait, so the next look cannot re-derive it
+     * live.
+     */
+    function deploymentWaitRelease(b: Binding, deployments: Binding["deployments"]): string | null {
+      const wait = b.wait;
+      if (wait === null || wait.kind !== "deployment") return null;
+      const parsed = parsePullRef(wait.ref);
+      if (parsed === null) return null;
+      const key = `${parsed.repo}#${parsed.number}`.toLowerCase();
+      if (Object.values(deployments).some((w) => lc(w.key) === key && (w.state === "merged" || w.state === "deploying"))) return null;
+      const watch = Object.values(deployments).find((w) => lc(w.key) === key);
+      return `${wait.ref}, which you waited on, ${watch?.state === "failed" ? "failed" : "settled"}. The wait is cleared; report what you are waiting on next, or carry on.`;
     }
 
     /**
@@ -12741,6 +12796,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (!q.choices.includes(chosen)) return { ok: false, message: `"${chosen}" is not one of the choices: ${q.choices.join(", ")}.` };
           const guidance = text === null ? chosen : `${chosen} — ${text}`;
           store.answer(q.id, `Chose: ${chosen}${text === null ? "" : ` — ${text}`}`, "user", guidance);
+          // BB-411: the question is closed, so release a `person` wait on it.
+          releasePersonWaitsForQuestion(q);
           // BB-328 Part 2: the owner's Review PR/Drop item for a playbook
           // refresh. Drop closes the pull request and declines the refresh, so
           // the next nightly pass does not re-queue it; Review PR leaves the
@@ -12797,6 +12854,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Ambiguous: close the question, keep the escalation, and send it
           // back to the project steward to interpret.
           store.answerQuestionOnly(q.id, text, "user");
+          // BB-411: the question is closed, so release a `person` wait on it.
+          releasePersonWaitsForQuestion(q);
           store.addGuidance(b.id, text, "user");
           store.reroute(x.id, "project", x.recommendation);
           store.note(b.id, `The user answered approval ${x.id} on the stewards page, but not clearly enough to approve or decline: ${text}`);
@@ -12811,6 +12870,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // steward forwarded it, so it is told too: the user's answer is a
         // lesson candidate for its next wake (BB-35 step 1).
         store.answer(q.id, text, "user");
+        // BB-411: the question is closed, so release a `person` wait on it.
+        releasePersonWaitsForQuestion(q);
         if (x !== null && b !== null && b.endedAt === null) {
           const closure = withRationale(`The user answered ${b.entityKey}'s forwarded escalation on the Stewards page: ${JSON.stringify(text)}.`);
           store.addGuidance(b.id, text, "user");
@@ -12843,6 +12904,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const after = (closure: string): void => {
           store.note(b.id, closure);
           if (text !== null) store.addGuidance(b.id, text, "user");
+          // BB-411: clear a stale `person` wait naming this item (or the
+          // escalation it forwarded), so the next look cannot re-derive it
+          // live; the note above already wakes the binding.
+          const closedItems = new Set([lc(need.id), ...forwarded.map((x) => lc(x.id))]);
+          if (b.wait?.kind === "person" && closedItems.has(lc(b.wait.ref))) store.patch(b.id, { wait: null, waitSince: null, waitNudgedAt: null });
           scheduleReconcile(b.id);
         };
         const freshPull = async (): Promise<EntitySnapshot | null> => {
@@ -14815,6 +14881,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const out: string[] = [];
             if (closing !== null) {
               const closed = store.answer(closing.question.id, closing.answer, threadId);
+              // BB-411: a plain question closed from a thread wakes every binding
+              // whose stored `person` wait names it, just as the page close does.
+              if (closed) releasePersonWaitsForQuestion(closing.question);
               // A question the page boxed was asked; closing it from a thread
               // marks it shown, so a later repeat is not a second box at once.
               if (closing.question.rationaleWanted !== null) store.markEscalationRationaleAsked(closing.question.id);

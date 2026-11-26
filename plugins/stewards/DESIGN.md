@@ -563,9 +563,15 @@ on the merged-pulls edge — scans the project's open bindings for a stored
 case-insensitively, notes the waiter with what happened, clears the wait so
 the next look cannot re-derive it live, and schedules a reconcile whose wake
 carries the note as an actionable change line. A `binding` wait therefore
-behaves like `hold, behind` for waking. The other kinds whose liveness is a
-page item or a deployment watch are not released here: their close or settle
-is a different hook (BB-411).
+behaves like `hold, behind` for waking. A typed `person` or `deployment`
+wait is released by its own hook (BB-411), not by `releaseBehind`:
+`releasePersonWaitsForQuestion` runs when a page item closes (the page's
+answer, and a project steward's `resolve` of a plain question), and
+`deploymentWaitRelease` runs on the deployment-settle paths, including the
+re-evaluation loop that settles a watch with only a log. Each notes the
+waiter with what happened, clears the stale wait so the next look cannot
+re-derive it live, and schedules a reconcile whose wake carries the note as
+an actionable change line.
 
 ### Judgment tier
 
