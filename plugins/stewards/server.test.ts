@@ -1601,6 +1601,38 @@ describe("scheduling overlapping work", () => {
     expect(toProject().filter((s) => /scheduling requested/u.test(s.text))).toHaveLength(1);
   });
 
+  it("wakes a steward that reported a typed `binding` wait when the waited binding ends (BB-410)", async () => {
+    const { t, second, toSecond } = await two();
+    // ENG-13's steward waits on ENG-12 with a typed binding wait, no free text.
+    // The ref is lowercased: the match is case-insensitive.
+    await t.tool("steward_report", { ...building, wait: { kind: "binding", ref: "eng-12" } }, second);
+    const b13 = t.hooks.store.find("ENG-13")!;
+    expect(b13.wait).toEqual({ kind: "binding", ref: "eng-12" });
+    expect(b13.status?.waitingOn).toBeNull();
+    const wakes = toSecond().length;
+    // ENG-12 reaches Done with its pull request merged: the binding ends.
+    t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true }));
+    t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed", ...linked }));
+    await t.ring("linear", "uuid-12");
+    expect(toSecond().length).toBe(wakes + 1);
+    const wake = toSecond().at(-1)!.text;
+    expect(wake).toMatch(/ENG-12, which you waited on, (reached Done|ended \(terminal\))/u);
+    expect(wake).toMatch(/The wait is cleared; report what you are waiting on next/u);
+    // The stale wait is cleared, so the next look cannot re-derive it live.
+    expect(t.hooks.store.find("ENG-13")!.wait).toBeNull();
+  });
+
+  it("wakes a typed `binding` wait when the waited binding merges all its pull requests (BB-410)", async () => {
+    const { t, second, toSecond } = await two();
+    await t.tool("steward_report", { ...building, wait: { kind: "binding", ref: "ENG-12" } }, second);
+    const wakes = toSecond().length;
+    t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true }));
+    await t.ring("github", "acme/web#7");
+    expect(toSecond().length).toBe(wakes + 1);
+    expect(toSecond().at(-1)!.text).toMatch(/ENG-12, which you waited on, merged its pull requests/u);
+    expect(t.hooks.store.find("ENG-13")!.wait).toBeNull();
+  });
+
   it("lets a ticket start on the project steward's word, asks again only for a new overlap, and lifts a hold when the work it waits behind ends", async () => {
     const { t, project, second, toProject } = await two();
     await t.tool("steward_report", ready, second);

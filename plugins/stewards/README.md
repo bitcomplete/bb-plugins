@@ -531,6 +531,11 @@ install on a stock bb: one repository, no Linear, no hooks service.
   including ops: a `steward_report` derives the same sentence for its reply in
   the turn the wait is set, so the steward can act then, but stores nothing.
   The mark clears when a source appears or the wait is cleared.
+  A typed `binding` wait is delivered on the same edges a `behind` hold
+  lifts: when the waited binding merges all its pull requests or ends, the
+  plugin notes the waiter, clears the stale wait so the next look cannot
+  re-derive it live, and wakes it with a change line naming what happened
+  (BB-410). It then behaves like `hold, behind` for waking.
   Separately, the plugin counts consecutive wakes
   whose reason was `requeue` and whose report ended with the same trimmed
   `waitingOn`; at two (one plugin constant, not a `project.json` key) it

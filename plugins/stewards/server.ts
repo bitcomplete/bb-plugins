@@ -9445,6 +9445,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-410: deliver a typed `binding` wait on the same edges that lift a
+     * `behind` hold. Every open binding in the project whose stored wait names
+     * `b` — by entity key or binding id, case-insensitively — is noted with
+     * what happened, has the stale wait cleared so the next look cannot
+     * re-derive it live, and is scheduled for a reconcile, whose wake carries
+     * the note as an actionable change line. The wait then behaves like
+     * `steward_update { hold, behind }` for waking. A `binding` wait on an
+     * already ended binding is downgraded to `external` at report time
+     * (BB-339), so this only ever sees a wait that was live when reported.
+     */
+    async function releaseBindingWaits(b: Binding, open: readonly Binding[], how: string): Promise<void> {
+      const keys = new Set([lc(b.entityKey), lc(b.id)]);
+      const waiting = open.filter((h) => h.id !== b.id && h.wait?.kind === "binding" && keys.has(lc(h.wait.ref)));
+      if (waiting.length === 0) return;
+      for (const h of waiting) {
+        store.note(h.id, `${b.entityKey}, which you waited on, ${how}. The wait is cleared; report what you are waiting on next, or carry on.`);
+        store.patch(h.id, { wait: null, waitSince: null, waitNudgedAt: null });
+        scheduleReconcile(h.id);
+      }
+      bb.log.info(`stewards: ${b.entityKey} ${how}; released the typed binding wait on ${waiting.map((h) => h.entityKey).join(", ")}`);
+    }
+
+    /**
      * The work `b` was holding others behind has landed (`how`: its pull
      * requests merged, or it ended): take it off every hold that waits behind
      * it, lift the holds with nothing left to wait for, wake those stewards,
@@ -9457,8 +9480,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await releaseStack(b, b.lastSnapshot, how);
       // A merge hold on this binding lifts on the same endings (BB-256).
       await releaseMergeBehind(b, how);
+      // A typed `binding` wait on this binding wakes on the same endings
+      // (BB-410).
+      const open = store.open(b.projectId);
+      await releaseBindingWaits(b, open, how);
       const key = lc(b.entityKey);
-      const waiting = store.open(b.projectId).filter((h) => h.id !== b.id && h.holdBehind.some((k) => lc(k) === key));
+      const waiting = open.filter((h) => h.id !== b.id && h.holdBehind.some((k) => lc(k) === key));
       if (waiting.length === 0) return;
       const fullyLifted: Binding[] = [];
       for (const h of waiting) {
