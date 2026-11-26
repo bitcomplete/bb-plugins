@@ -6,7 +6,7 @@
 // BB-279: an owner's page approval and the project steward's decision deliver
 // to a parked worker by the same path (`deliverProjectApproval`).
 import { describe, expect, it, vi } from "vitest";
-import { approvalRef, approvePrPageAction, delegateWaitNames, delegateWaitText, deliverApproval, deliverProjectApproval, isDelegateWait, isUserThread, recordProjectDecision, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { approvalRef, approvePrPageAction, delegateWaitNames, delegateWaitText, deliverApproval, deliverProjectApproval, deliverReviewRound, isDelegateWait, isUserThread, recordProjectDecision, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { isSelfWidening } from "./decisions.js";
 import { prGate } from "./gate.js";
 import { comment, parkedWorker, pull } from "./fixtures.js";
@@ -162,6 +162,46 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
     expect(threadId).toBe(worker.threadId);
     expect(message).toContain("The owner approved");
     expect(message).toContain("merge it now");
+  });
+
+  it("delivers a changes-requested reviewer round to the parked worker (BB-409)", async () => {
+    const { ctx, worker, sendTo, note } = deliveryContext();
+    const entity = pull({ comments: [] }, green);
+    await expect(deliverReviewRound(ctx, { id: "b1" } as never, entity, { round: 1, verdict: "changes-requested", sha: head })).resolves.toBe("worker");
+    expect(sendTo).toHaveBeenCalledTimes(1);
+    const [threadId, message] = sendTo.mock.calls[0]!;
+    expect(threadId).toBe(worker.threadId);
+    expect(message).toContain("Reviewer round 1 on acme/web#7 at aaaaaaa: changes-requested");
+    expect(message).toContain("Address the blockers and re-request the round");
+    // The quiet note is the one `deliverApproval` writes on a successful delivery.
+    expect(note).toHaveBeenCalledWith("b1", "Reviewer round 1 on acme/web#7 at aaaaaaa: changes-requested; its worker was told.", true);
+  });
+
+  it("falls back to the steward when no parked worker can be reached (BB-409)", async () => {
+    const { ctx, sendTo, note, scheduleReconcile } = deliveryContext();
+    sendTo.mockResolvedValue("failed");
+    const entity = pull({ comments: [] }, green);
+    await expect(deliverReviewRound(ctx, { id: "b1" } as never, entity, { round: 2, verdict: "changes-requested", sha: head })).resolves.toBe("steward");
+    expect(scheduleReconcile).toHaveBeenCalledTimes(1);
+    const [, text, actionable] = note.mock.calls[0]!;
+    expect(text).toContain("Reviewer round 2 on acme/web#7 at aaaaaaa: changes-requested");
+    expect(text).toContain("Start a worker at the build-tickets review loop");
+    expect(actionable).toBe(false);
+  });
+
+  it("prefers the newest parked worker when the signed review worker has ended (BB-409)", async () => {
+    const { ctx, sendTo } = deliveryContext();
+    // Worker A signed the "Independent review running" comment and ended
+    // plainly; worker B is parked. The round must reach B, not fall back.
+    const ended = parkedWorker({ threadId: "thr_a", bindingId: "b1", status: "stopped", parkedWaitingOn: null });
+    const parked = parkedWorker({ threadId: "thr_b", bindingId: "b1" });
+    const store = ctx.store as unknown as { worker: (id: string) => unknown; workers: () => unknown[] };
+    store.worker = (id: string) => (id === ended.threadId ? ended : id === parked.threadId ? parked : null);
+    store.workers = () => [ended, parked];
+    const entity = pull({ comments: [comment({ id: "ir", author: "trotterdylan", body: "Independent review running in bb thread @thread:thr_a.", signedBy: "thr_a", createdAt: "2026-10-14T16:00:00Z" })] }, green);
+    await expect(deliverReviewRound(ctx, { id: "b1" } as never, entity, { round: 1, verdict: "changes-requested", sha: head })).resolves.toBe("worker");
+    expect(sendTo).toHaveBeenCalledTimes(1);
+    expect(sendTo.mock.calls[0]![0]).toBe("thr_b");
   });
 
   it("does not tell a teammate's review worker to merge", async () => {
