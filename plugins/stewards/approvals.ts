@@ -121,20 +121,30 @@ export async function deliverApproval(ctx: ApprovalsContext, b: Binding, entity:
 }
 
 /**
+ * The thread a reviewer round is delivered to: the worker that signed the
+ * newest "Independent review running" comment when it is parked, else the
+ * newest parked worker of the binding. A worker that ended plainly is not a
+ * target: the steward starts a fresh worker instead (BB-409).
+ */
+function parkedWorkerThreadFor(ctx: ApprovalsContext, b: Binding, entity: EntitySnapshot): string | null {
+  const signed = reviewWorkerThread(entity.comments);
+  const signedWorker = signed === null ? null : ctx.store.worker(signed);
+  if (signedWorker !== null && signedWorker.bindingId === b.id && signedWorker.parkedWaitingOn !== null) return signed;
+  return [...ctx.store.workers(b.id)].reverse().find((w) => w.status === "finished" && w.parkedWaitingOn !== null)?.threadId ?? null;
+}
+
+/**
  * Tell the pull request's parked worker that a changes-requested reviewer
  * round landed, so it addresses the blockers and re-requests the round without
  * a `github_watch` on the reviewer (BB-409). It goes through the same delivery
- * as `deliverApproval`: the worker that posted build-tickets' "Independent
- * review running" comment, else the newest worker still in flight. Returns
+ * as `deliverApproval` (the worker that posted build-tickets' "Independent
+ * review running" comment, else the newest parked worker), and returns
  * `worker` when it was told, `steward` when no parked worker could be reached
  * and the ticket steward must start one at the review loop.
  */
 export async function deliverReviewRound(ctx: ApprovalsContext, b: Binding, entity: EntitySnapshot, round: { round: number; verdict: string; sha: string }): Promise<"worker" | "steward"> {
-  const thread = workerThreadFor(ctx, b, entity);
-  // Only a worker that called `worker_park` waits on a round; one that ended
-  // plainly is done, so the steward starts a fresh worker instead (BB-409).
-  const parked = thread !== null && ctx.store.worker(thread)?.parkedWaitingOn !== null;
-  const info = thread === null || !parked ? null : await ctx.threadInfo(thread).catch(() => null);
+  const thread = parkedWorkerThreadFor(ctx, b, entity);
+  const info = thread === null ? null : await ctx.threadInfo(thread).catch(() => null);
   const what = `Reviewer round ${round.round} on ${entity.key} at ${ctx.shortSha(round.sha)}: ${round.verdict}`;
   const next = "Address the blockers and re-request the round (build-tickets, the review loop): push your fixes and tell the reviewer the new head.";
   if (info !== null && info.deletedAt === null && info.archivedAt === null) {

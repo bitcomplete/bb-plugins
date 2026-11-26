@@ -189,6 +189,21 @@ describe("an approval is delivered to a parked worker (BB-279)", () => {
     expect(actionable).toBe(false);
   });
 
+  it("prefers the newest parked worker when the signed review worker has ended (BB-409)", async () => {
+    const { ctx, sendTo } = deliveryContext();
+    // Worker A signed the "Independent review running" comment and ended
+    // plainly; worker B is parked. The round must reach B, not fall back.
+    const ended = parkedWorker({ threadId: "thr_a", bindingId: "b1", status: "stopped", parkedWaitingOn: null });
+    const parked = parkedWorker({ threadId: "thr_b", bindingId: "b1" });
+    const store = ctx.store as unknown as { worker: (id: string) => unknown; workers: () => unknown[] };
+    store.worker = (id: string) => (id === ended.threadId ? ended : id === parked.threadId ? parked : null);
+    store.workers = () => [ended, parked];
+    const entity = pull({ comments: [comment({ id: "ir", author: "trotterdylan", body: "Independent review running in bb thread @thread:thr_a.", signedBy: "thr_a", createdAt: "2026-10-14T16:00:00Z" })] }, green);
+    await expect(deliverReviewRound(ctx, { id: "b1" } as never, entity, { round: 1, verdict: "changes-requested", sha: head })).resolves.toBe("worker");
+    expect(sendTo).toHaveBeenCalledTimes(1);
+    expect(sendTo.mock.calls[0]![0]).toBe("thr_b");
+  });
+
   it("does not tell a teammate's review worker to merge", async () => {
     const { ctx, sendTo, githubReview } = deliveryContext();
     // A teammate's pull request (the author is not the viewer) approves with a

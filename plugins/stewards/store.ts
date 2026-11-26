@@ -1025,6 +1025,8 @@ export const statusRecordSchema = z.object({
   requeueAfterMs: z.number().nullable(),
   conditions: z.array(z.string()),
   resources: z.object({ workers: z.array(z.string()), pullRequests: z.array(z.string()), children: z.array(z.string()) }),
+  /** BB-409: the head a delivered reviewer-round phrase names, so a later checks event on another head clears it. Optional: a record written before the field reads as no round. */
+  roundHeadSha: z.string().nullable().optional(),
   at: z.number(),
 });
 export type StatusRecord = z.infer<typeof statusRecordSchema>;
@@ -1046,6 +1048,8 @@ export const storedStatusRecordSchema = z
     requeueAfterMs: z.number().nullable(),
     conditions: z.array(z.string()),
     resources: z.object({ workers: z.array(z.string()), pullRequests: z.array(z.string()), children: z.array(z.string()) }),
+    /** BB-409: optional, so a status written before the field reads as no round. */
+    roundHeadSha: z.string().nullable().optional(),
     at: z.number(),
   })
   .transform((s): StatusRecord => ({
@@ -1057,6 +1061,7 @@ export const storedStatusRecordSchema = z
     requeueAfterMs: s.requeueAfterMs,
     conditions: s.conditions,
     resources: s.resources,
+    roundHeadSha: s.roundHeadSha ?? null,
     at: s.at,
   }));
 

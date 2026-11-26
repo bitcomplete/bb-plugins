@@ -4667,7 +4667,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (told === "steward") {
         changes.push({ text: `Reviewer round ${marker.round} on ${pull.key} at ${shortSha(marker.sha)}: ${marker.verdict}. Start a worker at the build-tickets review loop to address the blockers and re-request the round.`, actionable: true });
       }
-      return { kind: "round", pull: pull.key, round: marker.round, verdict: marker.verdict, told: told === "worker" };
+      return { kind: "round", pull: pull.key, round: marker.round, verdict: marker.verdict, told: told === "worker", headSha: marker.sha };
     }
 
     /**
@@ -10370,7 +10370,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // falling back to the stored snapshot when the read fails (BB-54).
       const fresh = await freshObserved(b);
       const observed = fresh?.observed ?? b.lastSnapshot;
-      if (observed !== null) await syncNeeds(b, observed, playbook);
+      if (observed === null) return;
+      const events = await syncNeeds(b, observed, playbook);
+      // BB-409: this report-path sync is a trigger for the reviewer-round
+      // delivery, so its mechanical events (the round status phrase) must be
+      // applied here too; the reconcile that later sees the same round is
+      // deduped and returns no event.
+      let next = store.binding(b.id) ?? b;
+      for (const event of events) next = patchMechanicalStatus(next, event);
     }
 
     /**
@@ -13722,10 +13729,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "worker_park",
       description:
-        "End a worker's turn parked on something outside it. The plugin leaves this worker unarchived and wakes it for exactly three waits: a reviewer's round, the approver's decision, and the no-review gate becoming met. A wait on anything else — checks, a build, a deployment — is not delivered by the plugin: set a `github_watch` on it too, so the turn resumes. Call it as your last action before ending a turn you are not finishing; a turn that ends without it is a plain finish and the plugin treats the worker as done.",
+        "End a worker's turn parked on something outside it. Call this as your last action whenever you end a turn on a wait: the plugin leaves the worker unarchived and shows it as parked. The plugin delivers only three waits to a parked worker: a changes-requested reviewer round, the approver's decision, and the no-review gate becoming met. A wait on anything else — checks, a build, a deployment — is not delivered by the plugin: set a `github_watch` on it too, so the turn resumes. A turn that ends without this call is a plain finish and the plugin treats the worker as done.",
       presentation: { label: { pending: "Parking", completed: "Parked" } },
       parameters: z.object({
-        waitingOn: z.string().trim().min(1).max(300).describe("What the turn waits on: a reviewer's round, the approver's decision, the no-review gate. A wait on anything else (checks, a build, a deployment) also needs a `github_watch`. Free text, shown on the finish note."),
+        waitingOn: z.string().trim().min(1).max(300).describe("What the turn waits on. The plugin delivers a changes-requested reviewer round, the approver's decision and the no-review gate; a wait on anything else (checks, a build, a deployment) also needs a `github_watch`. Free text, shown on the finish note."),
       }),
       execute: store.coalescingTool(async (input, { threadId }) => {
         const worker = store.worker(threadId);

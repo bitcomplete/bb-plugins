@@ -794,11 +794,11 @@ export function idleInActiveStage(b: IdleBinding, observed: Observed, now: numbe
 export type MechanicalEvent =
   | { kind: "approved"; pull: string }
   | { kind: "merged"; pull: string }
-  | { kind: "checks"; pull: string; state: string; failing: readonly string[] }
+  | { kind: "checks"; pull: string; state: string; failing: readonly string[]; headSha: string | null }
   | { kind: "deployed"; pull: string }
   // BB-409: a changes-requested reviewer round was delivered, so the page and
   // sidebar name the round and verdict instead of the steward's stale wait.
-  | { kind: "round"; pull: string; round: number; verdict: string; told: boolean };
+  | { kind: "round"; pull: string; round: number; verdict: string; told: boolean; headSha: string | null };
 
 /** The phrase a checks result folds into (BB-203): the summary stays the steward's. */
 export const checksPhrase = (state: string, failing: readonly string[]): string =>
@@ -806,9 +806,6 @@ export const checksPhrase = (state: string, failing: readonly string[]): string 
 
 /** The reviewer's verdict as the status phrase reads it (BB-409): `changes-requested` reads with a space. */
 export const roundVerdictPhrase = (verdict: string): string => (verdict === "changes-requested" ? "changes requested" : verdict);
-
-/** Whether a status `nextAction` is a delivered reviewer round's phrase (BB-409). */
-const isRoundPhrase = (nextAction: string): boolean => /^reviewer round \d+: .+; (?:worker|steward) told$/u.test(nextAction);
 
 /**
  * The status record the plugin writes on an event it observed itself (BB-203),
@@ -824,19 +821,21 @@ export function mechanicalStatus(prev: StatusRecord | null, event: MechanicalEve
   const base = { ...prev, actor, at };
   switch (event.kind) {
     case "approved":
-      return { ...base, summary: `Approved ${event.pull}.`, nextAction: "The worker merges it." };
+      return { ...base, summary: `Approved ${event.pull}.`, nextAction: "The worker merges it.", roundHeadSha: null };
     case "merged":
-      return { ...base, summary: `Merged ${event.pull}.`, nextAction: "Awaiting deployment." };
+      return { ...base, summary: `Merged ${event.pull}.`, nextAction: "Awaiting deployment.", roundHeadSha: null };
     case "checks":
-      // BB-409: a delivered round is the live next action; a later checks event
-      // must not overwrite it with the older "checks passed" phrase.
-      return { ...base, nextAction: isRoundPhrase(prev.nextAction) ? prev.nextAction : checksPhrase(event.state, event.failing) };
+      // BB-409: a delivered round is the live next action for its own head; a
+      // checks event on that head keeps the phrase, one on a new head clears it.
+      return prev.roundHeadSha !== null && prev.roundHeadSha === event.headSha
+        ? { ...base, roundHeadSha: prev.roundHeadSha }
+        : { ...base, nextAction: checksPhrase(event.state, event.failing), roundHeadSha: null };
     case "deployed":
-      return { ...base, summary: `Deployed ${event.pull}.`, nextAction: "Close the ticket." };
+      return { ...base, summary: `Deployed ${event.pull}.`, nextAction: "Close the ticket.", roundHeadSha: null };
     case "round":
       // BB-409: the round and its verdict, and who was told, so the row does
       // not keep the steward's stale "reviewer running the first round".
-      return { ...base, nextAction: `reviewer round ${event.round}: ${roundVerdictPhrase(event.verdict)}; ${event.told ? "worker" : "steward"} told` };
+      return { ...base, nextAction: `reviewer round ${event.round}: ${roundVerdictPhrase(event.verdict)}; ${event.told ? "worker" : "steward"} told`, roundHeadSha: event.headSha };
   }
 }
 
@@ -854,8 +853,12 @@ export function ownPullMerged(before: Observed, after: Observed, ownPulls: Reado
   return null;
 }
 
-/** Checks that settled on an own pull request between two observations, if any (BB-203). */
-export function ownChecksFinished(before: Observed, after: Observed, ownPulls: ReadonlySet<string>): { pull: string; state: string; failing: string[] } | null {
+/**
+ * Checks that settled on an own pull request between two observations, if any
+ * (BB-203). A push to a new head also counts, even while its checks are still
+ * pending, so a status phrase naming the old head's round is replaced (BB-409).
+ */
+export function ownChecksFinished(before: Observed, after: Observed, ownPulls: ReadonlySet<string>): { pull: string; state: string; failing: string[]; headSha: string | null } | null {
   const was = new Map<string, EntitySnapshot>();
   for (const e of [before.entity, ...before.pulls]) if (e.pull !== null) was.set(e.key.toLowerCase(), e);
   for (const e of [after.entity, ...after.pulls]) {
@@ -863,8 +866,10 @@ export function ownChecksFinished(before: Observed, after: Observed, ownPulls: R
     const prev = was.get(e.key.toLowerCase());
     const bChecks = prev?.pull?.checks?.state ?? null;
     const aChecks = e.pull.checks?.state ?? null;
-    if (aChecks === null || !SETTLED.has(aChecks)) continue;
-    if (bChecks !== aChecks || !same(prev?.pull?.checks?.failing ?? [], e.pull.checks?.failing ?? [])) return { pull: e.key, state: aChecks, failing: e.pull.checks?.failing ?? [] };
+    if (aChecks === null) continue;
+    const headMoved = prev !== undefined && prev.pull?.headSha !== e.pull.headSha;
+    if (!SETTLED.has(aChecks) && !headMoved) continue;
+    if (headMoved || bChecks !== aChecks || !same(prev?.pull?.checks?.failing ?? [], e.pull.checks?.failing ?? [])) return { pull: e.key, state: aChecks, failing: e.pull.checks?.failing ?? [], headSha: e.pull.headSha ?? null };
   }
   return null;
 }

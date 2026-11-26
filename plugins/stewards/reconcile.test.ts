@@ -1254,25 +1254,29 @@ describe("mechanical status and the user's open items (BB-203)", () => {
     expect(mechanicalStatus(status(), { kind: "merged", pull: "acme/web#7" }, false, 5)).toMatchObject({ summary: "Merged acme/web#7.", nextAction: "Awaiting deployment.", actor: "other" });
     expect(mechanicalStatus(status(), { kind: "deployed", pull: "acme/web#7" }, false, 5)).toMatchObject({ summary: "Deployed acme/web#7.", nextAction: "Close the ticket.", actor: "steward" });
     // Checks fold into the phrase and leave the summary alone.
-    expect(mechanicalStatus(status(), { kind: "checks", pull: "acme/web#7", state: "success", failing: [] }, false, 5)).toMatchObject({ summary: "Building.", nextAction: "checks passed" });
+    expect(mechanicalStatus(status(), { kind: "checks", pull: "acme/web#7", state: "success", failing: [], headSha: "aaaaaaa1" }, false, 5)).toMatchObject({ summary: "Building.", nextAction: "checks passed" });
     expect(checksPhrase("failure", ["ci"])).toBe("checks failure (failing: ci)");
   });
 
   it("names the reviewer round, its verdict and who was told for a delivered round (BB-409)", () => {
     // A changes-requested round reads with a space, so the page and sidebar
     // name it instead of the steward's stale "reviewer running the first round".
-    expect(mechanicalStatus(status(), { kind: "round", pull: "acme/web#7", round: 1, verdict: "changes-requested", told: true }, false, 5)).toMatchObject({
+    expect(mechanicalStatus(status(), { kind: "round", pull: "acme/web#7", round: 1, verdict: "changes-requested", told: true, headSha: "aaaaaaa1" }, false, 5)).toMatchObject({
       summary: "Building.",
       nextAction: "reviewer round 1: changes requested; worker told",
+      roundHeadSha: "aaaaaaa1",
     });
-    expect(mechanicalStatus(status(), { kind: "round", pull: "acme/web#7", round: 2, verdict: "changes-requested", told: false }, false, 5)).toMatchObject({
+    expect(mechanicalStatus(status(), { kind: "round", pull: "acme/web#7", round: 2, verdict: "changes-requested", told: false, headSha: "bbbbbbb2" }, false, 5)).toMatchObject({
       nextAction: "reviewer round 2: changes requested; steward told",
+      roundHeadSha: "bbbbbbb2",
     });
-    // A later checks event must not overwrite the live round phrase (BB-409).
-    const roundStatus = mechanicalStatus(status(), { kind: "round", pull: "acme/web#7", round: 1, verdict: "changes-requested", told: true }, false, 5)!;
-    expect(mechanicalStatus(roundStatus, { kind: "checks", pull: "acme/web#7", state: "success", failing: [] }, false, 6)).toMatchObject({ nextAction: "reviewer round 1: changes requested; worker told" });
-    // Once the steward reports again, a checks event folds as before.
-    expect(mechanicalStatus({ ...roundStatus, nextAction: "Wait" }, { kind: "checks", pull: "acme/web#7", state: "success", failing: [] }, false, 6)).toMatchObject({ nextAction: "checks passed" });
+    // A checks event on the round's own head keeps the phrase.
+    const roundStatus = mechanicalStatus(status(), { kind: "round", pull: "acme/web#7", round: 1, verdict: "changes-requested", told: true, headSha: "aaaaaaa1" }, false, 5)!;
+    expect(mechanicalStatus(roundStatus, { kind: "checks", pull: "acme/web#7", state: "success", failing: [], headSha: "aaaaaaa1" }, false, 6)).toMatchObject({ nextAction: "reviewer round 1: changes requested; worker told", roundHeadSha: "aaaaaaa1" });
+    // A checks event on a new head clears it, so the phrase never outlives its head.
+    expect(mechanicalStatus(roundStatus, { kind: "checks", pull: "acme/web#7", state: "success", failing: [], headSha: "bbbbbbb2" }, false, 6)).toMatchObject({ nextAction: "checks passed", roundHeadSha: null });
+    // An approval clears it too.
+    expect(mechanicalStatus(roundStatus, { kind: "approved", pull: "acme/web#7" }, false, 6)).toMatchObject({ nextAction: "The worker merges it.", roundHeadSha: null });
   });
 
   it("keeps actor user only while a need or me escalation is open, and never invents a first report", () => {
@@ -1291,8 +1295,11 @@ describe("mechanical status and the user's open items (BB-203)", () => {
     // Already merged is not a new transition.
     expect(ownPullMerged(merged, merged, own)).toBeNull();
     const checked = { entity: issue({ state: "In Progress" }), pulls: [pull({}, { checks: { state: "success", failing: [] } })] };
-    expect(ownChecksFinished(open, checked, own)).toEqual({ pull: "acme/web#7", state: "success", failing: [] });
+    expect(ownChecksFinished(open, checked, own)).toEqual({ pull: "acme/web#7", state: "success", failing: [], headSha: "aaaaaaa1" });
     expect(ownChecksFinished(checked, checked, own)).toBeNull();
+    // A push to a new head fires even while the new head's checks are pending (BB-409).
+    const pushed = { entity: issue({ state: "In Progress" }), pulls: [pull({}, { headSha: "bbbbbbb2", checks: { state: "pending", failing: [] } })] };
+    expect(ownChecksFinished(checked, pushed, own)).toEqual({ pull: "acme/web#7", state: "pending", failing: [], headSha: "bbbbbbb2" });
   });
 
   it("finds a deployment watch that settled to deployed", () => {
