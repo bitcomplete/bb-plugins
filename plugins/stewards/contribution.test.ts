@@ -247,11 +247,13 @@ describe("the github contributor (BB-380)", () => {
     expect(gate.map((g) => [g.met, g.missing, g.lane, g.escalated, g.product])).toEqual(a.gate.pulls.map((p) => [p.met, p.missing, p.decision, p.escalated, p.reason === "product"]));
   });
 
-  it("contributes one open-pull resource per own pull, inactive once gate-met", () => {
+  it("contributes one open-pull resource per own pull, inactive once gate-met, and a linked-pull resource per leased linked pull", () => {
     const resources = githubContributor.contribute(matrix("ticket", "build")).resources;
     expect(resources).toEqual([
       { source: "github", id: "open-pull:acme/web#7", active: false, subject: { kind: "pull", id: "acme/web#7" } },
       { source: "github", id: "open-pull:acme/web#8", active: true, subject: { kind: "pull", id: "acme/web#8" } },
+      { source: "github", id: "linked-pull:acme/web#7", active: true, subject: { kind: "pull", id: "acme/web#7" } },
+      { source: "github", id: "linked-pull:acme/web#8", active: true, subject: { kind: "pull", id: "acme/web#8" } },
     ]);
   });
 
@@ -267,7 +269,7 @@ describe("the github contributor (BB-380)", () => {
     expect(linearWorker.waits.map((w) => `${w.source} ${w.kind}`)).toEqual(["linear worker"]);
 
     const held = githubContributor.contribute(input({ observed: { entity: pull({}), pulls: [] }, binding: binding({ hold: "a freeze", ending: "terminal", requeueUntil: 2_000_000 }) }));
-    expect(held.holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue"]);
+    expect(held.holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "merge-behind", "ready-gate"]);
     expect(held.holds.find((h) => h.id === "requeue")!.held).toBe(true);
   });
 
@@ -284,11 +286,11 @@ describe("the github contributor (BB-380)", () => {
 describe("the linear and local contributors (BB-380)", () => {
   it("each contributes only for its own entity source, wrapping the binding's holds and non-pull wait", () => {
     const linear = input({ binding: binding({ hold: "a freeze" }), observed: { entity: issue(), pulls: [] } });
-    expect(linearContributor.contribute(linear).holds.map((h) => h.id)).toEqual(["hold"]);
+    expect(linearContributor.contribute(linear).holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "merge-behind", "ready-gate"]);
     expect(localContributor.contribute(linear)).toEqual({ source: "local", gate: [], waits: [], resources: [], holds: [], reasons: [] });
 
     const github = input({ observed: { entity: pull({}), pulls: [] } });
-    expect(githubContributor.contribute(github).holds).toEqual([]);
+    expect(githubContributor.contribute(github).holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "merge-behind", "ready-gate"]);
     expect(linearContributor.contribute(github)).toEqual({ source: "linear", gate: [], waits: [], resources: [], holds: [], reasons: [] });
   });
 });
@@ -326,9 +328,19 @@ describe("the composed answer equals today's assess() on the C1 characterization
       ["hold", true],
       ["ending", true],
       ["requeue", true],
+      ["behind", false],
+      ["merge-behind", false],
+      ["ready-gate", false],
     ]);
     const past = input({ binding: binding({ requeueUntil: 1_000_000 - 1 }) });
-    expect(composeAssessment(past).holds.map((h) => [h.id, h.held])).toEqual([["requeue", false]]);
+    expect(composeAssessment(past).holds.map((h) => [h.id, h.held])).toEqual([
+      ["hold", false],
+      ["ending", false],
+      ["requeue", false],
+      ["behind", false],
+      ["merge-behind", false],
+      ["ready-gate", false],
+    ]);
   });
 
   it("records no compose divergence through the existing compare path", () => {
@@ -454,6 +466,91 @@ describe("the composed liveness is assess()'s (BB-400, C5)", () => {
       "idle: typedWait !== null && waitLive === true ? false : idleBase,",
       "stalled: typedWait === null ? observedStall(binding, live, now) : !live && waitLive !== true && !dateAhead,",
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BB-412 (C6): the resources and holds contributions, in shadow.
+// ---------------------------------------------------------------------------
+
+describe("the resources and holds contributions (BB-412, C6)", () => {
+  /** A `ready` state with every checklist item met and not substantial, so the ready gate passes. */
+  const readyMet = () => readyStateSchema.parse({ checklist: tickets.ready!.checklist.map((item) => ({ item, met: true })), substantial: false });
+
+  const linkedNotOwn = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
+
+  /** One row per resource kind: the composed id and its live value. */
+  const resourceCases = (): Array<[string, AssessmentInput, Array<[string, boolean]>]> => [
+    ["a gate-met own pull is an inactive open-pull and a live linked-pull", onlyGateMetAt("build"), [["open-pull:acme/web#7", false], ["linked-pull:acme/web#7", true], ["workers", true]]],
+    [
+      "a linked pull no worker reported is a live linked-pull, not an active open-pull",
+      input({ observed: { entity: issue({ state: "In Progress" }), pulls: [linkedNotOwn] }, ownPulls: new Set<string>(), gatePulls: new Set([linkedNotOwn.key.toLowerCase()]), decisions: new Map([[linkedNotOwn.key.toLowerCase(), "user"]]), workers: [parkedWorker()] }),
+      [["open-pull:acme/web#8", false], ["linked-pull:acme/web#8", true], ["workers", true]],
+    ],
+    ["a live waited pull is a live waited-pull", waitInput({ kind: "pull", ref: "acme/web#9" }, { waitedPulls: waited(openPull("acme/web#9")) }), [["waited-pull:acme/web#9", true], ["workers", false]]],
+    ["a merged waited pull is an inactive waited-pull", waitInput({ kind: "pull", ref: "acme/web#9" }, { waitedPulls: waited(mergedPull("acme/web#9")) }), [["waited-pull:acme/web#9", false], ["workers", false]]],
+    ["an unsettled deployment watch is a live deployment", input({ binding: binding({ deployments: { "acme/web#9": watch("acme/web#9", "merged") as never } }) }), [["deployment:acme/web#9", true], ["workers", false]]],
+    ["a settled deployment watch is an inactive deployment", input({ binding: binding({ deployments: { "acme/web#9": watch("acme/web#9", "deployed") as never } }) }), [["deployment:acme/web#9", false], ["workers", false]]],
+    ["a running worker is a live workers resource", input({ workers: [{ threadId: "thr_w1", status: "running" } as never] }), [["workers", true]]],
+    ["a parked worker is still in flight, so workers is live", input({ workers: [parkedWorker()] }), [["workers", true]]],
+  ];
+
+  it("composes one resource per kind with its live value", () => {
+    for (const [label, i, expected] of resourceCases()) {
+      expect(composeAssessment(i).resources.map((r) => [r.id, r.active] as [string, boolean]), label).toEqual(expected);
+    }
+  });
+
+  it("carries the deployment key and the linked/waited pull as the resource subject", () => {
+    const deployment = composeAssessment(resourceCases()[4]![1]).resources.find((r) => r.id === "deployment:acme/web#9")!;
+    expect(deployment.subject).toEqual({ kind: "pull", id: "acme/web#9" });
+    const waited = composeAssessment(resourceCases()[2]![1]).resources.find((r) => r.id === "waited-pull:acme/web#9")!;
+    expect(waited.subject).toEqual({ kind: "pull", id: "acme/web#9" });
+    const workers = composeAssessment(resourceCases()[0]![1]).resources.find((r) => r.id === "workers")!;
+    expect(workers.subject).toBeNull();
+  });
+
+  /** The six hold ids in the order the composer emits them. */
+  const HOLD_IDS = ["hold", "ending", "requeue", "behind", "merge-behind", "ready-gate"] as const;
+  const held = (i: AssessmentInput): Array<[string, boolean]> => composeAssessment(i).holds.map((h) => [h.id, h.held] as [string, boolean]);
+  const allHolds = (on: Partial<Record<(typeof HOLD_IDS)[number], boolean>>): Array<[string, boolean]> => HOLD_IDS.map((id) => [id, on[id] ?? false]);
+
+  it("composes one hold per kind with its held value", () => {
+    expect(held(input({ binding: binding({ hold: "a freeze" }) }))).toEqual(allHolds({ hold: true }));
+    expect(held(input({ binding: binding({ ending: "terminal" }) }))).toEqual(allHolds({ ending: true }));
+    expect(held(input({ binding: binding({ requeueUntil: 1_000_000 + 1 }) }))).toEqual(allHolds({ requeue: true }));
+    expect(held(input({ binding: binding({ requeueUntil: 1_000_000 - 1 }) }))).toEqual(allHolds({}));
+    expect(held(input({ binding: binding({ holdBehind: ["ENG-13"] }) }))).toEqual(allHolds({ behind: true }));
+    expect(held(input({ binding: binding({ mergeBehind: ["ENG-14"] }) }))).toEqual(allHolds({ "merge-behind": true }));
+    expect(held(input({ binding: binding({ stage: "spec", phase: "Todo" }) }))).toEqual(allHolds({ "ready-gate": true }));
+    expect(held(input({ binding: binding({ stage: "spec", phase: "Todo", ready: readyMet() }) }))).toEqual(allHolds({}));
+  });
+
+  it("carries the entity keys a behind or merge-behind hold waits on", () => {
+    const behind = composeAssessment(input({ binding: binding({ holdBehind: ["ENG-13", "ENG-14"] }) })).holds.find((h) => h.id === "behind")!;
+    expect(behind.behind).toEqual(["ENG-13", "ENG-14"]);
+    const merge = composeAssessment(input({ binding: binding({ mergeBehind: ["ENG-15"] }) })).holds.find((h) => h.id === "merge-behind")!;
+    expect(merge.behind).toEqual(["ENG-15"]);
+  });
+
+  it("names the intended differences: a linked pull and a parked worker are resources but not idle-blocking", () => {
+    const composed = composeAssessment(resourceCases()[1]![1]);
+    // Both resources are live, and neither suppresses the idle wake: the linked
+    // pull is not an own pull, and `idleInActiveStage` reads only a running
+    // worker.
+    expect(composed.resources).toEqual(expect.arrayContaining([expect.objectContaining({ id: "linked-pull:acme/web#8", active: true }), expect.objectContaining({ id: "workers", active: true })]));
+    expect(composed.liveness.idle).toBe(true);
+    expect(compare(resourceCases()[1]![1], assess(resourceCases()[1]![1]), composed).filter((d) => d.surface.startsWith("compose."))).toEqual([]);
+  });
+
+  it("records no compose divergence for any resource or hold fixture", () => {
+    const fixtures: Array<[string, AssessmentInput]> = [...resourceCases().map(([label, i]): [string, AssessmentInput] => [label, i]), ...HOLD_IDS.flatMap((id) => {
+      const over: Partial<AssessmentInput["binding"]> = id === "hold" ? { hold: "a freeze" } : id === "ending" ? { ending: "terminal" } : id === "requeue" ? { requeueUntil: 1_000_000 + 1 } : id === "behind" ? { holdBehind: ["ENG-13"] } : id === "merge-behind" ? { mergeBehind: ["ENG-14"] } : { stage: "spec", phase: "Todo" };
+      return [[`hold ${id}`, input({ binding: binding(over) })] as [string, AssessmentInput]];
+    })];
+    for (const [label, i] of fixtures) {
+      expect(compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface.startsWith("compose.")), label).toEqual([]);
+    }
   });
 });
 

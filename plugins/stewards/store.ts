@@ -981,7 +981,17 @@ export const INITIATIVE_IDLE_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN idle
 // delivered and fires on the next look.
 export const REVIEWER_ROUND_DELIVER_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN reviewer_round_delivered TEXT NOT NULL DEFAULT '[]'`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS, ...REHOME_MARK_MIGRATIONS, ...REVIEWER_ROUND_WAKE_MIGRATIONS, ...INITIATIVE_IDLE_MIGRATIONS, ...REVIEWER_ROUND_DELIVER_MIGRATIONS];
+// BB-412 (BB-291 criterion 8, slice C6): the composed resources and holds,
+// stored beside the predicate they will replace, so `bb stewards show` can
+// print them read-only and a later slice can read them. Append-only and
+// defaulted: a row from before this group reads as no resources and no holds,
+// and a pre-migration build never reads the columns.
+export const COMPOSED_RESOURCE_MIGRATIONS = [
+  `ALTER TABLE assessments ADD COLUMN resources TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE assessments ADD COLUMN holds TEXT NOT NULL DEFAULT '[]'`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS, ...REHOME_MARK_MIGRATIONS, ...REVIEWER_ROUND_WAKE_MIGRATIONS, ...INITIATIVE_IDLE_MIGRATIONS, ...REVIEWER_ROUND_DELIVER_MIGRATIONS, ...COMPOSED_RESOURCE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1942,7 +1952,7 @@ export type KindBindingRow = { id: string; entityId: string; endedAt: number | n
  * non-actions (BB-335) ride on the same row and are rendered, but the three
  * answers themselves are not read to decide.
  */
-export type AssessmentRow = { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown; nonActions: NonActions };
+export type AssessmentRow = { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown; resources: unknown; holds: unknown; nonActions: NonActions };
 
 /** One place the shadow assessment and the predicate it will replace disagree. */
 export type DivergenceRow = {
@@ -2281,8 +2291,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
 
   // BB-293: the shadow assessment and its divergence log, prepared lazily for
   // the same reason: a store from before this group has no tables yet.
-  const upsertAssessmentStmt = lazy<[string, number, string, string, string], unknown>(
-    "INSERT INTO assessments (binding_id, at, gate, worker, liveness) VALUES (?, ?, ?, ?, ?) ON CONFLICT (binding_id) DO UPDATE SET at = excluded.at, gate = excluded.gate, worker = excluded.worker, liveness = excluded.liveness",
+  const upsertAssessmentStmt = lazy<[string, number, string, string, string, string, string], unknown>(
+    "INSERT INTO assessments (binding_id, at, gate, worker, liveness, resources, holds) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (binding_id) DO UPDATE SET at = excluded.at, gate = excluded.gate, worker = excluded.worker, liveness = excluded.liveness, resources = excluded.resources, holds = excluded.holds",
   );
   const getAssessmentStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM assessments WHERE binding_id = ?");
   const allAssessmentsStmt = lazy<[], Record<string, unknown>>("SELECT * FROM assessments ORDER BY at DESC");
@@ -2622,6 +2632,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     gate: parseJson(r.gate),
     worker: parseJson(r.worker),
     liveness: parseJson(r.liveness),
+    // BB-412: the composed resources and holds. A row from before this group
+    // has no value and reads as an empty list.
+    resources: parseJson(r.resources) ?? [],
+    holds: parseJson(r.holds) ?? [],
     nonActions: nonActionsSchema.parse(parseJson(r.non_actions) ?? {}),
   });
   const standupNoteRowSchema = z.object({
@@ -4267,8 +4281,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     // BB-293: the shadow assessment and its divergence log. The reconcile
     // writes them; the `bb stewards divergences` command reads them.
     /** Store the latest shadow assessment for a binding, replacing any earlier one, and merge any non-action reasons (BB-335). */
-    recordAssessment(fields: { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown; nonActions?: ReadonlyArray<{ code: NonActionCode; detail?: string | null }> }): void {
-      upsertAssessmentStmt().run(fields.bindingId, fields.at, JSON.stringify(fields.gate), JSON.stringify(fields.worker), JSON.stringify(fields.liveness));
+    recordAssessment(fields: { bindingId: string; at: number; gate: unknown; worker: unknown; liveness: unknown; resources?: unknown; holds?: unknown; nonActions?: ReadonlyArray<{ code: NonActionCode; detail?: string | null }> }): void {
+      upsertAssessmentStmt().run(fields.bindingId, fields.at, JSON.stringify(fields.gate), JSON.stringify(fields.worker), JSON.stringify(fields.liveness), JSON.stringify(fields.resources ?? []), JSON.stringify(fields.holds ?? []));
       for (const n of fields.nonActions ?? []) mergeNonAction(fields.bindingId, n.code, n.detail ?? null, fields.at);
     },
     /**

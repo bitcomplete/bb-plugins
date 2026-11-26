@@ -5053,6 +5053,36 @@ describe("the status report actor (BB-97)", () => {
     expect(shown).not.toMatch(/Need need_/u);
   });
 
+  it("bb stewards show prints the stored composed resources and holds, and neither with no row (BB-412)", async () => {
+    const t = await bound();
+    // A binding with no reconcile yet has no assessment row: neither block.
+    const b = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-99", entityKey: "ENG-99", url: null, title: "No row", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    const none = (await t.harness.behavior.runCli(["show", "ENG-99", "--project", "p1"])).stdout;
+    expect(none).not.toContain("Composed resources:");
+    expect(none).not.toContain("Composed holds:");
+
+    t.hooks.store.recordAssessment({
+      bindingId: b.id,
+      at: t.now(),
+      gate: {},
+      worker: {},
+      liveness: {},
+      resources: [
+        { source: "github", id: "open-pull:acme/web#7", active: true, subject: { kind: "pull", id: "acme/web#7" } },
+        { source: "github", id: "linked-pull:acme/web#8", active: false, subject: { kind: "pull", id: "acme/web#8" } },
+      ],
+      holds: [
+        { source: "linear", id: "merge-behind", held: true, behind: ["ENG-13"] },
+        { source: "linear", id: "ready-gate", held: true, behind: [] },
+        { source: "linear", id: "hold", held: false, behind: [] },
+      ],
+    });
+    const shown = (await t.harness.behavior.runCli(["show", "ENG-99", "--project", "p1"])).stdout;
+    expect(shown).toContain("Composed resources: open-pull:acme/web#7, linked-pull:acme/web#8 (inactive)");
+    // Only the held holds print, and a behind hold names the entity keys it waits on.
+    expect(shown).toContain("Composed holds: merge-behind -> ENG-13, ready-gate");
+  });
+
   it("closes every open auto-filed need at startup, once, without deleting it (BB-349)", async () => {
     const t = await bound();
     const b = t.hooks.store.find("ENG-12")!;
