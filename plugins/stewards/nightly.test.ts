@@ -57,7 +57,8 @@ describe("briefing", () => {
     const held = binding("ENG-2");
     store.patch(held.id, { hold: "Waiting on ENG-1" });
     const noWake = binding("ENG-3");
-    store.patch(noWake.id, { noWakeSource: true });
+    // BB-414: the stall is derived, so a free-text wait with no live source is what the briefing reads.
+    store.patch(noWake.id, { status: { phase: "Todo", summary: "Waiting.", nextAction: "Wait", actor: "steward", waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: SINCE + 5 } });
     const dated = binding("ENG-4");
     store.patch(dated.id, { requeueUntil: SINCE + 86_400_000 });
     const ended = binding("ENG-5");
@@ -91,7 +92,7 @@ describe("briefing", () => {
     expect(b.stuck.stuck.map((x) => x.escalation.id)).toEqual([f.stuckEsc.id]);
     expect(b.stuck.stall.map((x) => x.escalation.id)).toEqual([f.stallEsc.id]);
     expect(b.stuck.held.map((x) => x.id)).toEqual([f.held.id]);
-    expect(b.stuck.noWakeSource.map((x) => x.id)).toEqual([f.noWake.id]);
+    expect(b.stuck.stalled.map((x) => x.id)).toEqual([f.noWake.id]);
     expect(b.stuck.datedWaits.map((x) => x.id)).toEqual([f.dated.id]);
     expect((b.stuck.idle ?? []).map((x) => x.id)).toEqual([f.idleInit.id]);
     expect(b.done.moved.map((x) => x.id)).toEqual([f.moved.id]);
@@ -109,7 +110,7 @@ describe("briefing", () => {
     expect(scoped.escalations.map((x) => x.escalation.id)).toEqual([f.projectEsc.id]);
     expect(scoped.stuck.stuck).toEqual([]);
     expect(scoped.stuck.held).toEqual([]);
-    expect(scoped.stuck.noWakeSource).toEqual([]);
+    expect(scoped.stuck.stalled).toEqual([]);
     expect(scoped.stuck.datedWaits).toEqual([]);
     expect(scoped.decisions.needs.every((x) => x.binding.id === f.moved.id)).toBe(true);
     // The "since the last stand-up" sweep and the other bindings are not in it.
@@ -135,7 +136,7 @@ describe("briefing", () => {
       needs: [{ need: f.store.need(f.need.id)!, binding: f.store.binding(f.moved.id)! }, { need: f.store.need(f.userEsc.id)!, binding: f.store.binding(f.moved.id)! }],
       assumptions: [{ assumption: f.store.assumption(f.assumption.id)!, binding: null }],
       stuck: [{ escalation: f.store.escalation(f.stuckEsc.id)!, from: f.store.binding(f.held.id)! }],
-      noWakeSource: [f.store.binding(f.noWake.id)!],
+      stalled: [f.store.binding(f.noWake.id)!],
       stall: [{ escalation: f.store.escalation(f.stallEsc.id)!, from: f.store.binding(f.noWake.id)! }],
       datedWaits: [f.store.binding(f.dated.id)!],
       held: [f.store.binding(f.held.id)!],
@@ -236,7 +237,7 @@ describe("the backlog report (BB-334)", () => {
     ...over,
   });
   const look = (issues: BacklogIssue[], over: Partial<BacklogLook> = {}): BacklogLook => ({ at: NOW, target: "backlog/BB", team: "BB", error: null, issues, unsupported: false, truncated: false, ...over });
-  const emptyRecords = (backlog: DigestRecords["backlog"]): DigestRecords => ({ previous: null, since: NOW, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [], backlog });
+  const emptyRecords = (backlog: DigestRecords["backlog"]): DigestRecords => ({ previous: null, since: NOW, moved: [], ended: [], answered: [], withUser: [], stuck: [], stalled: [], stall: [], held: [], backlog });
 
   it("counts size, age buckets and inflow/outflow against the previous digest's snapshot", () => {
     const issues = [

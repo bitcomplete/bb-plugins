@@ -26,7 +26,7 @@ const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: 
   wait: null,
   overdue: false,
   overdueMs: null,
-  noWakeSource: false,
+  stalled: false,
   wakeFailure: null,
   needsUser: false,
   stuck: false,
@@ -62,7 +62,7 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   wait: null,
   overdue: false,
   overdueMs: null,
-  noWakeSource: false,
+  stalled: false,
   idleInitiativeSince: null,
   idleInitiativeUnmet: null,
   wakeFailure: null,
@@ -453,7 +453,7 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortState(effort({ key: "a", waitingOn: "a review" }))).toBe("quiet");
     expect(effortState(effort({ key: "b", hold: "a freeze" }))).toBe("quiet");
     expect(effortState(effort({ key: "c", stuck: true }))).toBe("blocked");
-    expect(effortState(effort({ key: "d", noWakeSource: true }))).toBe("blocked");
+    expect(effortState(effort({ key: "d", stalled: true }))).toBe("blocked");
     expect(effortState(effort({ key: "e", wakeFailure: "the thread is gone" }))).toBe("blocked");
   });
 
@@ -561,12 +561,12 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
   // phrase and free-text nextAction, which can look live when nothing will
   // deliver the wait.
   it("reads waiting, no wake source as a red phrase, ahead of the quiet ones", () => {
-    expect(effortPhrase(effort({ key: "w", noWakeSource: true, waitingOn: "the vendor", statusNextAction: "the vendor" }))).toBe("waiting, no wake source");
-    expect(effortPhrase(effort({ key: "w2", noWakeSource: true, deployment: "deployed", statusNextAction: "the vendor" }))).toBe("waiting, no wake source");
+    expect(effortPhrase(effort({ key: "w", stalled: true, waitingOn: "the vendor", statusNextAction: "the vendor" }))).toBe("waiting, no wake source");
+    expect(effortPhrase(effort({ key: "w2", stalled: true, deployment: "deployed", statusNextAction: "the vendor" }))).toBe("waiting, no wake source");
     // Red outranks a running worker and a lost hand-off.
-    expect(effortPhrase(effort({ key: "w3", noWakeSource: true, runningWorkers: 1 }))).toBe("waiting, no wake source");
+    expect(effortPhrase(effort({ key: "w3", stalled: true, runningWorkers: 1 }))).toBe("waiting, no wake source");
     const finished = [{ threadId: "thr_w", title: "Implement", status: "finished", parkedWaitingOn: null }];
-    expect(effortPhrase(effort({ key: "w4", noWakeSource: true, waitingOn: "Implement", workers: finished }))).toBe("waiting, no wake source");
+    expect(effortPhrase(effort({ key: "w4", stalled: true, waitingOn: "Implement", workers: finished }))).toBe("waiting, no wake source");
     // Unmarked still reads the next action verbatim.
     expect(effortPhrase(effort({ key: "w5", waitingOn: "the vendor", statusNextAction: "the vendor" }))).toBe("the vendor");
   });
@@ -719,7 +719,7 @@ describe("stewards sidebar Waiting section (BB-348)", () => {
     // A quiet effort with no report, a lost hand-off or a quiet worker finish
     // stays In flight; a no-wake-source wait and a failed wake are red.
     expect(effortSection(effort({ key: "none", kind: "ticket", state: "quiet" }), now)).toBe("inflight");
-    expect(effortSection(effort({ key: "nowake", kind: "ticket", state: "blocked", noWakeSource: true, waitingOn: "the vendor", statusNextAction: "the vendor" }), now)).toBe("blocked");
+    expect(effortSection(effort({ key: "nowake", kind: "ticket", state: "blocked", stalled: true, waitingOn: "the vendor", statusNextAction: "the vendor" }), now)).toBe("blocked");
     expect(effortSection(effort({ key: "failed", kind: "ticket", state: "blocked", wakeFailure: "the thread is gone" }), now)).toBe("blocked");
     const loud = { text: 'Worker "ENG-12: Implement" finished its turn while you were waiting on it. Check whether it happened.' };
     expect(effortSection(effort({ key: "lost", kind: "ticket", state: "quiet", waitingOn: "Implement", pending: [loud] }), now)).toBe("inflight");
@@ -765,7 +765,7 @@ describe("stewards sidebar Waiting section (BB-348)", () => {
     expect(section({ key: "you", kind: "ticket", needsUser: true, ...wait })).toBe("blocked");
     expect(section({ key: "stuck", kind: "ticket", stuck: true, ...wait })).toBe("blocked");
     // A no-wake-source wait and a failed wake are red, not Waiting.
-    expect(section({ key: "nowake", kind: "ticket", noWakeSource: true, waitingOn: "the vendor" })).toBe("blocked");
+    expect(section({ key: "nowake", kind: "ticket", stalled: true, waitingOn: "the vendor" })).toBe("blocked");
     expect(section({ key: "failed", kind: "ticket", wakeFailure: "the thread is gone" })).toBe("blocked");
     // BB-348: a hold is a wait, not a block, so it sits in Waiting.
     expect(section({ key: "held", kind: "ticket", hold: "a freeze", ...wait })).toBe("waiting");

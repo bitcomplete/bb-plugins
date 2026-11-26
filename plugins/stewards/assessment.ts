@@ -2,10 +2,10 @@
 // binding for the merge gate (with the decide-list mark and the recorded
 // project approvals the approvals.ts path omits), the worker state (an
 // explicit `parked`, distinct from `running`) and the wait liveness (wake
-// source, idle and stall derived from what the plugin observes, not the
-// stored `noWakeSource` flag, which only a reconcile writes for a ticket or
-// pull request). BB-400 (C5) makes the composer the one place idle and stall
-// are derived: `assess()` reads them from the composed answer.
+// source, idle and stall derived from what the plugin observes, not a flag
+// stored at report time; BB-414 retires the last such flag, the
+// `no_wake_source` column). BB-400 (C5) makes the composer the one place idle
+// and stall are derived: `assess()` reads them from the composed answer.
 //
 // It is pure: it reads only the rows a reconcile already has in hand and
 // decides nothing. `compare` runs the predicates the assessment will replace
@@ -78,8 +78,6 @@ export type AssessedLiveness = {
   stuck: boolean;
   /** A free-text wait with no tracked source and no dated wait ahead, recomputed from the rows. */
   stalled: boolean;
-  /** The stored flag the assessment replaces; a reconcile is its only writer (BB-375). */
-  reportedNoWakeSource: boolean;
   /** BB-351: the stored wait is live and past its kind's budget. */
   overdue: boolean;
   /** BB-351: the wait's age in ms when `overdue`, for the `, overdue <duration>` phrase; null otherwise. */
@@ -116,7 +114,7 @@ export type Assessment = {
 export type AssessmentInput = {
   binding: Pick<
     Binding,
-    "id" | "entityKey" | "kind" | "ready" | "stage" | "ending" | "hold" | "deployments" | "requeueUntil" | "noWakeSource" | "status" | "createdAt" | "advancedAt" | "phase"
+    "id" | "entityKey" | "kind" | "ready" | "stage" | "ending" | "hold" | "deployments" | "requeueUntil" | "status" | "createdAt" | "advancedAt" | "phase"
   > & { wait?: Binding["wait"]; waitSince?: number | null; holdBehind?: Binding["holdBehind"]; holdStack?: Binding["holdStack"]; mergeBehind?: Binding["mergeBehind"] };
   /**
    * Fresh snapshots of the binding's waited `pull`/`review` refs (BB-333),
@@ -360,7 +358,6 @@ export function assess(input: AssessmentInput, composed?: ComposedAssessment): A
       idle: answer.liveness.idle,
       stuck: stuckDue(binding, playbook, [...escalations], now) !== null,
       stalled: answer.liveness.stalled,
-      reportedNoWakeSource: binding.noWakeSource,
       overdue: overdueMs !== null,
       overdueMs,
     },
@@ -393,8 +390,10 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  * - `approvals.gate`: the old surface gate, built without the decide mark or
  *   the recorded project approvals, against the assessment (BB-292 #2).
  * - `approvals.pageRefusal`: the page action's refusal on a met gate (BB-292 #3).
- * - `noWakeSource`: the stored flag against the stall recomputed from the
- *   observable rows.
+ *
+ * BB-414 (C4) retires the `noWakeSource` surface with the column it compared:
+ * the flag is no longer written, and the derived stall is the one answer every
+ * surface reads through `derivedStalled`.
  *
  * BB-322 keeps the gate comparison as the soak's evidence that the consumer's
  * answer still matches the predicate it retired; a new `approvals.gate` row is
@@ -449,25 +448,7 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     if (pageRefusal !== null && assessed.met) add("approvals.pageRefusal", pageRefusal, "met", gateInputs);
   }
 
-  // (4) The stored no-wake-source flag against the stall recomputed from the
-  // rows. `idleInActiveStage` and `stuckDue` are the assessment's own
-  // derivation, so they are compared by construction; only the flag and the
-  // observed stall can disagree.
-  add("noWakeSource", binding.noWakeSource ? "no-wake-source" : "source-or-no-wait", assessment.liveness.stalled ? "no-wake-source" : "source-or-no-wait", {
-    binding: binding.id,
-    live: assessment.liveness.live,
-    idle: assessment.liveness.idle,
-    stuck: assessment.liveness.stuck,
-    readyPassed: assessment.gate.readyPassed,
-    requeueUntil: binding.requeueUntil,
-    phase: binding.phase,
-    // The row the predicates read, as a boolean, never the wait text.
-    hasWait: (binding.status?.waitingOn ?? "").trim() !== "",
-    waitKind: binding.wait?.kind ?? null,
-    waitLive: assessment.liveness.waitLive === true,
-  });
-
-  // (5) BB-380 (C2): the shadow composer's waits and holds against the
+  // (4) BB-380 (C2): the shadow composer's waits and holds against the
   // assessment. The composed answer is computed from the same rows by the
   // in-process contributors; a difference here is a defect in the refactor, so
   // the row is the evidence the next slice's consumer can rely on the

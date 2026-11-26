@@ -39,7 +39,6 @@ const binding = (over: Partial<AssessmentInput["binding"]> = {}): AssessmentInpu
   hold: null,
   deployments: {},
   requeueUntil: null,
-  noWakeSource: false,
   status: null,
   createdAt: 1,
   advancedAt: 1,

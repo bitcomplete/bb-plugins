@@ -118,7 +118,7 @@ import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
-import { advanced, adoptedBySource, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, observedStall, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, repinInitiativeSpecText, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
+import { advanced, adoptedBySource, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, derivedStalled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, observedStall, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, repinInitiativeSpecText, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker, type ReviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, deliverReviewRound, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedEscalations, routedTo, type EscalationsContext } from "./escalations.js";
@@ -164,7 +164,7 @@ import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, LOCAL_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
 import { templateWarnings, type CheckFinding } from "./template-stamp.js";
 import type { DeploymentTarget } from "./config.js";
-import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBacklogWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, initiativeIdle, initiativeLiveWait, initiativeUnmet, noWakeSourceReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, bindingMayMerge, choicesNote, formatAlertmanagerWake, formatBacklogWake, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, initiativeIdle, initiativeLiveWait, initiativeUnmet, stalledReportSentence, spawnCommand, workerFinishNote, workerQuestion, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 import { KNOWN_PLAYBOOKS, buildSurvey, formatSurvey, surveyWantedPaths, type Available, type SurveyBb, type SurveyLinear, type SurveyRepoInput, type SurveyReport } from "./survey.js";
 
 export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
@@ -424,9 +424,10 @@ export function formatDivergences(rows: ReadonlyArray<Pick<DivergenceRow, "bindi
 
 /**
  * BB-333: the human-readable typed-wait shadow state, one line per binding
- * (derived result, noWakeSource result, kind, count, first/last seen). The
- * reader for the `wait_divergence_state` table behind `bb stewards
- * wait-divergences`; like `formatDivergences`, nothing reads it to decide.
+ * (derived result, stored result, kind, count, first/last seen). The reader for
+ * the `wait_divergence_state` table behind `bb stewards wait-divergences`; like
+ * `formatDivergences`, nothing reads it to decide. BB-414 retires the surface's
+ * writer, so the rows are frozen history.
  */
 export function formatWaitDivergences(rows: ReadonlyArray<WaitDivergenceRow>): string {
   if (rows.length === 0) return "No wait divergences recorded.";
@@ -435,7 +436,7 @@ export function formatWaitDivergences(rows: ReadonlyArray<WaitDivergenceRow>): s
   return rows
     .map((d) => {
       const window = d.firstSeenAt === null || d.lastSeenAt === null ? "never" : `${at(d.firstSeenAt)} -> ${at(d.lastSeenAt)}`;
-      return `${d.bindingId}  derived=${result(d.derived)}  noWakeSource=${result(d.reported)}  kind=${d.kind ?? "-"}  x${d.count}  ${window}`;
+      return `${d.bindingId}  derived=${result(d.derived)}  stored=${result(d.reported)}  kind=${d.kind ?? "-"}  x${d.count}  ${window}`;
     })
     .join("\n");
 }
@@ -773,8 +774,8 @@ export const rpcContract = defineRpcContract({
               /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
               overdueMs: z.number().nullable(),
               nonActions: nonActionsSchema,
-              /** Waiting with nothing the plugin tracks to wake it (BB-154). */
-              noWakeSource: z.boolean(),
+              /** BB-414: the derived stall (waiting with nothing the plugin tracks to wake it, BB-154). */
+              stalled: z.boolean(),
               /** BB-392: the only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
               reviewerRoundMissing: z.boolean().optional(),
               /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. Optional so a client built from the previous image still validates. */
@@ -943,8 +944,8 @@ export const rpcContract = defineRpcContract({
               /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
               overdueMs: z.number().nullable(),
               nonActions: nonActionsSchema,
-              /** Waiting with nothing the plugin tracks to wake it (BB-154). */
-              noWakeSource: z.boolean(),
+              /** BB-414: the derived stall (waiting with nothing the plugin tracks to wake it, BB-154). */
+              stalled: z.boolean(),
               /** BB-392: the only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
               reviewerRoundMissing: z.boolean().optional(),
               /** BB-406: when an initiative was first seen idle, or null; the card shows `idle <duration>`. Optional so a client built from the previous image still validates. */
@@ -1068,8 +1069,8 @@ export const rpcContract = defineRpcContract({
           /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
           overdueMs: z.number().nullable(),
           nonActions: nonActionsSchema,
-          /** Waiting with nothing the plugin tracks to wake it (BB-154). */
-          noWakeSource: z.boolean(),
+          /** BB-414: the derived stall (waiting with nothing the plugin tracks to wake it, BB-154). */
+          stalled: z.boolean(),
           /** BB-392: the only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
           reviewerRoundMissing: z.boolean().optional(),
           /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. Optional so a client built from the previous image still validates. */
@@ -5634,25 +5635,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * BB-293/BB-322/BB-333/BB-375/BB-400: the binding's one assessment, from
-     * the rows the look already holds. BB-333 made the typed-wait derivation
-     * authoritative; BB-375 made the reconcile its only writer; BB-400 makes
-     * the composer's liveness the one `assess()` reads. The stored
-     * `noWakeSource` is written from the assessment here for a ticket or pull
-     * request and from `observedStall` on the ops path, and `steward_report`
-     * derives the same answer for its reply without storing it. The shadow's
-     * `noWakeSource` divergence is retired because the flag and the derivation
-     * now agree by construction. The column and every surface that reads it are
-     * unchanged.
+     * BB-293/BB-322/BB-333/BB-375/BB-400/BB-414: the binding's one assessment,
+     * from the rows the look already holds. BB-333 made the typed-wait
+     * derivation authoritative; BB-375 made the reconcile its only writer;
+     * BB-400 makes the composer's liveness the one `assess()` reads; BB-414
+     * retires the stored `noWakeSource` column, so the derived stall is the
+     * joined assessment's `liveness.stalled` and every surface reads it through
+     * `derivedStalled`. `steward_report` derives the same answer for its reply
+     * without storing it.
      */
     function recordAssessed(b: Binding, input: AssessmentInput, composed: ComposedAssessment, assessment: Assessment): void {
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness, resources: composed.resources, holds: composed.holds });
-      // The shadow's `noWakeSource` divergence is retired with the flag: the
-      // two agree by construction now, so `wait_divergence_state` stops being
-      // written and keeps its history. The other surfaces' rows still record.
-      // The derived `noWakeSource` itself rides the reconcile's existing
-      // binding patch, so no extra store read is added.
-      store.recordDivergences(compare(input, assessment, composed).filter((d) => d.surface !== "noWakeSource"));
+      // BB-414: the `noWakeSource` divergence surface is retired with the column
+      // it compared, so the other surfaces' rows are all that record now.
+      store.recordDivergences(compare(input, assessment, composed));
       store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
     }
 
@@ -6264,7 +6260,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       signalNeedActionability(b, observed, ready);
-      b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready, ...(assessment === null ? {} : { noWakeSource: assessment.liveness.stalled }) });
+      // BB-414: no `noWakeSource` write; the derived stall is the joined
+      // assessment's `liveness.stalled`, written just above by `recordAssessed`.
+      b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
       // BB-406: the initiative idle clock. The predicate reads only rows this
       // look already holds — the fresh snapshot's children and the composed
       // typed-wait liveness — so it adds no store read or source call. The
@@ -6896,12 +6894,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const target = parseOpsTargetKey(b.entityId);
       // A target no longer listed is ended by the sweep.
       if (target === null || !allOpsTargets(config).some((t) => opsTargetKey(t) === b.entityId)) return;
-      // The no-wake-source mark is derived on every ops reconcile, from the
-      // same free-text wait rule a ticket or pull request uses. It runs before
-      // the per-target dispatch so every ops target kind gets it, including a
-      // look that cannot read the target and one that finds nothing actionable.
-      const noWakeSource = observedStall(b, rowLiveSource(bindingWakeSources(b, new Set())), now());
-      if (b.noWakeSource !== noWakeSource) b = store.patch(b.id, { noWakeSource });
+      // BB-414: the ops no-wake-source mark is no longer written; an ops
+      // binding's derived stall is the free-text `observedStall` rule computed
+      // on read by `derivedStalled` (ops has no snapshot, so no assessment).
       if (target.kind === "dependabot") {
         await reconcileDeps(b, config, playbook, target, force);
         return;
@@ -12082,7 +12077,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               nextAction: b.status?.nextAction ?? null,
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
-              noWakeSource: b.noWakeSource,
+              stalled: derivedStalled(b, now()),
               reviewerRoundMissing: b.reviewerRoundMissing,
               idleInitiativeSince: b.idleInitiativeSince,
               idleInitiativeUnmet: b.idleInitiativeSince === null ? null : initiativeUnmet(b),
@@ -12225,7 +12220,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               nextAction: b.status?.nextAction ?? null,
               actor: b.status?.actor ?? null,
               waitingOn: b.status?.waitingOn ?? null,
-              noWakeSource: b.noWakeSource,
+              stalled: derivedStalled(b, now()),
               reviewerRoundMissing: b.reviewerRoundMissing,
               idleInitiativeSince: b.idleInitiativeSince,
               idleInitiativeUnmet: b.idleInitiativeSince === null ? null : initiativeUnmet(b),
@@ -12347,7 +12342,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...composedHoldRow(b),
               holdStack: b.holdStack,
               waitingOn: b.status?.waitingOn ?? null,
-              noWakeSource: b.noWakeSource,
+              stalled: derivedStalled(b, now()),
               reviewerRoundMissing: b.reviewerRoundMissing,
               idleInitiativeSince: b.idleInitiativeSince,
               idleInitiativeUnmet: b.idleInitiativeSince === null ? null : initiativeUnmet(b),
@@ -14537,20 +14532,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // `store.workers`/`openEscalations`/`openNeeds`/`pullWatch` reads.
           let liveSourceCache: boolean | null = null;
           const liveSource = (): boolean => (liveSourceCache ??= rowLiveSource(bindingWakeSources(current, currentOwnPulls)));
-          // BB-333/BB-375/BB-400: liveness and stall come from the one
+          // BB-333/BB-375/BB-400/BB-414: liveness and stall come from the one
           // assessment. The report derives the same answer here for its reply
           // (the reconcile that stores it may not have run since the wait was
           // set), so the reply is current in the turn the wait is set; a
           // no-kind report is the assessment's own no-kind derivation. The
-          // report stores nothing: every reconcile, ticket, pull request or
-          // ops, is the column's sole writer. An ops binding has no snapshot to
-          // assess, so its report keeps the free-text rule the ops reconcile
-          // writes with (the ops path is out of C5's scope).
-          let derivedStalled: boolean | null = null;
+          // report stores nothing. An ops binding has no snapshot to assess, so
+          // its report keeps the free-text rule the ops reconcile writes with.
+          let freshStalled: boolean | null = null;
           if (current.lastSnapshot !== null && playbook !== null && config !== null) {
             try {
               const derived = assess(await buildAssessmentInput(current, current.lastSnapshot, store.workers(current.id), currentOwnPulls, playbook, specHashFor(current, current.lastSnapshot.entity), config));
-              derivedStalled = derived.liveness.stalled;
+              freshStalled = derived.liveness.stalled;
             } catch (error) {
               bb.log.warn(`stewards: could not derive the liveness for ${current.entityKey}: ${errorMessage(error)}`);
             }
@@ -14562,14 +14555,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // or a failed build), fall back to the stored assessment's stall, not
           // to `false`: the reply must not drop the warning. An ops binding has
           // no stored assessment, so its report keeps the free-text rule the
-          // ops reconcile writes with (the ops path is out of C5's scope).
+          // derived helper computes on read.
           const storedStalled = (store.assessment(current.id)?.liveness as { stalled?: boolean } | null | undefined)?.stalled;
-          const noWakeSource = derivedStalled ?? storedStalled ?? (current.source === "ops" ? observedStall(current, liveSource(), now()) : false);
+          // An ops binding has no snapshot to assess, so its reply keeps the
+          // free-text rule over the live source this turn read, never the ops
+          // reconcile's stored liveness (BB-414).
+          const stalled = current.source === "ops" ? observedStall(current, liveSource(), now()) : (freshStalled ?? storedStalled ?? false);
           // BB-339: the open bindings the free text names, in the order they
           // appeared, so the report reply can point the steward at the hold it
           // can take in this turn. A key that resolves to nothing, to an ended
           // binding, or to this binding itself is not named.
-          const namedOpenKeys = noWakeSource
+          const namedOpenKeys = stalled
             ? waitEntityKeys(waitingOn ?? "").filter((key) => {
                 const target = store.find(key, b.projectId);
                 return target !== null && target.endedAt === null && target.id !== b.id;
@@ -14577,7 +14573,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             : [];
           const stall = advanceStall(
             { count: current.requeueWakeCount, waitText: current.requeueWaitText, firstAt: current.requeueFirstAt },
-            { reason: wakeReason, waitingOn, liveSource: derivedStalled !== null ? !derivedStalled : liveSource(), now: now(), until: current.requeueUntil },
+            { reason: wakeReason, waitingOn, liveSource: freshStalled !== null ? !freshStalled : liveSource(), now: now(), until: current.requeueUntil },
           );
           b = store.patch(b.id, {
             requeueWakeCount: stall.state.count,
@@ -14695,8 +14691,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const requeueOnly = `Until you name one, this wait is delivered only by requeue, ${requeuePhrase}.`;
           if (b.ending === "terminal") {
             if (b.followThrough === null) return `Reported.${untilNote}${waitNote}${replacedNote}${handOffNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
-            const followWake = noWakeSource
-              ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} ${requeueOnly}`
+            const followWake = stalled
+              ? `${stalledReportSentence(waitingOn, namedOpenKeys)} ${requeueOnly}`
               : `You will be woken when a worker finishes or something actionable changes, or ${requeuePhrase}. End the turn now.`;
             return `Reported.${untilNote}${waitNote}${replacedNote}${handOffNote}${filingNote}${escalated}${deploymentNote}${citesNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. ${followWake}`;
           }
@@ -14704,8 +14700,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (gateJustPassed && nothingPending) {
             return `Reported.${untilNote}${waitNote}${replacedNote}${handOffNote}${recorded}${filingNote}${escalated}${citesNote} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
           }
-          const wakeNote = noWakeSource
-            ? `${noWakeSourceReportSentence(waitingOn, namedOpenKeys)} ${requeueOnly}`
+          const wakeNote = stalled
+            ? `${stalledReportSentence(waitingOn, namedOpenKeys)} ${requeueOnly}`
             : `You will be woken when something actionable changes, or ${requeuePhrase}. End the turn now.`;
           return `Reported.${untilNote}${waitNote}${replacedNote}${handOffNote}${recorded}${filingNote}${gateNote}${escalated}${citesNote} ${wakeNote}`;
         } catch (error) {
@@ -15765,7 +15761,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const holdFlag = held("hold") ? `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}` : null;
           const mergeFlag = held("merge-behind") ? `MERGE HOLD: behind ${b.mergeBehind.join(", ")}` : null;
           const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, holdFlag, mergeFlag, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.filter((x) => !(x.isQuestion && x.forwardedFrom !== null && openPresent.has(x.forwardedFrom))).map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
-          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${b.wait === null ? "" : `; typed wait: ${waitPhrase(b.wait)}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
+          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${derivedStalled(b, now()) ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${b.wait === null ? "" : `; typed wait: ${waitPhrase(b.wait)}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
     }
@@ -17029,7 +17025,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             description: "Every place the shadow assessment disagrees with the predicate it will replace, one row per distinct (binding, surface, old, new) with a first/last seen time and a count. --binding filters by binding id or entity key, --surface by surface name. --json emits the rows. Nothing reads the log to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's divergences (binding id or entity key)" },
-              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, approvals.gate, approvals.pageRefusal, noWakeSource, compose.waits, compose.holds, compose.resources)" },
+              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, approvals.gate, approvals.pageRefusal, waitStall, compose.waits, compose.holds, compose.resources)" },
               project: PROJECT_OPTION,
               json: JSON_OPTION,
             },
@@ -17043,8 +17039,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           "wait-divergences": cliCommand({
-            summary: "The typed wait's shadow state, derived vs noWakeSource (BB-333), read-only",
-            description: "One row per binding that has reported a typed wait: the stall derived from the wait kind on the last reconcile, the stored noWakeSource flag (a reconcile is its only writer since BB-375), and the wait kind, first/last seen time and count from the noWakeSource divergence row behind that state. --binding filters by binding id or entity key. --json emits the rows. Read-only: nothing reads the state to decide or render.",
+            summary: "The typed wait's shadow state, derived vs stored (BB-333), read-only",
+            description: "One row per binding that has reported a typed wait: the stall derived from the wait kind on the last reconcile, the stored assessment's stall (a reconcile was its only writer since BB-375; the retired column it mirrored is never read), and the wait kind, first/last seen time and count from the waitStall divergence row behind that state. --binding filters by binding id or entity key. --json emits the rows. Read-only: nothing reads the state to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's wait divergences (binding id or entity key)" },
               project: PROJECT_OPTION,

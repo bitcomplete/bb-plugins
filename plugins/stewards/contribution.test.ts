@@ -53,7 +53,6 @@ const binding = (over: Partial<AssessmentInput["binding"]> = {}): AssessmentInpu
   hold: null,
   deployments: {},
   requeueUntil: null,
-  noWakeSource: false,
   status: null,
   createdAt: 1,
   advancedAt: 1,
@@ -128,17 +127,6 @@ function projectApproved(): AssessmentInput {
   });
 }
 
-/** The report-time `noWakeSource` flag set with no free-text wait. */
-function noWakeSourceFlag(): AssessmentInput {
-  const second = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
-  return input({
-    binding: binding({ noWakeSource: true, status: null }),
-    observed: { entity: issue({ state: "In Progress" }), pulls: [second] },
-    ownPulls: own(second),
-    workers: [parkedWorker()],
-  });
-}
-
 const status = (waitingOn: string | null): StatusRecord => ({ phase: "In Progress", summary: "s", nextAction: "n", actor: "other", waitingOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
 
 /** An open or merged pull request read for a `pull`/`review` wait. */
@@ -184,7 +172,6 @@ const characterizationFixtures = (): Array<[string, AssessmentInput]> => [
   ...(["ticket", "pr", "review"] as const).flatMap((kind) => (["spec", "build", "review"] as const).map((stage): [string, AssessmentInput] => [`matrix ${kind} ${stage}`, matrix(kind, stage)])),
   ...(["spec", "build", "review", null] as const).map((stage): [string, AssessmentInput] => [`only-gate-met ${String(stage)}`, onlyGateMetAt(stage)]),
   ["project approved", projectApproved()],
-  ["no-wake-source flag", noWakeSourceFlag()],
   ...waitCases(),
 ];
 
@@ -354,12 +341,12 @@ describe("the composed answer equals today's assess() on the C1 characterization
     }
   });
 
-  it("compare still records the six C1 surfaces when no composed answer is passed (BB-413 retired the live-source surface)", () => {
+  it("compare still records the five C1 surfaces when no composed answer is passed (BB-413 retired the live-source surface, BB-414 the no-wake-source one)", () => {
     const union = new Set<string>();
     for (const [label, i] of characterizationFixtures()) {
       for (const d of compare(i, assess(i))) union.add(d.surface);
     }
-    expect([...union].sort()).toEqual(["approvals.gate", "approvals.pageRefusal", "idleInActiveStage", "noWakeSource", "runningWorkerReason", "workerInFlight"]);
+    expect([...union].sort()).toEqual(["approvals.gate", "approvals.pageRefusal", "idleInActiveStage", "runningWorkerReason", "workerInFlight"]);
   });
 });
 

@@ -434,6 +434,12 @@ export const REVIEWER_MODEL_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN model
 // requeue-only wakes with the same wait (`requeue_wake_count`,
 // `requeue_wait_text`, `requeue_first_at`). Additive and defaulted: an old row
 // reads as not marked, with no wake reason and no run under way.
+//
+// BB-414 (C4): `noWakeSource` is retired. The `no_wake_source` column is
+// neither written nor read any more: the derived stall is the stored
+// assessment's `liveness.stalled`, read through the one `derivedStalled`
+// helper. The column stays by the append-only rule; a pre-migration build
+// ignores it.
 export const WAKE_SOURCE_MIGRATIONS = [
   `ALTER TABLE bindings ADD COLUMN no_wake_source INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE bindings ADD COLUMN last_wake_reason TEXT`,
@@ -1270,8 +1276,14 @@ export type Binding = {
   idleWokenAt: number | null;
   /** A worker finish asked for an idle look at once, without the grace (BB-83). */
   idleWakeNow: boolean;
-  /** The steward reported a free-text wait with nothing the plugin tracks to wake it (BB-154). */
-  noWakeSource: boolean;
+  /**
+   * BB-414 (C4): the stored assessment's liveness, joined into every binding
+   * read (`assessments.liveness`), never a column of its own. `stalled` is the
+   * reconcile's own derivation; `live` is the composed live-source answer the
+   * untyped and ops `observedStall` rule reads on read. Null with no
+   * assessment; a derived read, never patched.
+   */
+  assessedLiveness?: { stalled: boolean; live: boolean } | null;
   /** The reason the last wake was delivered (BB-154); cleared by the report it produced. */
   lastWakeReason: string | null;
   /** Consecutive requeue-only wakes with the same wait (BB-154). */
@@ -1296,6 +1308,9 @@ export type Binding = {
 type BindingRow = Record<string, unknown> & { id: string };
 
 const readyDefault = (): ReadyState => readyStateSchema.parse({});
+
+/** BB-414: the joined `assessments.liveness`, the part `Binding` carries; the extra fields are dropped. */
+const assessedLivenessSchema = z.object({ stalled: z.boolean(), live: z.boolean().default(false) });
 
 function rowToBinding(r: BindingRow): Binding {
   const str = (k: string) => (r[k] === null || r[k] === undefined ? null : String(r[k]));
@@ -1376,7 +1391,7 @@ function rowToBinding(r: BindingRow): Binding {
     idleInitiativeSince: num("idle_initiative_since"),
     idleWokenAt: num("idle_woken_at"),
     idleWakeNow: Number(r.idle_wake_now ?? 0) === 1,
-    noWakeSource: Number(r.no_wake_source ?? 0) === 1,
+    assessedLiveness: json(assessedLivenessSchema, str("assessment_liveness"), null),
     lastWakeReason: str("last_wake_reason"),
     requeueWakeCount: Number(r.requeue_wake_count ?? 0),
     requeueWaitText: str("requeue_wait_text"),
@@ -1463,7 +1478,6 @@ const COLUMNS = {
   idleInitiativeSince: "idle_initiative_since",
   idleWokenAt: "idle_woken_at",
   idleWakeNow: "idle_wake_now",
-  noWakeSource: "no_wake_source",
   lastWakeReason: "last_wake_reason",
   requeueWakeCount: "requeue_wake_count",
   requeueWaitText: "requeue_wait_text",
@@ -1506,8 +1520,6 @@ const VISIBLE_COLUMNS = [
   "ending",
   "ended_at",
   "thread_id",
-  // BB-154: the mark changes line two's phrase, so its write rings the channel.
-  "no_wake_source",
   // BB-392: the missing-reviewer-round mark changes line two's phrase too.
   "reviewer_round_missing",
   // BB-406: the initiative idle clock changes line two's chip.
@@ -1970,13 +1982,14 @@ export type DivergenceRow = {
 /**
  * BB-333: one binding's typed-wait shadow state, the reader's row for
  * `bb stewards wait-divergences`. `derived` is the stall the typed wait derives
- * on each reconcile; `reported` is the stored `noWakeSource` flag (a reconcile
- * is its only writer for a ticket or pull request since BB-375; an ops
- * binding's report still writes it). The `kind`, `firstSeenAt`, `lastSeenAt`
- * and `count` come from the `noWakeSource`
- * divergence row the state last wrote, so a divergence that has stopped still
- * reads back with its history. `at` is when the derived/reported pair last
- * changed. Read-only: the reconcile writes this table and the divergence rows.
+ * on each reconcile; `reported` is the stored assessment's stall that the
+ * retired `noWakeSource` column used to hold (a reconcile was its only writer
+ * for a ticket or pull request since BB-375; an ops binding's report wrote it
+ * before BB-414). The `kind`, `firstSeenAt`, `lastSeenAt` and `count` come from
+ * the `waitStall` divergence row the state last wrote, so a divergence that has
+ * stopped still reads back with its history. `at` is when the derived/reported
+ * pair last changed. Read-only: nothing writes this table since BB-414, and no
+ * consumer reads it to decide or render.
  */
 export type WaitDivergenceRow = {
   bindingId: string;
@@ -2065,7 +2078,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // measured reconcile or wake.
   const hasNonActions = db.prepare("SELECT 1 AS one FROM pragma_table_info('assessments') WHERE name = 'non_actions'").get() !== undefined;
   const BINDING_SELECT = hasNonActions
-    ? "SELECT b.*, a.non_actions AS assessment_non_actions FROM bindings b LEFT JOIN assessments a ON a.binding_id = b.id"
+    ? "SELECT b.*, a.non_actions AS assessment_non_actions, a.liveness AS assessment_liveness FROM bindings b LEFT JOIN assessments a ON a.binding_id = b.id"
     : "SELECT * FROM bindings";
   const getBinding = db.prepare<[string], BindingRow>(BINDING_SELECT + " WHERE id = ?");
   // BB-318: an entity can now have an open binding in one project and ended
@@ -2348,7 +2361,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // with no row to show for it. Scoped to the state table's pair, so a second
   // (other-direction) row for the same binding is not touched.
   const touchWaitDivergenceStmt = lazy<[number, string, string, string, string], unknown>(
-    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = ? WHERE binding_id = ? AND surface = 'noWakeSource' AND old = ? AND new = ?",
+    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = ? WHERE binding_id = ? AND surface = 'waitStall' AND old = ? AND new = ?",
   );
   // The stop touch keeps the row's own inputs (the disagreement it records) and
   // only flips its `transition`, so a stopped row still reads back the wait
@@ -2357,12 +2370,12 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // no-wake-source` pair (BB-333). `json_set` keeps this append-only: no
   // migration for a display-only field.
   const stopWaitDivergenceStmt = lazy<[number, string, string, string], unknown>(
-    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = json_set(inputs, '$.transition', 'stop') WHERE binding_id = ? AND surface = 'noWakeSource' AND old = ? AND new = ?",
+    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = json_set(inputs, '$.transition', 'stop') WHERE binding_id = ? AND surface = 'waitStall' AND old = ? AND new = ?",
   );
   // BB-333: the reader's side of the state table. The `bb stewards
   // wait-divergences` command reads the current derived/reported pair per
-  // binding; the `noWakeSource` divergence row the pair wrote rides along for
-  // the kind and the seen window. Prepared lazily for the same reason.
+  // binding; the `waitStall` divergence row the pair wrote rides along for the
+  // kind and the seen window. Prepared lazily for the same reason.
   const waitDivergenceStatesStmt = lazy<[], Record<string, unknown>>("SELECT * FROM wait_divergence_state ORDER BY at DESC, binding_id");
   const waitDivergenceStatesByBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM wait_divergence_state WHERE binding_id = ? ORDER BY at DESC");
 
@@ -4362,14 +4375,14 @@ export function createStore(db: Database.Database, now: () => number, options: S
     /**
      * The typed-wait shadow's current derived-vs-flag state, one row per
      * binding that has ever reported a typed wait (BB-333), for the
-     * `bb stewards wait-divergences` command. Read-only. The `noWakeSource`
+     * `bb stewards wait-divergences` command. Read-only. The `waitStall`
      * divergence row the pair wrote rides along for the wait kind, the
      * first/last seen window and the count; the active direction's row is
      * preferred, and a stopped divergence keeps its most recent row.
      */
     waitDivergences(opts: { bindingId?: string } = {}): WaitDivergenceRow[] {
       const states = opts.bindingId === undefined ? waitDivergenceStatesStmt().all() : waitDivergenceStatesByBindingStmt().all(opts.bindingId);
-      const logs = (opts.bindingId === undefined ? divergencesBySurfaceStmt().all("noWakeSource") : divergencesByBothStmt().all(opts.bindingId, "noWakeSource")).map(toDivergenceRow);
+      const logs = (opts.bindingId === undefined ? divergencesBySurfaceStmt().all("waitStall") : divergencesByBothStmt().all(opts.bindingId, "waitStall")).map(toDivergenceRow);
       const token = (v: boolean): string => (v ? "no-wake-source" : "source-or-no-wait");
       return states.map((r) => {
         const bindingId = String(r.binding_id);
@@ -4401,14 +4414,14 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return removed;
     },
     /**
-     * Record a typed-wait divergence from the stored `noWakeSource` flag
-     * (BB-333; the reconcile is its only writer since BB-375). A `noWakeSource`
-     * row is written only when the disagreement
-     * starts; while it stands the open row's `last_seen_at` is refreshed so the
-     * age prune cannot drop it, and when it stops the row is noted and the
-     * state cleared without adding a row that would read as a divergence. The
-     * `(binding_id, surface, old, new)` unique constraint caps the rows at two
-     * per binding. Returns whether a divergence row was written.
+     * Record a typed-wait divergence from the stored assessment's stall
+     * (BB-333; the reconcile was its only writer since BB-375, and it no longer
+     * writes at all since BB-414). A `waitStall` row is written only when the
+     * disagreement starts; while it stands the open row's `last_seen_at` is
+     * refreshed so the age prune cannot drop it, and when it stops the row is
+     * noted and the state cleared without adding a row that would read as a
+     * divergence. The `(binding_id, surface, old, new)` unique constraint caps
+     * the rows at two per binding. Returns whether a divergence row was written.
      */
     recordWaitDivergence(fields: { bindingId: string; derived: boolean; reported: boolean; waitKind: string | null; waitLive: boolean; inputs: Record<string, unknown> }, at = now()): boolean {
       const derived = fields.derived ? 1 : 0;
@@ -4445,7 +4458,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       insertDivergenceStmt().run(
         newId("dvg"),
         fields.bindingId,
-        "noWakeSource",
+        "waitStall",
         old(reported),
         old(derived),
         note("start"),

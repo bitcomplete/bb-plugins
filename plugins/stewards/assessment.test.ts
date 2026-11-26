@@ -53,7 +53,6 @@ const binding = (over: Partial<AssessmentInput["binding"]> = {}): AssessmentInpu
   hold: null,
   deployments: {},
   requeueUntil: null,
-  noWakeSource: false,
   status: null,
   createdAt: 1,
   advancedAt: 1,
@@ -240,34 +239,23 @@ describe("the shadow assessment: the page refusal text (BB-292 #3)", () => {
   });
 });
 
-describe("the shadow assessment: the liveness (bb-plugins#294 and noWakeSource)", () => {
-  it("derives the stall from the rows on the bb-plugins#294 shape, agreeing with the stored flag", () => {
+describe("the shadow assessment: the liveness (bb-plugins#294 and the free-text rule)", () => {
+  it("derives the stall from the rows on the bb-plugins#294 shape", () => {
     // #294: a `pr` binding's own open pull request with a free-text wait and no
-    // other source; the derivation marks it noWakeSource, and the rows say the
-    // same thing.
+    // other source; the derivation marks it stalled.
     const entity = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" });
     const i = input({
-      binding: binding({ kind: "pr", status: status("the dompurify fix on main"), noWakeSource: true }),
+      binding: binding({ kind: "pr", status: status("the dompurify fix on main") }),
       observed: { entity, pulls: [] },
       ownPulls: own(entity),
     });
     const a = assess(i);
     expect(a.liveness.live).toBe(false);
     expect(a.liveness.stalled).toBe(true);
-    expect(a.liveness.reportedNoWakeSource).toBe(true);
-    // Agreement, so nothing is logged.
-    expect(compare(i, a).find((x) => x.surface === "noWakeSource")).toBeUndefined();
-  });
-
-  it("records a noWakeSource divergence when the stored flag and the rows disagree", () => {
-    const i = input({ binding: binding({ noWakeSource: true, status: null }) });
-    const a = assess(i);
-    expect(a.liveness.stalled).toBe(false);
-    expect(compare(i, a).find((x) => x.surface === "noWakeSource")).toMatchObject({ old: "no-wake-source", new: "source-or-no-wait" });
   });
 
   it("does not call a dated wait a stall", () => {
-    const i = input({ binding: binding({ status: status("the vendor's reply"), requeueUntil: 2_000_000, noWakeSource: false }) });
+    const i = input({ binding: binding({ status: status("the vendor's reply"), requeueUntil: 2_000_000 }) });
     const a = assess(i);
     expect(a.liveness.stalled).toBe(false);
   });
@@ -473,10 +461,10 @@ describe("the shadow assessment: the typed wait (BB-333)", () => {
   });
 
   it("keeps the free-text rule exactly for a report with no typed wait", () => {
-    const stalled = assess(input({ binding: binding({ status: status("the vendor"), noWakeSource: false }) }));
+    const stalled = assess(input({ binding: binding({ status: status("the vendor") }) }));
     expect(stalled.liveness.waitLive).toBeNull();
     expect(stalled.liveness.stalled).toBe(true);
-    const dated = assess(input({ binding: binding({ status: status("the vendor"), requeueUntil: 2_000_000, noWakeSource: false }) }));
+    const dated = assess(input({ binding: binding({ status: status("the vendor"), requeueUntil: 2_000_000 }) }));
     expect(dated.liveness.stalled).toBe(false);
   });
 
@@ -646,7 +634,7 @@ describe("the typed-wait divergence store (BB-333)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.count).toBe(2);
     // The surface filter still reads it as `noWakeSource`.
-    expect(s.divergences({ surface: "noWakeSource" })).toHaveLength(1);
+    expect(s.divergences({ surface: "waitStall" })).toHaveLength(1);
     // A first observation that agrees is a baseline, not a transition.
     expect(s.recordWaitDivergence({ bindingId: "b2", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 5_000)).toBe(false);
     expect(s.divergences({ bindingId: "b2" })).toHaveLength(0);

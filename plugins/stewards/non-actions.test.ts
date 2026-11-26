@@ -481,7 +481,7 @@ describe("the non-action render surfaces (BB-335)", () => {
       answered: [],
       withUser: [],
       stuck: [],
-      noWakeSource: [],
+      stalled: [],
       stall: [],
       held: [],
       nonActions: [{ binding: { entityKey: "ENG-12", kind: "ticket", phase: "Done" } as never, nonActions: { "binding-ended-closed": { date: "2026-11-14", text: "Closed because the binding ended (terminal)" } } }],
@@ -492,7 +492,7 @@ describe("the non-action render surfaces (BB-335)", () => {
   });
 
   it("does not render the digest section when there are no non-actions", () => {
-    const records: DigestRecords = { previous: null, since: NOW, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [] };
+    const records: DigestRecords = { previous: null, since: NOW, moved: [], ended: [], answered: [], withUser: [], stuck: [], stalled: [], stall: [], held: [] };
     expect(formatRecords(records, []).join("\n")).not.toContain("### Non-actions");
   });
 });

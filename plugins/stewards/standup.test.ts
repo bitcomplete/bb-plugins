@@ -379,7 +379,7 @@ const briefing = (over: Partial<Briefing> = {}): Briefing => ({
   notes: [],
   decisions: { needs: [{ need: { what: "Approve the spec", kind: "approve-spec", createdAt: 1 } as never, binding: binding({ entityKey: "ENG-12" }) }], withUser: [] },
   escalations: [{ escalation: escalation({ question: "A project question" }), from: binding({ entityKey: "ENG-13" }) }],
-  stuck: { stuck: [{ escalation: escalation({ kind: "stuck", question: "Blocked on CI" }), from: binding({ entityKey: "ENG-14" }) }], held: [binding({ entityKey: "ENG-15", hold: "behind ENG-16", holdBehind: ["ENG-16"] })], noWakeSource: [], stall: [], datedWaits: [] },
+  stuck: { stuck: [{ escalation: escalation({ kind: "stuck", question: "Blocked on CI" }), from: binding({ entityKey: "ENG-14" }) }], held: [binding({ entityKey: "ENG-15", hold: "behind ENG-16", holdBehind: ["ENG-16"] })], stalled: [], stall: [], datedWaits: [] },
   done: { moved: [binding({ entityKey: "ENG-17" })], ended: [binding({ entityKey: "ENG-18", endReason: "merged" })], answered: [] },
   assumptions: [{ assumption: { text: "the schema is stable" } as never, binding: binding({ entityKey: "ENG-19" }) }],
   ...over,
@@ -481,7 +481,7 @@ describe("buildStandupInstructions (BB-300)", () => {
   it("leaves a hold undated because the store records no hold time (BB-306)", () => {
     const now = Date.parse("2026-11-12T00:00:00Z");
     const text = buildStandupInstructions(
-      briefing({ stuck: { stuck: [], held: [binding({ entityKey: "ENG-15", hold: "behind ENG-16", holdBehind: ["ENG-16"], createdAt: 1 })], noWakeSource: [], stall: [], datedWaits: [] } }),
+      briefing({ stuck: { stuck: [], held: [binding({ entityKey: "ENG-15", hold: "behind ENG-16", holdBehind: ["ENG-16"], createdAt: 1 })], stalled: [], stall: [], datedWaits: [] } }),
       "Acme",
       now,
     );
@@ -495,7 +495,7 @@ describe("buildStandupInstructions (BB-300)", () => {
   it("renders an idle initiative's line in the stuck-or-held section (BB-406)", () => {
     const entity = issue({ labels: ["bb-managed", "initiative"], description: "## Criteria\n\n- [ ] One\n- [ ] Two", state: "In Progress" });
     const idle = binding({ id: "b-idle", entityKey: "ENG-30", idleInitiativeSince: 10_000 - 3 * 3_600_000, lastSnapshot: { entity, pulls: [] } });
-    const brief = briefing({ stuck: { stuck: [], held: [], noWakeSource: [], stall: [], datedWaits: [], idle: [idle] } });
+    const brief = briefing({ stuck: { stuck: [], held: [], stalled: [], stall: [], datedWaits: [], idle: [idle] } });
     const text = buildStandupInstructions(brief, "Acme", 10_000);
     expect(text).toContain("ENG-30: idle 3h — 2 unmet criteria");
   });
@@ -546,7 +546,7 @@ describe("buildStandupInstructions (BB-300)", () => {
       briefing({
         decisions: { needs, withUser: [] },
         escalations,
-        stuck: { stuck, held: [], noWakeSource: [], stall: [], datedWaits: [] },
+        stuck: { stuck, held: [], stalled: [], stall: [], datedWaits: [] },
         done: { moved, ended: [], answered: [] },
         assumptions,
       }),
@@ -581,7 +581,7 @@ describe("buildStandupInstructions (BB-300)", () => {
       briefing({
         decisions: { needs, withUser: [] },
         escalations,
-        stuck: { stuck, held: [], noWakeSource: [], stall: [], datedWaits: [] },
+        stuck: { stuck, held: [], stalled: [], stall: [], datedWaits: [] },
         done: { moved, ended: [], answered: [] },
         assumptions,
       }),
@@ -617,7 +617,7 @@ const tierBriefing = (agenda: Binding, over: Partial<Briefing> = {}): Briefing =
   briefing({
     decisions: { needs: [{ need: { id: "need_1", what: "Approve the spec", kind: "approve-spec", createdAt: NOW - 1_000, url: "spec", how: null } as never, binding: agenda }], withUser: [] },
     escalations: [],
-    stuck: { stuck: [], held: [], noWakeSource: [], stall: [], datedWaits: [] },
+    stuck: { stuck: [], held: [], stalled: [], stall: [], datedWaits: [] },
     done: { moved: [], ended: [], answered: [] },
     assumptions: [],
     ...over,
@@ -671,14 +671,15 @@ describe("buildStandupBrief (BB-312)", () => {
     const stuck = binding({ id: "b-stuck", entityKey: "ENG-10", title: "Stuck" });
     const stalled = binding({ id: "b-stall", entityKey: "ENG-11", title: "Stalled" });
     const held = binding({ id: "b-held", entityKey: "ENG-12", title: "Held", hold: "behind ENG-1", holdBehind: ["ENG-1"] });
-    const noWake = binding({ id: "b-nowake", entityKey: "ENG-13", title: "No wake", noWakeSource: true });
+    // BB-414: the flag is gone; a free-text wait with no live source derives the stall.
+    const noWake = binding({ id: "b-nowake", entityKey: "ENG-13", title: "No wake", status: { phase: "Todo", summary: "s", nextAction: "n", actor: "other", waitingOn: "the vendor", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 } as never });
     const dated = binding({ id: "b-dated", entityKey: "ENG-14", title: "Dated", requeueUntil: NOW + DAY });
     const brief = tierBriefing(binding({ id: "b-agenda", entityKey: "ENG-1" }), {
       stuck: {
         stuck: [{ escalation: escalation({ kind: "stuck", question: "Blocked" }), from: stuck }],
         stall: [{ escalation: escalation({ kind: "stall", question: "Stalled" }), from: stalled }],
         held: [held],
-        noWakeSource: [noWake],
+        stalled: [noWake],
         datedWaits: [dated],
       },
     });
@@ -707,7 +708,8 @@ describe("buildStandupBrief (BB-312)", () => {
 });
 
 describe("quiet ops monitors in the stand-up brief (BB-315)", () => {
-  const opsBinding = (over: Partial<Binding> = {}): Binding => binding({ kind: "ops", source: "ops", phase: "watching", ...over });
+  // A quiet monitor has no free-text wait, so BB-414's derived stall is false.
+  const opsBinding = (over: Partial<Binding> = {}): Binding => binding({ kind: "ops", source: "ops", phase: "watching", status: null, ...over });
   const section = (text: string, heading: string): string => {
     const start = text.indexOf(`## ${heading}`);
     const end = text.indexOf("\n## ", start + 1);
@@ -727,7 +729,7 @@ describe("quiet ops monitors in the stand-up brief (BB-315)", () => {
     const agenda = binding({ id: "b-agenda", entityKey: "ENG-1" });
     const stuck = opsBinding({ id: "b-stuck", entityKey: "sentry-project/acme/web", title: "Stuck watch" });
     const brief = tierBriefing(agenda, {
-      stuck: { stuck: [{ escalation: escalation({ kind: "stuck", question: "Blocked" }), from: stuck }], held: [], noWakeSource: [], stall: [], datedWaits: [] },
+      stuck: { stuck: [{ escalation: escalation({ kind: "stuck", question: "Blocked" }), from: stuck }], held: [], stalled: [], stall: [], datedWaits: [] },
     });
     const text = buildStandupBrief(brief, [agenda, stuck], new Map(), "Acme", NOW, [], { closedLimit: 10, closedDays: 3, lastCompletedAt: null });
     expect(section(text, "Other open stewards")).toContain(stuck.entityKey);
@@ -786,7 +788,7 @@ describe("the enriched agenda items (BB-312)", () => {
     const brief = briefing({
       decisions: { needs: [], withUser: [{ escalation: escalation({ question: "Ship it?" }), from }] },
       escalations: [],
-      stuck: { stuck: [], held: [], noWakeSource: [], stall: [], datedWaits: [] },
+      stuck: { stuck: [], held: [], stalled: [], stall: [], datedWaits: [] },
       done: { moved: [], ended: [], answered: [] },
       assumptions: [],
     });
@@ -806,7 +808,7 @@ describe("the enriched agenda items (BB-312)", () => {
       notes: ["The owner asked about BB-312"],
       decisions: { needs: [], withUser: [] },
       escalations: [],
-      stuck: { stuck: [], held: [], noWakeSource: [], stall: [], datedWaits: [] },
+      stuck: { stuck: [], held: [], stalled: [], stall: [], datedWaits: [] },
       done: { moved: [], ended: [], answered: [] },
       assumptions: [],
     });
