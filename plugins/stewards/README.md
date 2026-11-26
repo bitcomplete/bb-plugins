@@ -535,7 +535,13 @@ install on a stock bb: one repository, no Linear, no hooks service.
   lifts: when the waited binding merges all its pull requests or ends, the
   plugin notes the waiter, clears the stale wait so the next look cannot
   re-derive it live, and wakes it with a change line naming what happened
-  (BB-410). It then behaves like `hold, behind` for waking.
+  (BB-410). It then behaves like `hold, behind` for waking. A typed `person`
+  wait is delivered when the page item it names closes — a plain project
+  question (`qst_`) or an escalation with no binding, which otherwise wakes
+  only the project steward — with the same note, clear and reconcile
+  (BB-411). A typed `deployment` wait is delivered when its watch settles,
+  including a settlement that queued only a quiet note, and the stale wait is
+  cleared (BB-411).
   Separately, the plugin counts consecutive wakes
   whose reason was `requeue` and whose report ended with the same trimmed
   `waitingOn`; at two (one plugin constant, not a `project.json` key) it

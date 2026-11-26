@@ -1633,6 +1633,65 @@ describe("scheduling overlapping work", () => {
     expect(t.hooks.store.find("ENG-13")!.wait).toBeNull();
   });
 
+  it("wakes a steward that reported a typed `person` wait when its plain project question closes (BB-411)", async () => {
+    const { t, second, toSecond } = await two();
+    // A plain project question, no escalation and no binding: closing it wakes
+    // only the project steward today, so the binding that reported the wait
+    // must be released by the item-close hook.
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });
+    await t.tool("steward_report", { ...building, waitingOn: "the answer", wait: { kind: "person", ref: q.id } }, second);
+    expect(t.hooks.store.find("ENG-13")!.wait).toEqual({ kind: "person", ref: q.id });
+    const wakes = toSecond().length;
+    const res = await t.harness.callRpc("stewardsAnswerQuestion", { questionId: q.id, answer: "Yes." }, { experimental_caller: { kind: "client" } });
+    expect(res).toMatchObject({ ok: true, message: "Closed." });
+    await t.flush();
+    expect(toSecond().length).toBe(wakes + 1);
+    const wake = toSecond().at(-1)!.text;
+    expect(wake).toMatch(new RegExp(`${q.id}, which you waited on, closed\\.`, "u"));
+    expect(wake).toMatch(/The wait is cleared; report what you are waiting on next/u);
+    // The stale wait is cleared, so the next look cannot re-derive it live.
+    expect(t.hooks.store.find("ENG-13")!.wait).toBeNull();
+  });
+
+  it("wakes a typed `person` wait when the project steward closes the plain question from a thread (BB-411)", async () => {
+    const { t, project, second, toSecond } = await two();
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });
+    await t.tool("steward_report", { ...building, waitingOn: "the answer", wait: { kind: "person", ref: q.id } }, second);
+    expect(t.hooks.store.find("ENG-13")!.wait).toEqual({ kind: "person", ref: q.id });
+    const wakes = toSecond().length;
+    // The project steward closes it with `resolve`, not the page: the same
+    // release must run from `questionWrites`.
+    const res = await t.tool("steward_update", { resolve: q.id, answer: "Yes." }, project);
+    expect(res.error).toBe(false);
+    await t.flush();
+    expect(toSecond().length).toBe(wakes + 1);
+    expect(toSecond().at(-1)!.text).toMatch(new RegExp(`${q.id}, which you waited on, closed\\.`, "u"));
+    expect(t.hooks.store.find("ENG-13")!.wait).toBeNull();
+  });
+
+  it("does not double-note a `person` wait on the waiter's own forwarded escalation (BB-411)", async () => {
+    const { t, project, second, toSecond, toProject } = await two();
+    // ENG-13 escalates; the project steward forwards it as a question.
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, second);
+    const esc = /(esc_[\w-]+) from ENG-13/u.exec(toProject().at(-1)!.text)![1]!;
+    const forwarded = await t.tool("steward_update", { binding: "ENG-13", forward: esc }, project);
+    const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
+    // ENG-13's steward waits on its own forwarded question.
+    await t.tool("steward_report", { ...building, waitingOn: "the answer", wait: { kind: "person", ref: qst } }, second);
+    expect(t.hooks.store.find("ENG-13")!.wait).toEqual({ kind: "person", ref: qst });
+    const wakes = toSecond().length;
+    const res = await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, answer: "Yes." }, { experimental_caller: { kind: "client" } });
+    expect(res).toMatchObject({ ok: true });
+    await t.flush();
+    // Exactly one wake: the escalation's own note. The person-wait release
+    // clears the stale wait without a second note.
+    expect(toSecond().length).toBe(wakes + 1);
+    const wake = toSecond().at(-1)!.text;
+    expect(wake).toMatch(/decided by the user: Yes\./u);
+    expect(wake).not.toMatch(/which you waited on, closed/u);
+    expect(t.hooks.store.find("ENG-13")!.wait).toBeNull();
+  });
+
   it("lets a ticket start on the project steward's word, asks again only for a new overlap, and lifts a hold when the work it waits behind ends", async () => {
     const { t, project, second, toProject } = await two();
     await t.tool("steward_report", ready, second);
@@ -15465,6 +15524,63 @@ describe("deployment watching (BB-53)", () => {
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", note: expect.stringMatching(/does not contain merge/u) });
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
     expect(t.hooks.store.find("ENG-12")!.pending.some((n) => n.quiet === true)).toBe(true);
+  });
+
+  // BB-411: a stored `deployment` wait is released when its watch settles.
+  // The re-evaluation loop settles a `deploying` watch deployed with only a
+  // log (no `deploymentChanges` line), so the wait is the only actionable
+  // change; the stale wait is cleared.
+  it("wakes a typed `deployment` wait when its watch settles quietly (BB-411)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.hooks.forgetConfigs();
+    await seededWatch(t, watchFixture(t.now(), { state: "deploying", deploymentId: 7, deploymentState: "success", ref: "main", sha: "bbbbbbb2", url: "https://github.com/acme/web/actions/runs/9" }));
+    const steward = "thr_steward";
+    await t.tool("steward_report", { phase: "In Progress", summary: "Watching the deploy.", nextAction: "Wait", actor: "steward", waitingOn: "the deploy", wait: { kind: "deployment", ref: "acme/web#7" } }, steward);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "deployment", ref: "acme/web#7" });
+    const wakes = t.sends.filter((s) => s.threadId === steward).length;
+    // main contains the merge: the re-evaluation settles the watch deployed
+    // with only a log, so the wait's live -> not-live is the actionable change.
+    t.sourceCompares.set("acme/web aaaaaaa1 main", "identical");
+    await t.hooks.reconcilePass("p1");
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
+    expect(t.sends.filter((s) => s.threadId === steward).length).toBe(wakes + 1);
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/acme\/web#7, which you waited on, settled\./u);
+    expect(t.hooks.store.find("ENG-12")!.wait).toBeNull();
+  });
+
+  // BB-411: the doorbell path releases the wait at the settle, before the
+  // reconcile it schedules runs; the reconcile then delivers the line once.
+  it("clears a typed `deployment` wait at the doorbell settle, before the reconcile (BB-411)", async () => {
+    // A wider debounce than the default separates the doorbell's own timer from
+    // the reconcile it schedules, so the check below lands between them.
+    const t = await setup({ timing: { debounceMs: 20, nightlyStaggerMs: 0 } });
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { phase: "In Progress", summary: "Watching the deploy.", nextAction: "Wait", actor: "steward", waitingOn: "the deploy", wait: { kind: "deployment", ref: "acme/web#7" } }, steward);
+    expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "deployment", ref: "acme/web#7" });
+    const wakes = t.sends.filter((s) => s.threadId === steward).length;
+    t.sourceCompares.set("acme/web aaaaaaa1 main", "identical");
+    await t.harness.callRpc("stewardsRing", { source: "github", id: "acme/web#7", deployment: deployment() }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } });
+    // Let the doorbell's own debounce fire and its handler finish. Its reconcile
+    // debounce (20ms after that) has not run yet: the wait is already cleared
+    // by the doorbell itself.
+    await new Promise((r) => setTimeout(r, 30));
+    await t.hooks.settle();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
+    expect(t.hooks.store.find("ENG-12")!.wait).toBeNull();
+    // The reconcile now runs and delivers the release line once, not twice.
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === steward).length).toBe(wakes + 1);
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/acme\/web#7, which you waited on, settled\./u);
+    await t.hooks.reconcilePass("p1");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === steward).length).toBe(wakes + 1);
   });
 
   // BB-204: a watch in a repo no carries rule matches wakes once, then stays

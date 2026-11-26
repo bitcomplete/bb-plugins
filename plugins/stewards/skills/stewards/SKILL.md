@@ -349,6 +349,9 @@ Two tools are yours; everything else you do with the tools every thread has.
   the same edges a `behind` hold lifts: when the waited binding merges all
   its pull requests or ends, the plugin wakes you with a change line and
   clears the stale wait, so the next look cannot re-derive it live (BB-410).
+  A `person` wait is delivered when the page item it names closes, and a
+  `deployment` wait when its watch settles, each with a change line and the
+  stale wait cleared (BB-411).
   If the free text names an open
   binding in the same project, the reply names it and the exact `hold,
   behind` call. Clear the mark by adding a real source or clearing the wait.
