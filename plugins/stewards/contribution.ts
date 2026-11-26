@@ -19,7 +19,6 @@
 // from the `AssessmentInput` the reconcile already holds.
 import { createHash } from "node:crypto";
 import {
-  assessLiveWakeSource,
   isOwn,
   leasedLinkedPullKeys,
   ownPullEntities,
@@ -32,7 +31,7 @@ import {
 import type { AssessedGate, Assessment, AssessmentInput, DecideMark } from "./assessment.js";
 import { waitBudgetMs } from "./config.js";
 import { prGate, type PrGate, type PrGateOptions, type ProjectApprovalRecord } from "./gate.js";
-import { anyWorkerInFlight, idleInActiveStage, observedStall, productGateOptions } from "./reconcile.js";
+import { idleInActiveStage, observedStall, productGateOptions } from "./reconcile.js";
 import { gateState } from "./ready-gate.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation } from "./store.js";
@@ -163,12 +162,13 @@ export type ResourceContribution = {
 
 /**
  * One hold a source contributes, wrapping the binding's hold, ending and
- * requeue and adding `behind`, `merge-behind` and `ready-gate`. `behind`
- * carries the entity keys a `behind` or `merge-behind` hold waits on.
+ * requeue and adding `behind`, `stack`, `merge-behind` and `ready-gate`.
+ * `behind` carries the entity keys a `behind`, `stack` or `merge-behind` hold
+ * waits on.
  */
 export type HoldContribution = {
   source: ContributionSource;
-  /** `hold`, `ending`, `requeue`, `behind`, `merge-behind` or `ready-gate`. */
+  /** `hold`, `ending`, `requeue`, `behind`, `stack`, `merge-behind` or `ready-gate`. */
   id: string;
   held: boolean;
   behind: readonly string[];
@@ -214,7 +214,7 @@ export type ComposedAssessment = {
   resources: readonly ResourceContribution[];
   holds: readonly HoldContribution[];
   reasons: readonly Reason[];
-  liveness: { idleBase: boolean; idle: boolean; stalled: boolean };
+  liveness: { live: boolean; idleBase: boolean; idle: boolean; stalled: boolean };
 };
 
 const empty = (source: ContributionSource): SourceContribution => ({ source, gate: [], waits: [], resources: [], holds: [], reasons: [] });
@@ -242,22 +242,41 @@ function waitContribution(source: ContributionSource, input: AssessmentInput): W
 const PULL_WAIT_KINDS: ReadonlySet<WaitKind> = new Set(["pull", "review", "deployment"]);
 
 /**
- * The binding's holds, one item per kind so the set is complete: the fields
- * `idleInActiveStage` reads today (hold, ending, requeue), the scheduling
- * holds (`behind`, `merge-behind`, BB-215/BB-256) and the ready-gate hold. The
- * ready gate is held while the binding is in the spec stage (the playbook's
- * Todo) and the gate has not passed; it reads the same `gateState`
- * `composeAssessment` computes for `gate.readyPassed`.
+ * The scheduling holds a binding carries, one item per kind: `hold`, `ending`,
+ * `requeue` (a dated wait still ahead), `behind` (BB-215's hold behind another
+ * binding), `stack` (BB-215's stack-wait) and `merge-behind` (BB-256's merge
+ * hold). The `hold`/`behind`/`stack`/`merge-behind` rows are what the retired
+ * live-source predicate read; `ending` and `requeue` are what
+ * `idleInActiveStage` reads. It is pure over the binding and `now`, so the
+ * presentation surfaces and `atWork` read the same composed set the reconcile
+ * does, with no extra store read.
+ */
+export function schedulingHolds(
+  b: Pick<AssessmentInput["binding"], "hold" | "ending" | "requeueUntil" | "holdBehind" | "holdStack" | "mergeBehind">,
+  now: number,
+): HoldContribution[] {
+  return [
+    { source: "local", id: "hold", held: b.hold !== null, behind: [] },
+    { source: "local", id: "ending", held: b.ending !== null, behind: [] },
+    { source: "local", id: "requeue", held: b.requeueUntil !== null && b.requeueUntil > now, behind: [] },
+    { source: "local", id: "behind", held: (b.holdBehind ?? []).length > 0, behind: b.holdBehind ?? [] },
+    { source: "local", id: "stack", held: (b.holdStack ?? []).length > 0, behind: b.holdStack ?? [] },
+    { source: "local", id: "merge-behind", held: (b.mergeBehind ?? []).length > 0, behind: b.mergeBehind ?? [] },
+  ];
+}
+
+/**
+ * The binding's holds, one item per kind so the set is complete: the scheduling
+ * holds above, plus the ready-gate hold. The ready gate is held while the
+ * binding is in the spec stage (the playbook's Todo) and the gate has not
+ * passed; it reads the same `gateState` `composeAssessment` computes for
+ * `gate.readyPassed`.
  */
 function bindingHolds(source: ContributionSource, input: AssessmentInput): HoldContribution[] {
   const b = input.binding;
   const readyPassed = gateState(input.playbook, b.ready, input.currentSpecHash).passed;
   return [
-    { source, id: "hold", held: b.hold !== null, behind: [] },
-    { source, id: "ending", held: b.ending !== null, behind: [] },
-    { source, id: "requeue", held: b.requeueUntil !== null && b.requeueUntil > input.now, behind: [] },
-    { source, id: "behind", held: (b.holdBehind ?? []).length > 0, behind: b.holdBehind ?? [] },
-    { source, id: "merge-behind", held: (b.mergeBehind ?? []).length > 0, behind: b.mergeBehind ?? [] },
+    ...schedulingHolds(b, input.now).map((h) => ({ ...h, source })),
     { source, id: "ready-gate", held: b.stage === "spec" && !readyPassed, behind: [] },
   ];
 }
@@ -283,7 +302,16 @@ function entityContribution(source: ContributionSource, input: AssessmentInput):
   for (const [key, w] of Object.entries(input.binding.deployments)) {
     resources.push({ source, id: `deployment:${lc(key)}`, active: w.state === "merged" || w.state === "deploying", subject: { kind: "pull", id: w.key } });
   }
-  resources.push({ source, id: "workers", active: anyWorkerInFlight(input.workers), subject: null });
+  // The resources the live-source answer reads (BB-413, C7): a running worker
+  // and a parked worker are the two halves of the retired live predicate's
+  // worker clauses, an open escalation and a need are its last two. A plainly
+  // `finished` worker is in flight but is not a live source, so `workers`
+  // follows the live predicate (running or parked), and a parked worker gets
+  // its own resource so the surface can name it.
+  resources.push({ source, id: "workers", active: input.workers.some((w) => w.status === "running" || (w.status === "finished" && w.parkedWaitingOn !== null)), subject: null });
+  resources.push({ source, id: "parked-workers", active: input.workers.some((w) => w.status === "finished" && w.parkedWaitingOn !== null), subject: null });
+  resources.push({ source, id: "escalations", active: input.escalations.length > 0, subject: null });
+  resources.push({ source, id: "needs", active: input.needs.length > 0, subject: null });
   return { source, gate: [], waits, resources, holds: bindingHolds(source, input), reasons: [] };
 }
 
@@ -294,12 +322,18 @@ function pullContributions(input: AssessmentInput): { gate: GateContribution[]; 
   const gate: GateContribution[] = [];
   const resources: ResourceContribution[] = [];
   const reasons: Reason[] = [];
+  // The pull watch (`pullWatchCounts`, BB-285/BB-154): a ticket's belonging
+  // open pull request whose gate is unmet. It is the wake answer, distinct
+  // from the idle-blocking `open-pull` below (a `pr`/`review` binding's own
+  // open pull is idle-blocking but never a wake source).
+  let pullWatch = false;
   for (const e of ownPullEntities(observed, gatePulls)) {
     const decideMark = decisions.get(lc(e.key)) ?? "user";
     const mark: DecideMark = decideMark === "project" && forwardedToOwner(escalations, e) ? "user" : decideMark;
     const remembered = rememberedFor(input.rememberedRequesters, e);
     const reRequested = rememberedFor(input.reRequestedDelegates, e);
     const g: PrGate = assessedPullGate(binding, e, mark, projectApprovals, remembered, reRequested);
+    if (binding.kind === "ticket" && pullIsOpen(e) && !g.gateMet) pullWatch = true;
     const inputs = gateInputKey(binding, e, g.decision, projectApprovals, remembered, reRequested);
     const assessed: AssessedGate = { ...g, pull: e.key, met: g.gateMet, key: inputs };
     gate.push({ source: "github", subject: { kind: "pull", id: e.key }, id: "merge", met: g.gateMet, missing: g.missing, lane: g.decision, escalated: g.escalated, product: g.reason === "product", inputs, assessed });
@@ -323,6 +357,9 @@ function pullContributions(input: AssessmentInput): { gate: GateContribution[]; 
   if (wait !== null && waitedKey !== null) {
     resources.push({ source: "github", id: `waited-pull:${waitedKey}`, active: typedWaitLive(wait, input), subject: { kind: "pull", id: waitedKey } });
   }
+  // A ticket's own open pull is a wake source only while the gate is unmet
+  // (`pullWatchCounts`), so the resource exists for a ticket alone.
+  if (binding.kind === "ticket") resources.push({ source: "github", id: "pull-watch", active: pullWatch, subject: null });
   const waits: WaitContribution[] = [];
   if (wait !== null && PULL_WAIT_KINDS.has(wait.kind)) {
     const w = waitContribution("github", input);
@@ -388,9 +425,19 @@ export function compose(contributions: readonly SourceContribution[]): ComposedA
     reasons: contributions.flatMap((c) => c.reasons),
     // `compose` folds contributions only; the liveness also reads rows, so
     // `composeAssessment` overwrites this neutral default.
-    liveness: { idleBase: false, idle: false, stalled: false },
+    liveness: { live: false, idleBase: false, idle: false, stalled: false },
   };
 }
+
+/**
+ * The resource ids that are live wake sources, the non-hold clauses of the
+ * retired live-source predicate (BB-413, C7): the pull watch, a deployment watch in
+ * `merged`/`deploying`, a running or parked worker, and an open escalation or
+ * need. `open-pull` is the idle resource and `linked-pull`/`waited-pull` are
+ * watched resources the typed wait judges, so none of them is a wake source.
+ */
+const WAKE_RESOURCE_IDS: ReadonlySet<string> = new Set(["pull-watch", "workers", "parked-workers", "escalations", "needs"]);
+export const isWakeResource = (id: string): boolean => WAKE_RESOURCE_IDS.has(id) || id.startsWith("deployment:");
 
 /** No own pulls: the composer's idle derivation takes the pull wait from the
  * github contributor's `open-pull` resources, so core names no pull set. */
@@ -411,6 +458,13 @@ const NO_OWN_PULLS: ReadonlySet<string> = new Set<string>();
  * base therefore reads only the `open-pull` resources; `idleInActiveStage`
  * still reads workers and deployments from its rows, so the new resources
  * leave the idle answer exactly as it was.
+ *
+ * BB-413 (C7) makes the live-source answer the composed resources and holds,
+ * not the retired row helper. The `open-pull` resource is the idle-blocking
+ * own-pull wait, not the wake source, so the live scan skips it; the github
+ * contributor's `pull-watch` resource is the pull watch (`pullWatchCounts`).
+ * A held `hold` behind a `behind`/`stack` and a `merge-behind` are the two
+ * hold clauses the retired live-source predicate read.
  */
 function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): ComposedAssessment["liveness"] {
   const { binding, observed, workers, escalations, needs, now } = input;
@@ -435,8 +489,12 @@ function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): 
   const typedWait = composed.waits[0] ?? null;
   const waitLive = typedWait === null ? null : typedWait.live;
   const dateAhead = composed.holds.some((h) => h.id === "requeue" && h.held);
-  const live = assessLiveWakeSource(input.sources);
+  const held = (id: string): boolean => composed.holds.some((h) => h.id === id && h.held);
+  const resourceLive = composed.resources.some((r) => r.active && isWakeResource(r.id));
+  const holdLive = held("merge-behind") || (held("hold") && (held("behind") || held("stack")));
+  const live = resourceLive || holdLive;
   return {
+    live,
     idleBase,
     idle: typedWait !== null && waitLive === true ? false : idleBase,
     stalled: typedWait === null ? observedStall(binding, live, now) : !live && waitLive !== true && !dateAhead,

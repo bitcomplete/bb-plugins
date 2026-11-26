@@ -19,8 +19,8 @@ import { comment, issue, parkedWorker, pull } from "./fixtures.js";
 import { approvalMarkerLine } from "./gate.js";
 import { readyStateSchema, type StatusRecord } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
+import { rowLiveSource, type WakeSourceInput } from "./wake-source.js";
 import type { EntitySnapshot } from "./source-contract.js";
-import type { WakeSourceInput } from "./wake-source.js";
 import type { Wait } from "./wait.js";
 
 const tickets: Playbook = (() => {
@@ -31,7 +31,6 @@ const tickets: Playbook = (() => {
 
 const head = "aaaaaaa1";
 const green = { checks: { state: "success", failing: [] } };
-const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, parkedWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
 const noReviewMarker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
 const ownerMarker = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
@@ -72,7 +71,6 @@ function input(over: Partial<AssessmentInput> = {}): AssessmentInput {
     workers: [],
     escalations: [],
     needs: [],
-    sources: { ...noSources },
     playbook: tickets,
     currentSpecHash: "",
     now: 1_000_000,
@@ -254,6 +252,9 @@ describe("the github contributor (BB-380)", () => {
       { source: "github", id: "open-pull:acme/web#8", active: true, subject: { kind: "pull", id: "acme/web#8" } },
       { source: "github", id: "linked-pull:acme/web#7", active: true, subject: { kind: "pull", id: "acme/web#7" } },
       { source: "github", id: "linked-pull:acme/web#8", active: true, subject: { kind: "pull", id: "acme/web#8" } },
+      // BB-413 (C7): the wake pull watch (a ticket's belonging open pull whose
+      // gate is unmet), distinct from the idle-blocking `open-pull` above.
+      { source: "github", id: "pull-watch", active: true, subject: null },
     ]);
   });
 
@@ -269,7 +270,7 @@ describe("the github contributor (BB-380)", () => {
     expect(linearWorker.waits.map((w) => `${w.source} ${w.kind}`)).toEqual(["linear worker"]);
 
     const held = githubContributor.contribute(input({ observed: { entity: pull({}), pulls: [] }, binding: binding({ hold: "a freeze", ending: "terminal", requeueUntil: 2_000_000 }) }));
-    expect(held.holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "merge-behind", "ready-gate"]);
+    expect(held.holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "stack", "merge-behind", "ready-gate"]);
     expect(held.holds.find((h) => h.id === "requeue")!.held).toBe(true);
   });
 
@@ -286,11 +287,11 @@ describe("the github contributor (BB-380)", () => {
 describe("the linear and local contributors (BB-380)", () => {
   it("each contributes only for its own entity source, wrapping the binding's holds and non-pull wait", () => {
     const linear = input({ binding: binding({ hold: "a freeze" }), observed: { entity: issue(), pulls: [] } });
-    expect(linearContributor.contribute(linear).holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "merge-behind", "ready-gate"]);
+    expect(linearContributor.contribute(linear).holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "stack", "merge-behind", "ready-gate"]);
     expect(localContributor.contribute(linear)).toEqual({ source: "local", gate: [], waits: [], resources: [], holds: [], reasons: [] });
 
     const github = input({ observed: { entity: pull({}), pulls: [] } });
-    expect(githubContributor.contribute(github).holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "merge-behind", "ready-gate"]);
+    expect(githubContributor.contribute(github).holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "stack", "merge-behind", "ready-gate"]);
     expect(linearContributor.contribute(github)).toEqual({ source: "linear", gate: [], waits: [], resources: [], holds: [], reasons: [] });
   });
 });
@@ -329,6 +330,7 @@ describe("the composed answer equals today's assess() on the C1 characterization
       ["ending", true],
       ["requeue", true],
       ["behind", false],
+      ["stack", false],
       ["merge-behind", false],
       ["ready-gate", false],
     ]);
@@ -338,6 +340,7 @@ describe("the composed answer equals today's assess() on the C1 characterization
       ["ending", false],
       ["requeue", false],
       ["behind", false],
+      ["stack", false],
       ["merge-behind", false],
       ["ready-gate", false],
     ]);
@@ -351,12 +354,12 @@ describe("the composed answer equals today's assess() on the C1 characterization
     }
   });
 
-  it("compare still records the seven C1 surfaces when no composed answer is passed", () => {
+  it("compare still records the six C1 surfaces when no composed answer is passed (BB-413 retired the live-source surface)", () => {
     const union = new Set<string>();
     for (const [label, i] of characterizationFixtures()) {
       for (const d of compare(i, assess(i))) union.add(d.surface);
     }
-    expect([...union].sort()).toEqual(["approvals.gate", "approvals.pageRefusal", "hasLiveWakeSource", "idleInActiveStage", "noWakeSource", "runningWorkerReason", "workerInFlight"]);
+    expect([...union].sort()).toEqual(["approvals.gate", "approvals.pageRefusal", "idleInActiveStage", "noWakeSource", "runningWorkerReason", "workerInFlight"]);
   });
 });
 
@@ -423,8 +426,8 @@ describe("the composed liveness is assess()'s (BB-400, C5)", () => {
 
   it("takes assess()'s idle, idleBase and stalled from a passed composed answer", () => {
     const i = input();
-    const flipped = { ...composeAssessment(i), liveness: { idleBase: true, idle: true, stalled: true } };
-    expect(assess(i, flipped).liveness).toMatchObject({ idleBase: true, idle: true, stalled: true });
+    const flipped = { ...composeAssessment(i), liveness: { live: true, idleBase: true, idle: true, stalled: true } };
+    expect(assess(i, flipped).liveness).toMatchObject({ live: true, idleBase: true, idle: true, stalled: true });
   });
 
   it("retired the compose.liveness surface from compare", () => {
@@ -481,11 +484,11 @@ describe("the resources and holds contributions (BB-412, C6)", () => {
 
   /** One row per resource kind: the composed id and its live value. */
   const resourceCases = (): Array<[string, AssessmentInput, Array<[string, boolean]>]> => [
-    ["a gate-met own pull is an inactive open-pull and a live linked-pull", onlyGateMetAt("build"), [["open-pull:acme/web#7", false], ["linked-pull:acme/web#7", true], ["workers", true]]],
+    ["a gate-met own pull is an inactive open-pull and a live linked-pull", onlyGateMetAt("build"), [["open-pull:acme/web#7", false], ["linked-pull:acme/web#7", true], ["pull-watch", false], ["workers", true], ["parked-workers", true]]],
     [
       "a linked pull no worker reported is a live linked-pull, not an active open-pull",
       input({ observed: { entity: issue({ state: "In Progress" }), pulls: [linkedNotOwn] }, ownPulls: new Set<string>(), gatePulls: new Set([linkedNotOwn.key.toLowerCase()]), decisions: new Map([[linkedNotOwn.key.toLowerCase(), "user"]]), workers: [parkedWorker()] }),
-      [["open-pull:acme/web#8", false], ["linked-pull:acme/web#8", true], ["workers", true]],
+      [["open-pull:acme/web#8", false], ["linked-pull:acme/web#8", true], ["pull-watch", true], ["workers", true], ["parked-workers", true]],
     ],
     ["a live waited pull is a live waited-pull", waitInput({ kind: "pull", ref: "acme/web#9" }, { waitedPulls: waited(openPull("acme/web#9")) }), [["waited-pull:acme/web#9", true], ["workers", false]]],
     ["a merged waited pull is an inactive waited-pull", waitInput({ kind: "pull", ref: "acme/web#9" }, { waitedPulls: waited(mergedPull("acme/web#9")) }), [["waited-pull:acme/web#9", false], ["workers", false]]],
@@ -497,13 +500,16 @@ describe("the resources and holds contributions (BB-412, C6)", () => {
       input({ binding: binding({ deployments: { "acme/web#9::bb-gate": watch("acme/web#9", "merged") as never, "acme/web#9::devbox": watch("acme/web#9", "deployed") as never } }) }),
       [["deployment:acme/web#9::bb-gate", true], ["deployment:acme/web#9::devbox", false], ["workers", false]],
     ],
-    ["a running worker is a live workers resource", input({ workers: [{ threadId: "thr_w1", status: "running" } as never] }), [["workers", true]]],
-    ["a parked worker is still in flight, so workers is live", input({ workers: [parkedWorker()] }), [["workers", true]]],
+    ["a running worker is a live workers resource", input({ workers: [{ threadId: "thr_w1", status: "running" } as never] }), [["workers", true], ["parked-workers", false]]],
+    ["a parked worker is a live workers resource and a live parked-workers resource (BB-413)", input({ workers: [parkedWorker()] }), [["workers", true], ["parked-workers", true]]],
+    ["a plainly finished worker is not a live workers resource (BB-413)", input({ workers: [parkedWorker({ parkedWaitingOn: null })] }), [["workers", false], ["parked-workers", false]]],
+    ["an open escalation is a live escalations resource", input({ escalations: [{ status: "open", route: "project" } as never] }), [["escalations", true]]],
+    ["an open need is a live needs resource", input({ needs: [{} as never] }), [["needs", true]]],
   ];
 
   it("composes one resource per kind with its live value", () => {
     for (const [label, i, expected] of resourceCases()) {
-      expect(composeAssessment(i).resources.map((r) => [r.id, r.active] as [string, boolean]), label).toEqual(expected);
+      expect(composeAssessment(i).resources, label).toEqual(expect.arrayContaining(expected.map(([id, active]) => expect.objectContaining({ id, active }))));
     }
   });
 
@@ -516,8 +522,8 @@ describe("the resources and holds contributions (BB-412, C6)", () => {
     expect(workers.subject).toBeNull();
   });
 
-  /** The six hold ids in the order the composer emits them. */
-  const HOLD_IDS = ["hold", "ending", "requeue", "behind", "merge-behind", "ready-gate"] as const;
+  /** The seven hold ids in the order the composer emits them. */
+  const HOLD_IDS = ["hold", "ending", "requeue", "behind", "stack", "merge-behind", "ready-gate"] as const;
   const held = (i: AssessmentInput): Array<[string, boolean]> => composeAssessment(i).holds.map((h) => [h.id, h.held] as [string, boolean]);
   const allHolds = (on: Partial<Record<(typeof HOLD_IDS)[number], boolean>>): Array<[string, boolean]> => HOLD_IDS.map((id) => [id, on[id] ?? false]);
 
@@ -527,6 +533,7 @@ describe("the resources and holds contributions (BB-412, C6)", () => {
     expect(held(input({ binding: binding({ requeueUntil: 1_000_000 + 1 }) }))).toEqual(allHolds({ requeue: true }));
     expect(held(input({ binding: binding({ requeueUntil: 1_000_000 - 1 }) }))).toEqual(allHolds({}));
     expect(held(input({ binding: binding({ holdBehind: ["ENG-13"] }) }))).toEqual(allHolds({ behind: true }));
+    expect(held(input({ binding: binding({ holdStack: ["ENG-13"] }) }))).toEqual(allHolds({ stack: true }));
     expect(held(input({ binding: binding({ mergeBehind: ["ENG-14"] }) }))).toEqual(allHolds({ "merge-behind": true }));
     expect(held(input({ binding: binding({ stage: "spec", phase: "Todo" }) }))).toEqual(allHolds({ "ready-gate": true }));
     expect(held(input({ binding: binding({ stage: "spec", phase: "Todo", ready: readyMet() }) }))).toEqual(allHolds({}));
@@ -543,7 +550,7 @@ describe("the resources and holds contributions (BB-412, C6)", () => {
     const composed = composeAssessment(resourceCases()[1]![1]);
     // Both resources are live, and neither suppresses the idle wake: the linked
     // pull is not an own pull, and `idleInActiveStage` reads only a running
-    // worker.
+    // worker (a parked worker is `parked-workers`).
     expect(composed.resources).toEqual(expect.arrayContaining([expect.objectContaining({ id: "linked-pull:acme/web#8", active: true }), expect.objectContaining({ id: "workers", active: true })]));
     expect(composed.liveness.idle).toBe(true);
     expect(compare(resourceCases()[1]![1], assess(resourceCases()[1]![1]), composed).filter((d) => d.surface.startsWith("compose."))).toEqual([]);
@@ -551,11 +558,64 @@ describe("the resources and holds contributions (BB-412, C6)", () => {
 
   it("records no compose divergence for any resource or hold fixture", () => {
     const fixtures: Array<[string, AssessmentInput]> = [...resourceCases().map(([label, i]): [string, AssessmentInput] => [label, i]), ...HOLD_IDS.flatMap((id) => {
-      const over: Partial<AssessmentInput["binding"]> = id === "hold" ? { hold: "a freeze" } : id === "ending" ? { ending: "terminal" } : id === "requeue" ? { requeueUntil: 1_000_000 + 1 } : id === "behind" ? { holdBehind: ["ENG-13"] } : id === "merge-behind" ? { mergeBehind: ["ENG-14"] } : { stage: "spec", phase: "Todo" };
+      const over: Partial<AssessmentInput["binding"]> = id === "hold" ? { hold: "a freeze" } : id === "ending" ? { ending: "terminal" } : id === "requeue" ? { requeueUntil: 1_000_000 + 1 } : id === "behind" ? { holdBehind: ["ENG-13"] } : id === "stack" ? { holdStack: ["ENG-13"] } : id === "merge-behind" ? { mergeBehind: ["ENG-14"] } : { stage: "spec", phase: "Todo" };
       return [[`hold ${id}`, input({ binding: binding(over) })] as [string, AssessmentInput]];
     })];
     for (const [label, i] of fixtures) {
       expect(compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface.startsWith("compose.")), label).toEqual([]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BB-413 (C7): the composed live-source answer covers every WakeSourceInput
+// field. This is the fixture the ticket asks for before the old predicate is
+// deleted: for each field, the composed `live` equals the row predicate over
+// the same rows.
+// ---------------------------------------------------------------------------
+
+describe("the composed live-source answer covers every WakeSourceInput field (BB-413, C7)", () => {
+  const sourcesFor = (i: AssessmentInput, pullRequestWatch: boolean): WakeSourceInput => ({
+    hold: i.binding.hold,
+    holdBehind: i.binding.holdBehind ?? [],
+    mergeBehind: i.binding.mergeBehind ?? [],
+    holdStack: i.binding.holdStack ?? [],
+    deployments: i.binding.deployments,
+    runningWorkers: i.workers.filter((w) => w.status === "running").length,
+    parkedWorkers: i.workers.filter((w) => w.status === "finished" && w.parkedWaitingOn !== null).length,
+    openEscalations: i.escalations.length,
+    openNeeds: i.needs.length,
+    pullRequestWatch,
+  });
+
+  const ownPullInput = (): AssessmentInput => {
+    const pr = openPull("acme/web#9");
+    return input({ observed: { entity: issue({ state: "In Progress" }), pulls: [pr] }, ownPulls: own(pr), gatePulls: own(pr), decisions: new Map([[pr.key.toLowerCase(), "user" as const]]) });
+  };
+
+  const cases = (): Array<[string, AssessmentInput, boolean, boolean]> => [
+    // [label, input, pullRequestWatch, expected live]
+    ["hold behind another binding", input({ binding: binding({ hold: "a freeze", holdBehind: ["ENG-13"] }) }), false, true],
+    ["stack-wait on another binding", input({ binding: binding({ hold: "stacked", holdStack: ["ENG-13"] }) }), false, true],
+    ["merge hold", input({ binding: binding({ mergeBehind: ["ENG-14"] }) }), false, true],
+    ["a hold with nothing behind it is not a source", input({ binding: binding({ hold: "a freeze" }) }), false, false],
+    ["a deployment watch deploying", input({ binding: binding({ deployments: { "acme/web#9": watch("acme/web#9", "deploying") as never } }) }), false, true],
+    ["a settled deployment watch", input({ binding: binding({ deployments: { "acme/web#9": watch("acme/web#9", "deployed") as never } }) }), false, false],
+    ["a running worker", input({ workers: [{ threadId: "thr_w1", status: "running" } as never] }), false, true],
+    ["a parked worker", input({ workers: [parkedWorker()] }), false, true],
+    ["a plainly finished worker is not a source", input({ workers: [parkedWorker({ parkedWaitingOn: null })] }), false, false],
+    ["an open escalation", input({ escalations: [{ status: "open", route: "project" } as never] }), false, true],
+    ["an open need", input({ needs: [{} as never] }), false, true],
+    ["a ticket's open pull whose gate is unmet", ownPullInput(), true, true],
+    ["a pr binding's own open pull is not a source", input({ binding: binding({ kind: "pr" }), observed: { entity: pull({ key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "open" }), pulls: [] }, ownPulls: own(pull({ key: "acme/web#9", url: "https://github.com/acme/web/pull/9" })) }), false, false],
+    ["no structured source", input(), false, false],
+  ];
+
+  it("makes the composed live equal the row predicate and the named answer for every field", () => {
+    for (const [label, i, pullRequestWatch, expected] of cases()) {
+      const composed = composeAssessment(i).liveness.live;
+      expect(composed, label).toBe(expected);
+      expect(composed, label).toBe(rowLiveSource(sourcesFor(i, pullRequestWatch)));
     }
   });
 });
@@ -574,7 +634,7 @@ describe("the contribution interface (BB-380)", () => {
     expect(composed.reasons).toEqual([]);
     // `compose` folds contributions only; the liveness is a neutral default
     // that `composeAssessment` overwrites.
-    expect(composed.liveness).toEqual({ idleBase: false, idle: false, stalled: false });
+    expect(composed.liveness).toEqual({ live: false, idleBase: false, idle: false, stalled: false });
   });
 
   it("a gate contribution carries the source, subject, id and inputs the design names", () => {

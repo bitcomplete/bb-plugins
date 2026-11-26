@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { NO_STALL, STALL_WAKE_THRESHOLD, advanceStall, hasLiveWakeSource, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
+import { NO_STALL, STALL_WAKE_THRESHOLD, advanceStall, rowLiveSource, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
 
 const noSources: WakeSourceInput = {
   hold: null,
@@ -18,46 +18,46 @@ const watch = (over: Partial<WakeSourceInput> = {}): WakeSourceInput => ({ ...no
 
 describe("a binding's live wake sources (BB-154)", () => {
   it("is false with only a free-text wait", () => {
-    expect(hasLiveWakeSource(noSources)).toBe(false);
+    expect(rowLiveSource(noSources)).toBe(false);
   });
 
   it("is true for an open holdBehind", () => {
-    expect(hasLiveWakeSource(watch({ hold: "behind ENG-9", holdBehind: ["ENG-9"] }))).toBe(true);
+    expect(rowLiveSource(watch({ hold: "behind ENG-9", holdBehind: ["ENG-9"] }))).toBe(true);
   });
 
   it("is true for a merge hold (BB-256), with or without a start hold", () => {
-    expect(hasLiveWakeSource(watch({ mergeBehind: ["ENG-9"] }))).toBe(true);
-    expect(hasLiveWakeSource(watch({ hold: "Later", mergeBehind: ["ENG-9"] }))).toBe(true);
+    expect(rowLiveSource(watch({ mergeBehind: ["ENG-9"] }))).toBe(true);
+    expect(rowLiveSource(watch({ hold: "Later", mergeBehind: ["ENG-9"] }))).toBe(true);
   });
 
   it("is true for an open stack-wait (BB-215)", () => {
-    expect(hasLiveWakeSource(watch({ hold: "stacked on ENG-9", holdStack: ["ENG-9"] }))).toBe(true);
+    expect(rowLiveSource(watch({ hold: "stacked on ENG-9", holdStack: ["ENG-9"] }))).toBe(true);
   });
 
   it("does not count a manual hold with no holdBehind", () => {
-    expect(hasLiveWakeSource(watch({ hold: "waiting for the vendor" }))).toBe(false);
+    expect(rowLiveSource(watch({ hold: "waiting for the vendor" }))).toBe(false);
   });
 
   it("is true for a deployment watch merged or deploying, false once deployed", () => {
     const merged = watch({ deployments: { "acme/web#7": { state: "merged" } as never } });
     const deploying = watch({ deployments: { "acme/web#7": { state: "deploying" } as never } });
     const deployed = watch({ deployments: { "acme/web#7": { state: "deployed" } as never } });
-    expect(hasLiveWakeSource(merged)).toBe(true);
-    expect(hasLiveWakeSource(deploying)).toBe(true);
-    expect(hasLiveWakeSource(deployed)).toBe(false);
+    expect(rowLiveSource(merged)).toBe(true);
+    expect(rowLiveSource(deploying)).toBe(true);
+    expect(rowLiveSource(deployed)).toBe(false);
   });
 
   it("is true for a running worker, an open escalation or need, or a pull-request watch", () => {
-    expect(hasLiveWakeSource(watch({ runningWorkers: 1 }))).toBe(true);
-    expect(hasLiveWakeSource(watch({ openEscalations: 1 }))).toBe(true);
-    expect(hasLiveWakeSource(watch({ openNeeds: 1 }))).toBe(true);
-    expect(hasLiveWakeSource(watch({ pullRequestWatch: true }))).toBe(true);
+    expect(rowLiveSource(watch({ runningWorkers: 1 }))).toBe(true);
+    expect(rowLiveSource(watch({ openEscalations: 1 }))).toBe(true);
+    expect(rowLiveSource(watch({ openNeeds: 1 }))).toBe(true);
+    expect(rowLiveSource(watch({ pullRequestWatch: true }))).toBe(true);
   });
 
   // BB-389: a parked worker is still waiting, so it is a live source; the
   // parked worker's resume, or the pull request it waits on, wakes the binding.
   it("is true for a parked worker (BB-389)", () => {
-    expect(hasLiveWakeSource(watch({ parkedWorkers: 1 }))).toBe(true);
+    expect(rowLiveSource(watch({ parkedWorkers: 1 }))).toBe(true);
   });
 
   // BB-285: an open pull request is not a wake source for a `pr`/`review`

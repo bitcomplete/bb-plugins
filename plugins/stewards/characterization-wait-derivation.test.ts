@@ -16,7 +16,6 @@ import { observedStall } from "./reconcile.js";
 import { readyStateSchema, type StatusRecord } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
 import type { EntitySnapshot } from "./source-contract.js";
-import type { WakeSourceInput } from "./wake-source.js";
 import type { Wait } from "./wait.js";
 
 const tickets: Playbook = (() => {
@@ -25,7 +24,6 @@ const tickets: Playbook = (() => {
   return p.value;
 })();
 
-const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, parkedWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
 /** A second open own pull request, so the binding-shaped fixture is not a lone PR (BB-291). */
 const secondOpenPull = pull({ key: "acme/web#8", url: "https://github.com/acme/web/pull/8" }, { headSha: "bbbbbbb2" });
@@ -62,7 +60,6 @@ function input(over: Partial<AssessmentInput> = {}): AssessmentInput {
     workers: [parkedWorker()],
     escalations: [],
     needs: [],
-    sources: { ...noSources },
     playbook: tickets,
     currentSpecHash: "",
     now: 1_000_000,
@@ -231,21 +228,25 @@ describe("observedStall: the wait, the live source and the dated wait", () => {
 
   it("the date-ahead non-stall branch on the assessment's typed-wait path", () => {
     const now2 = 1_000_000;
-    const ahead = assess(input({ now: now2, binding: binding({ wait: { kind: "external", ref: "the vendor" }, status: status("the vendor"), requeueUntil: now2 + 86_400_000 }) }));
+    // No live source in the rows, so the dated wait is the only thing the
+    // stall branch reads (BB-413: `live` is the composed resources, not a
+    // test-only `sources` value).
+    const quiet: Partial<AssessmentInput> = { workers: [], observed: { entity: issue({ state: "In Progress" }), pulls: [] }, ownPulls: new Set<string>() };
+    const ahead = assess(input({ ...quiet, now: now2, binding: binding({ wait: { kind: "external", ref: "the vendor" }, status: status("the vendor"), requeueUntil: now2 + 86_400_000 }) }));
     expect(ahead.liveness.waitLive).toBe(false);
     expect(ahead.liveness.stalled).toBe(false);
-    const past = assess(input({ now: now2, binding: binding({ wait: { kind: "external", ref: "the vendor" }, status: status("the vendor"), requeueUntil: now2 - 86_400_000 }) }));
+    const past = assess(input({ ...quiet, now: now2, binding: binding({ wait: { kind: "external", ref: "the vendor" }, status: status("the vendor"), requeueUntil: now2 - 86_400_000 }) }));
     expect(past.liveness.stalled).toBe(true);
   });
 
   // The two derivations answer different questions and are both carried: the
-  // tracked-source answer (`hasLiveWakeSource`) is false for a live typed wait
-  // the report path never put in `sources`, while `typedWaitLive` reads the
-  // wait's own kind and says live. `compare` records no divergence for this;
-  // it is the design (BB-333), and the test pins both answers so a refactor
-  // cannot quietly collapse them.
-  it("pins hasLiveWakeSource false alongside a live typed wait (different questions, both carried)", () => {
-    const i = input({ binding: binding({ wait: { kind: "pull", ref: "acme/web#9" } }), waitedPulls: waited(openPull("acme/web#9")) });
+  // composed live-source answer (resources and holds) is false for a live
+  // typed wait, while `typedWaitLive` reads the wait's own kind and says live.
+  // `compare` records no divergence for this; it is the design (BB-333), and
+  // the test pins both answers so a refactor cannot quietly collapse them.
+  it("pins the composed live-source answer false alongside a live typed wait (different questions, both carried)", () => {
+    const quiet: Partial<AssessmentInput> = { workers: [], observed: { entity: issue({ state: "In Progress" }), pulls: [] }, ownPulls: new Set<string>() };
+    const i = input({ ...quiet, binding: binding({ wait: { kind: "pull", ref: "acme/web#9" } }), waitedPulls: waited(openPull("acme/web#9")) });
     const a = assess(i);
     expect(a.liveness.live).toBe(false);
     expect(a.liveness.waitLive).toBe(true);

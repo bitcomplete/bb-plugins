@@ -6610,6 +6610,22 @@ describe("questions to the user", () => {
     });
   });
 
+  it("the card reads the composed hold set: a merge hold shows as held behind its keys, and a stack-wait rides the row unchanged (BB-413, C7)", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    const at = t.now();
+    t.hooks.store.patch(b.id, {
+      mergeBehind: ["ENG-9"],
+      holdStack: ["ENG-8"],
+      status: { phase: "In Progress", summary: "Waiting", nextAction: "the merge", actor: "other", waitingOn: "waiting on ENG-9", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at },
+    });
+    const row = (await t.board()).stewards.find((s) => s.key === "ENG-12")!;
+    // `composedHoldRow` reads the composed `hold`/`behind`/`merge-behind` holds:
+    // a merge hold is presentation-only, so `hold` is the steward's `waitingOn`
+    // and `holdBehind` is the merge-behind set. `holdStack` is carried as before.
+    expect(row).toMatchObject({ hold: "waiting on ENG-9", holdBehind: ["ENG-9"], holdStack: ["ENG-8"] });
+  });
+
   it("the nightly wake carries the previous digest and the record since it", async () => {
     const t = await adopted();
     await t.hooks.nightlyPass("p1", "first");

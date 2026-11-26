@@ -101,8 +101,8 @@ import {
 } from "./roles.js";
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mergeWorkaroundParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
-import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessLiveWakeSource, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
-import { composeAssessment, type ComposedAssessment, type HoldContribution, type ResourceContribution } from "./contribution.js";
+import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
+import { composeAssessment, schedulingHolds, type ComposedAssessment, type HoldContribution, type ResourceContribution } from "./contribution.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { ASK_ON_SLACK_CHOICE, NOT_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackCandidateLabel, slackNameCandidates, slackPersonKey, slackPersonLabel, slackPersonNotOnSlack, waitSlackAskOnceWhat, waitSlackInstruction, waitSlackTerminalWhat, type SlackCandidate, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
@@ -157,7 +157,7 @@ import { createGhWriter, parsePullRef, type BranchProtection, type GithubWriter,
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, openPull, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_NAVIGATION_PROVIDER, AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_NAVIGATION_ID, BUILTIN_THREAD_LIST_ID, NAVIGATION_PROVIDER_KEY, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { reportWaitsOnWorker } from "./sidebar.js";
-import { advanceStall, parseUntil, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
+import { advanceStall, parseUntil, pullWatchCounts, rowLiveSource, type WakeSourceInput } from "./wake-source.js";
 import { WAIT_REFUSAL_MESSAGE, waitInputSchema, waitPhrase, waitSchema, validateWait, type Wait, type WaitContext, type WaitKind } from "./wait.js";
 import { PROJECT_CHANGED } from "./channels.js";
 import { LINEAR_TICKETS, LOCAL_TICKETS, PLAYBOOK_TEMPLATES, projectFileTemplate, stampedTemplate, templateHashes } from "./templates.js";
@@ -4005,8 +4005,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return pullWatchCounts(b.kind, open.length, gateMet);
     }
 
-    /** The structured sources that will wake a binding, as the report path reads them (BB-154). */
-    function wakeSourcesFor(b: Binding, ownPulls: ReadonlySet<string>): WakeSourceInput {
+    /**
+     * The structured sources that will wake a binding, for the two paths with
+     * no assessment to compose (BB-413, C7): the ops reconcile and a report
+     * whose fresh assessment could not be built. Every ticket, pull-request and
+     * local surface reads the composed resources and holds instead.
+     */
+    function bindingWakeSources(b: Binding, ownPulls: ReadonlySet<string>): WakeSourceInput {
       // One worker read for both counts, so BB-389 adds no store read.
       const workers = store.workers(b.id);
       return {
@@ -4024,10 +4029,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         openNeeds: store.openNeeds(b.id).length,
         pullRequestWatch: pullWatch(b, ownPulls),
       };
-    }
-
-    function liveWakeSourceFor(b: Binding, ownPulls: ReadonlySet<string>): boolean {
-      return assessLiveWakeSource(wakeSourcesFor(b, ownPulls));
     }
 
     /**
@@ -5609,7 +5610,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         workers,
         escalations,
         needs,
-        sources: wakeSourcesFor(b, ownPulls),
         waitBudgets: config.file.waitBudgets,
         playbook,
         currentSpecHash,
@@ -6891,7 +6891,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // same free-text wait rule a ticket or pull request uses. It runs before
       // the per-target dispatch so every ops target kind gets it, including a
       // look that cannot read the target and one that finds nothing actionable.
-      const noWakeSource = observedStall(b, liveWakeSourceFor(b, new Set()), now());
+      const noWakeSource = observedStall(b, rowLiveSource(bindingWakeSources(b, new Set())), now());
       if (b.noWakeSource !== noWakeSource) b = store.patch(b.id, { noWakeSource });
       if (target.kind === "dependabot") {
         await reconcileDeps(b, config, playbook, target, force);
@@ -12079,7 +12079,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               idleInitiativeUnmet: b.idleInitiativeSince === null ? null : initiativeUnmet(b),
               wakeFailure: b.wakeFailure,
               priority: b.priority,
-              ...presentationHold(b),
+              ...composedHoldRow(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
               ...escalationRowFacts(b.id),
@@ -12222,7 +12222,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               idleInitiativeUnmet: b.idleInitiativeSince === null ? null : initiativeUnmet(b),
               wakeFailure: b.wakeFailure,
               priority: b.priority,
-              ...presentationHold(b),
+              ...composedHoldRow(b),
               holdStack: b.holdStack,
               needsUser: needsUser(b, projectQuestions, openIds),
               ...escalationRowFacts(b.id),
@@ -12335,7 +12335,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // child stays top-level (the client decides from the tab's own
               // list).
               parentKey: parentKeys.get(b.id) ?? null,
-              ...presentationHold(b),
+              ...composedHoldRow(b),
               holdStack: b.holdStack,
               waitingOn: b.status?.waitingOn ?? null,
               noWakeSource: b.noWakeSource,
@@ -14521,7 +14521,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // The same own-pull set the gate/merge loop uses (BB-52 rule 0), so a
           // ticket's own pull request counts as a source or not by one rule.
           const currentOwnPulls = current.kind === "ticket" && current.lastSnapshot !== null ? await ownPullKeys(current, store.workers(current.id), current.lastSnapshot) : new Set<string>();
-          const liveSource = liveWakeSourceFor(current, currentOwnPulls);
+          const liveSource = rowLiveSource(bindingWakeSources(current, currentOwnPulls));
           // BB-333/BB-375/BB-400: liveness and stall come from the one
           // assessment. The report derives the same answer here for its reply
           // (the reconcile that stores it may not have run since the wait was
@@ -15704,9 +15704,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * does not read as "needs you". The stored field drives the plugin; this is
      * presentation only.
      */
-    function presentationHold(b: Binding): { hold: string | null; holdBehind: string[] } {
-      if (b.hold !== null) return { hold: b.hold, holdBehind: b.holdBehind };
-      if (b.mergeBehind.length > 0) return { hold: b.status?.waitingOn ?? "merge hold", holdBehind: b.mergeBehind };
+    function composedHoldRow(b: Binding): { hold: string | null; holdBehind: string[] } {
+      // BB-413 (C7): the row reads the composed hold set, the same derivation
+      // the composer and `atWork` read, rather than re-testing the raw fields.
+      const holds = schedulingHolds(b, now());
+      const held = (id: string): boolean => holds.some((h) => h.id === id && h.held);
+      if (held("hold")) return { hold: b.hold, holdBehind: [...holds.find((h) => h.id === "behind")!.behind] };
+      if (held("merge-behind")) return { hold: b.status?.waitingOn ?? "merge hold", holdBehind: [...holds.find((h) => h.id === "merge-behind")!.behind] };
       return { hold: null, holdBehind: [] };
     }
 
@@ -17004,7 +17008,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             description: "Every place the shadow assessment disagrees with the predicate it will replace, one row per distinct (binding, surface, old, new) with a first/last seen time and a count. --binding filters by binding id or entity key, --surface by surface name. --json emits the rows. Nothing reads the log to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's divergences (binding id or entity key)" },
-              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, hasLiveWakeSource, approvals.gate, approvals.pageRefusal, noWakeSource, compose.waits, compose.holds, compose.resources)" },
+              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, approvals.gate, approvals.pageRefusal, noWakeSource, compose.waits, compose.holds, compose.resources)" },
               project: PROJECT_OPTION,
               json: JSON_OPTION,
             },

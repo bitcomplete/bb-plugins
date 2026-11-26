@@ -17,7 +17,6 @@ import { formatDivergences } from "./server.js";
 import { MIGRATIONS, createStore, readyStateSchema, type StatusRecord } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
 import type { EntitySnapshot } from "./source-contract.js";
-import type { WakeSourceInput } from "./wake-source.js";
 
 const tickets: Playbook = (() => {
   const p = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
@@ -33,7 +32,6 @@ const projectApprovalMarker = (id: string) => comment({ id, author: "trotterdyla
 // The owner's unsigned approval, as the Stewards page posts it (BB-279).
 const ownerUnsignedApproval = comment({ id: "oa", author: "jane", body: `Approved ${head} from the Stewards page`, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
 
-const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, parkedWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
 /** A gate-met own pull request (no-review, green) plus the reviewer marker. */
 const gateMetPull = (key: string, url: string) => pull({ key, url, comments: [noReviewMarker] }, { headSha: head, ...green });
@@ -73,7 +71,6 @@ function input(over: Partial<AssessmentInput> = {}): AssessmentInput {
     workers: [],
     escalations: [],
     needs: [],
-    sources: { ...noSources },
     playbook: tickets,
     currentSpecHash: "",
     now: 1_000_000,
@@ -84,10 +81,8 @@ function input(over: Partial<AssessmentInput> = {}): AssessmentInput {
 /**
  * BB-266: a gate-met own pull request, a parked `finished` worker, and (unless
  * `secondOpen` says the test is about its absence) a second open own pull
- * request. `sources` is the report path's input shape; the fixture passes it
- * without the parked worker so `compare` still pins the BB-292
- * `hasLiveWakeSource` divergence. The report path itself counts the parked
- * worker since BB-389 (`wakeSourcesFor`), so the row cannot fire in production.
+ * request. The parked worker is the composed `parked-workers` resource, so
+ * `assess().liveness.live` is true exactly as the report path read it.
  */
 function bb266(secondOpen: boolean): AssessmentInput {
   const first = gateMetPull("acme/web#7", "https://github.com/acme/web/pull/7");
@@ -98,7 +93,6 @@ function bb266(secondOpen: boolean): AssessmentInput {
     ownPulls: own(...pulls),
     decisions: new Map(pulls.map((p) => [p.key.toLowerCase(), "user" as const])),
     workers: [parkedWorker({ result: "Waiting on the owner's approval of acme/web#7." })],
-    sources: { ...noSources },
   });
 }
 
@@ -113,9 +107,9 @@ describe("the shadow assessment: the worker state (BB-266)", () => {
   });
 
   // DIVERGENCE (BB-292 #1): workerInFlight counts the parked worker in flight,
-  // runningWorkerReason says nobody is mid-turn, and hasLiveWakeSource says no
-  // tracked source is live; the assessment names the one state `parked`.
-  it("records the parked-worker divergences: in-flight, not mid-turn, no live source", () => {
+  // runningWorkerReason says nobody is mid-turn; the assessment names the one
+  // state `parked`. BB-413 (C7) retired the live-source row.
+  it("records the parked-worker divergences: in-flight and not mid-turn", () => {
     const i = bb266(true);
     const a = assess(i);
     expect(a.liveness.idle).toBe(false); // the second open own PR is gate-unmet
@@ -123,7 +117,6 @@ describe("the shadow assessment: the worker state (BB-266)", () => {
     const by = new Map(d.map((x) => [x.surface, x]));
     expect(by.get("workerInFlight")).toMatchObject({ old: "in-flight", new: "parked" });
     expect(by.get("runningWorkerReason")).toMatchObject({ old: "not-mid-turn", new: "parked" });
-    expect(by.get("hasLiveWakeSource")).toMatchObject({ old: "no-live-source", new: "parked" });
     expect(by.has("idleInActiveStage")).toBe(false);
     // The log's inputs hold only ids, states and timestamps.
     expect(by.get("workerInFlight")!.inputs).toEqual({ binding: "b1", workers: 1, states: "finished" });
@@ -257,7 +250,6 @@ describe("the shadow assessment: the liveness (bb-plugins#294 and noWakeSource)"
       binding: binding({ kind: "pr", status: status("the dompurify fix on main"), noWakeSource: true }),
       observed: { entity, pulls: [] },
       ownPulls: own(entity),
-      sources: { ...noSources, pullRequestWatch: false },
     });
     const a = assess(i);
     expect(a.liveness.live).toBe(false);
@@ -306,11 +298,11 @@ describe("the composed resources and holds divergences (BB-412, C6)", () => {
   it("records a compose.resources row when a resource the rows have is missing", () => {
     const i = input();
     const composed = composeAssessment(i);
-    const missing = { ...composed, resources: composed.resources.filter((r) => r.id !== "workers") };
+    const missing = { ...composed, resources: composed.resources.filter((r) => r.id !== "escalations") };
     const rows = compare(i, assess(i), missing).filter((d) => d.surface === "compose.resources");
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.old).toContain("workers:false");
-    expect(rows[0]!.new).not.toContain("workers:false");
+    expect(rows[0]!.old).toContain("escalations:false");
+    expect(rows[0]!.new).not.toContain("escalations:false");
     expect(rows[0]!.inputs).toMatchObject({ binding: "b1" });
   });
 
@@ -421,7 +413,8 @@ describe("the shadow assessment: the typed wait (BB-333)", () => {
   // BB-389: the typed wait may add liveness but never removes it. An external
   // (or otherwise non-live) wait beside a live structured source is not stalled.
   it("does not stall a non-live external wait while a structured source is live", () => {
-    const a = assess(withWait({ kind: "external", ref: "the vendor" }, { sources: { ...noSources, pullRequestWatch: true } }));
+    const pr = openPull("acme/web#7");
+    const a = assess(withWait({ kind: "external", ref: "the vendor" }, { observed: { entity: issue({ state: "In Progress" }), pulls: [pr] }, ownPulls: own(pr), gatePulls: own(pr), decisions: new Map([[pr.key.toLowerCase(), "user" as const]]) }));
     expect(a.liveness.waitLive).toBe(false);
     expect(a.liveness.live).toBe(true);
     expect(a.liveness.stalled).toBe(false);
@@ -508,37 +501,42 @@ describe("BB-389: a live structured source is never overridden by a typed wait",
   const withWait = (over: Partial<AssessmentInput>) => assess(input({ binding: binding({ wait: external }), ...over }));
 
   it("row 1: an open schedule escalation is live with an external wait", () => {
-    const a = withWait({ sources: { ...noSources, openEscalations: 1 } });
+    const a = withWait({ escalations: [{ status: "open", route: "project" } as never] });
     expect(a.liveness.waitLive).toBe(false);
     expect(a.liveness.live).toBe(true);
     expect(a.liveness.stalled).toBe(false);
   });
 
   it("row 2: a parked worker is live with an external wait", () => {
-    const a = withWait({ sources: { ...noSources, parkedWorkers: 1 } });
+    const a = withWait({ workers: [parkedWorker()] });
     expect(a.liveness.live).toBe(true);
     expect(a.liveness.stalled).toBe(false);
   });
 
+  const watchedPull = (): Partial<AssessmentInput> => {
+    const pr = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", state: "open" });
+    return { observed: { entity: issue({ state: "In Progress" }), pulls: [pr] }, ownPulls: own(pr), gatePulls: own(pr), decisions: new Map([[pr.key.toLowerCase(), "user" as const]]) };
+  };
+
   it("row 3: a pull-request watch is live with an external wait (checks on the PR)", () => {
-    const a = withWait({ sources: { ...noSources, pullRequestWatch: true } });
+    const a = withWait(watchedPull());
     expect(a.liveness.stalled).toBe(false);
   });
 
   it("row 4: the reviewer's pull-request watch is live with an external wait (a stored reviewer thread)", () => {
-    const a = withWait({ sources: { ...noSources, pullRequestWatch: true } });
+    const a = withWait(watchedPull());
     expect(a.liveness.stalled).toBe(false);
   });
 
   it("row 5: an open approval escalation and approve-pr need are live with an external wait", () => {
-    const a = withWait({ sources: { ...noSources, openEscalations: 1, openNeeds: 1 } });
+    const a = withWait({ escalations: [{ status: "open", route: "project" } as never], needs: [{} as never] });
     expect(a.liveness.stalled).toBe(false);
   });
 
   // The BB-154 true positive is unchanged: a free-text or `external` wait with
   // no live source still flags.
   it("still flags a non-live external wait with no structured source", () => {
-    const a = withWait({ sources: { ...noSources } });
+    const a = withWait({});
     expect(a.liveness.waitLive).toBe(false);
     expect(a.liveness.live).toBe(false);
     expect(a.liveness.stalled).toBe(true);
