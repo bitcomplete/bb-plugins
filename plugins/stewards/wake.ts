@@ -7,6 +7,7 @@
 // transcript stop being the source of truth.
 import { formatDuration, GITHUB_TODO_LABEL, INITIATIVE_LABEL, INITIATIVE_PLAYBOOK, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
 import { formatAge } from "./duration.js";
+import { bindingHeld, schedulingHolds } from "./holds.js";
 import { landLessonInstruction } from "./lessons.js";
 import type { GuidanceUnit } from "./guidance.js";
 import type { BigDecision } from "./decisions.js";
@@ -467,15 +468,21 @@ function gateLines(input: Pick<WakeInput, "gate" | "binding" | "playbook" | "esc
 
 /** The hold line of a wake: the reason, and what it waits behind when it was placed to schedule. */
 const holdLine = (binding: Binding, then: string): string => {
-  if (binding.hold === null) return "- Hold: none";
+  // BB-413 (C7): the held/behind/stack answer is the composed hold set; the
+  // text still reads the binding's own fields.
+  const holds = schedulingHolds(binding, Date.now());
+  const hold = holds.find((h) => h.id === "hold")!;
+  if (!hold.held) return "- Hold: none";
+  const behindKeys = holds.find((h) => h.id === "behind")!.behind;
+  const stackKeys = holds.find((h) => h.id === "stack")!.behind;
   const behind =
-    binding.holdBehind.length === 0
+    behindKeys.length === 0
       ? null
-      : `behind ${binding.holdBehind.join(", ")}: it lifts itself, and you are woken, once ${binding.holdBehind.length === 1 ? "that binding has merged its pull requests or ended" : "each of them has merged its pull requests or ended"}`;
+      : `behind ${behindKeys.join(", ")}: it lifts itself, and you are woken, once ${behindKeys.length === 1 ? "that binding has merged its pull requests or ended" : "each of them has merged its pull requests or ended"}`;
   const stack =
-    binding.holdStack.length === 0
+    stackKeys.length === 0
       ? null
-      : `stacked on ${binding.holdStack.join(", ")}: it lifts itself, and you are woken with that pull request's head branch, as soon as ${binding.holdStack.length === 1 ? "that binding has opened a pull request" : "each of them has opened a pull request"}`;
+      : `stacked on ${stackKeys.join(", ")}: it lifts itself, and you are woken with that pull request's head branch, as soon as ${stackKeys.length === 1 ? "that binding has opened a pull request" : "each of them has opened a pull request"}`;
   const why = [behind, stack].filter((x): x is string => x !== null).join("; ");
   return `- **HOLD: ${binding.hold}**${why === "" ? "" : ` (${why})`} — ${then}`;
 };
@@ -487,7 +494,7 @@ const holdLine = (binding: Binding, then: string): string => {
  * binding may carry both holds.
  */
 const mergeHoldLine = (binding: Binding): string => {
-  const keys = binding.mergeBehind;
+  const keys = schedulingHolds(binding, Date.now()).find((h) => h.id === "merge-behind")!.behind;
   return `- **MERGE HOLD: behind ${keys.join(", ")}** — the plugin files no Merge item while it stands, so the effort shows as held. It lifts itself, and you are woken, once ${keys.length === 1 ? "that binding has" : "each of them has"} merged its pull requests or ended.`;
 };
 
@@ -568,7 +575,7 @@ function schedulingLines(binding: Binding, conflicts: Conflict[], escalations: E
   if (conflicts.length > 0) lines.push(`- File-level overlap with work in flight: ${conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}) on ${c.on.join(", ")}`).join("; ")}.`);
   const scheduling = escalations.find((x) => x.status === "open" && x.kind === "schedule");
   if (scheduling !== undefined) lines.push(`- **Scheduling is with the project steward (${scheduling.id}).** Start no workers and do not move the ticket into a build state until it decides: it holds you behind that work (the hold lifts itself when the work lands), stacks you on a pull request still being built (the hold lifts itself, with the branch, when it opens), or tells you to start. Do not escalate for it.`);
-  else if (conflicts.length > 0 && binding.hold === null) lines.push("- Once your ready gate passes, the plugin asks the project steward to schedule you against that work; do not escalate for it.");
+  else if (conflicts.length > 0 && !bindingHeld(binding)) lines.push("- Once your ready gate passes, the plugin asks the project steward to schedule you against that work; do not escalate for it.");
   return lines;
 }
 
@@ -649,7 +656,7 @@ export function formatWake(input: WakeInput): string {
   out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
   const idleWake = initiativeIdleWakeLine(binding, input.now);
   if (idleWake !== null) out.push(idleWake);
-  if (binding.mergeBehind.length > 0) out.push(mergeHoldLine(binding));
+  if (schedulingHolds(binding, input.now).some((h) => h.id === "merge-behind" && h.held)) out.push(mergeHoldLine(binding));
   if (binding.stackedPulls.length > 0) out.push(stackedPullsLine(binding));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
   out.push(...trialLessonsLines(input.lessons ?? []));
@@ -931,7 +938,7 @@ export function formatOpsWake(input: OpsWakeInput): string {
   if (binding.guidance.length === 0) out.push("No standing guidance.");
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
-  out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+  out.push(!bindingHeld(binding) ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
   if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
 
   const head = out.splice(0);
@@ -1059,7 +1066,7 @@ export function formatDepsWake(input: DepsWakeInput): string {
   if (binding.guidance.length === 0) out.push("No standing guidance.");
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
-  out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+  out.push(!bindingHeld(binding) ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
   if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
 
   const head = out.splice(0);
@@ -1189,7 +1196,7 @@ export function formatBacklogWake(input: BacklogWakeInput): string {
   if (binding.guidance.length === 0) out.push("No standing guidance.");
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
-  out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+  out.push(!bindingHeld(binding) ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
   if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
 
   const head = out.splice(0);
@@ -1302,7 +1309,7 @@ export function formatSentryWake(input: SentryWakeInput): string {
   if (binding.guidance.length === 0) out.push("No standing guidance.");
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
-  out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+  out.push(!bindingHeld(binding) ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
   if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
 
   const head = out.splice(0);
@@ -1443,7 +1450,7 @@ export function formatAlertmanagerWake(input: AlertmanagerWakeInput): string {
   if (binding.guidance.length === 0) out.push("No standing guidance.");
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
-  out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+  out.push(!bindingHeld(binding) ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
   if (binding.noWakeSource) out.push("", ...noWakeSourceLines(binding));
 
   const head = out.splice(0);
@@ -1727,13 +1734,13 @@ export function initiativeLiveWait(wait: { kind: WaitKind } | null): boolean {
  * read idle.
  */
 export function initiativeIdle(
-  binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot" | "stage" | "hold" | "wait">,
+  binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot" | "stage" | "hold" | "ending" | "requeueUntil" | "wait">,
   children: readonly SnapshotChild[],
   waitLive: boolean | null,
 ): boolean {
   if (initiativeProgress(binding) === null) return false;
   if (binding.stage !== "build") return false;
-  if (binding.hold !== null) return false;
+  if (bindingHeld(binding)) return false;
   // An unreadable count (null) is not "all met", so it still reads idle.
   if (initiativeUnmet(binding) === 0) return false;
   // Anything but completed or canceled is an open child, including a null type.
@@ -1753,7 +1760,7 @@ export function idleInitiativeLine(binding: Binding, now: number): string | null
   if (binding.idleInitiativeSince === null) return null;
   // A held initiative is listed as held, never as idle, even before the next
   // reconcile clears the stored clock.
-  if (binding.hold !== null) return null;
+  if (bindingHeld(binding)) return null;
   if (initiativeProgress(binding) === null) return null;
   const unmet = initiativeUnmet(binding);
   const criteria = unmet === null ? "unmet criteria unknown" : `${unmet} unmet criteria`;
@@ -1940,7 +1947,7 @@ export function formatProjectWake(input: {
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
     const s = b.status;
     const conflicts = conflictsOf(b, allOpen);
-    const flags = [initiativeProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null].filter((f): f is string => f !== null);
+    const flags = [initiativeProgressFlag(b), b.priority === null ? null : `priority ${b.priority}`, !bindingHeld(b) ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `file-level overlap: ${conflicts.map((c) => { const open = c.with.lastSnapshot === null ? null : openPull(c.with, c.with.lastSnapshot); return `${c.with.entityKey} on ${c.on.join(", ")}${open === null || open.head === null || open.head === "" ? "" : ` (its pull request ${open.key} is open on ${open.head})`}`; }).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${day(b.requeueUntil)}`}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
   // BB-288: the guidance index sits at the end of the bindings list, so `fit`
@@ -1997,8 +2004,8 @@ export function formatSessionWake(input: {
       ? `You are ${w.issue.key}'s steward (binding ${role.binding.id}), so it came to you.`
       : `${w.issue.key} has no steward of its own, so it came to you, the project steward.`,
   );
-  if (role.kind === "ticket" && role.binding.hold !== null) {
-    out.push("", `**Your binding is on hold** (${role.binding.hold.replace(/\.$/u, "")}). Answer the mention, but take no new actions. Only the project steward lifts a hold: if ${owner} asks to resume, escalate with steward_report and say so in the reply.`);
+  if (role.kind === "ticket" && bindingHeld(role.binding)) {
+    out.push("", `**Your binding is on hold** (${(role.binding.hold ?? "").replace(/\.$/u, "")}). Answer the mention, but take no new actions. Only the project steward lifts a hold: if ${owner} asks to resume, escalate with steward_report and say so in the reply.`);
   }
 
   if (confirmed === null) {

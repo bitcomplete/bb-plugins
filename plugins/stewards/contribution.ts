@@ -31,6 +31,7 @@ import {
 import type { AssessedGate, Assessment, AssessmentInput, DecideMark } from "./assessment.js";
 import { waitBudgetMs } from "./config.js";
 import { prGate, type PrGate, type PrGateOptions, type ProjectApprovalRecord } from "./gate.js";
+import { schedulingHolds, type HoldContribution } from "./holds.js";
 import { idleInActiveStage, observedStall, productGateOptions } from "./reconcile.js";
 import { gateState } from "./ready-gate.js";
 import type { EntitySnapshot } from "./source-contract.js";
@@ -160,19 +161,10 @@ export type ResourceContribution = {
   subject: ContributionSubject | null;
 };
 
-/**
- * One hold a source contributes, wrapping the binding's hold, ending and
- * requeue and adding `behind`, `stack`, `merge-behind` and `ready-gate`.
- * `behind` carries the entity keys a `behind`, `stack` or `merge-behind` hold
- * waits on.
- */
-export type HoldContribution = {
-  source: ContributionSource;
-  /** `hold`, `ending`, `requeue`, `behind`, `stack`, `merge-behind` or `ready-gate`. */
-  id: string;
-  held: boolean;
-  behind: readonly string[];
-};
+// The composed holds and their one derivation live in `holds.ts`, so the
+// composer, the idle rule, `atWork`, the card row and the wake renderer share
+// it without an import cycle. Re-exported here for the existing importers.
+export { schedulingHolds, type HoldContribution, type HoldFields, type HoldSource } from "./holds.js";
 
 /** One reason a source contributes, for the card, `show` and the digest (BB-335). */
 export type Reason = {
@@ -242,33 +234,9 @@ function waitContribution(source: ContributionSource, input: AssessmentInput): W
 const PULL_WAIT_KINDS: ReadonlySet<WaitKind> = new Set(["pull", "review", "deployment"]);
 
 /**
- * The scheduling holds a binding carries, one item per kind: `hold`, `ending`,
- * `requeue` (a dated wait still ahead), `behind` (BB-215's hold behind another
- * binding), `stack` (BB-215's stack-wait) and `merge-behind` (BB-256's merge
- * hold). The `hold`/`behind`/`stack`/`merge-behind` rows are what the retired
- * live-source predicate read; `ending` and `requeue` are what
- * `idleInActiveStage` reads. It is pure over the binding and `now`, so the
- * presentation surfaces and `atWork` read the same composed set the reconcile
- * does, with no extra store read.
- */
-export function schedulingHolds(
-  b: Pick<AssessmentInput["binding"], "hold" | "ending" | "requeueUntil" | "holdBehind" | "holdStack" | "mergeBehind">,
-  now: number,
-): HoldContribution[] {
-  return [
-    { source: "local", id: "hold", held: b.hold !== null, behind: [] },
-    { source: "local", id: "ending", held: b.ending !== null, behind: [] },
-    { source: "local", id: "requeue", held: b.requeueUntil !== null && b.requeueUntil > now, behind: [] },
-    { source: "local", id: "behind", held: (b.holdBehind ?? []).length > 0, behind: b.holdBehind ?? [] },
-    { source: "local", id: "stack", held: (b.holdStack ?? []).length > 0, behind: b.holdStack ?? [] },
-    { source: "local", id: "merge-behind", held: (b.mergeBehind ?? []).length > 0, behind: b.mergeBehind ?? [] },
-  ];
-}
-
-/**
  * The binding's holds, one item per kind so the set is complete: the scheduling
- * holds above, plus the ready-gate hold. The ready gate is held while the
- * binding is in the spec stage (the playbook's Todo) and the gate has not
+ * holds from `holds.ts`, plus the ready-gate hold. The ready gate is held while
+ * the binding is in the spec stage (the playbook's Todo) and the gate has not
  * passed; it reads the same `gateState` `composeAssessment` computes for
  * `gate.readyPassed`.
  */
@@ -319,6 +287,10 @@ function entityContribution(source: ContributionSource, input: AssessmentInput):
 function pullContributions(input: AssessmentInput): { gate: GateContribution[]; waits: WaitContribution[]; resources: ResourceContribution[]; reasons: Reason[] } {
   const { binding, observed, ownPulls, decisions, projectApprovals, escalations } = input;
   const gatePulls = input.gatePulls ?? ownPulls;
+  // The wake pull watch counts the belonging pulls, not the wider `gatePulls`
+  // seeded with `ownPulls`: a pull handed to another binding (BB-386) is still
+  // worker-owned but is not this binding's watch (BB-413, C7).
+  const watchedPulls = input.watchedPulls ?? gatePulls;
   const gate: GateContribution[] = [];
   const resources: ResourceContribution[] = [];
   const reasons: Reason[] = [];
@@ -333,7 +305,7 @@ function pullContributions(input: AssessmentInput): { gate: GateContribution[]; 
     const remembered = rememberedFor(input.rememberedRequesters, e);
     const reRequested = rememberedFor(input.reRequestedDelegates, e);
     const g: PrGate = assessedPullGate(binding, e, mark, projectApprovals, remembered, reRequested);
-    if (binding.kind === "ticket" && pullIsOpen(e) && !g.gateMet) pullWatch = true;
+    if (binding.kind === "ticket" && watchedPulls.has(lc(e.key)) && pullIsOpen(e) && !g.gateMet) pullWatch = true;
     const inputs = gateInputKey(binding, e, g.decision, projectApprovals, remembered, reRequested);
     const assessed: AssessedGate = { ...g, pull: e.key, met: g.gateMet, key: inputs };
     gate.push({ source: "github", subject: { kind: "pull", id: e.key }, id: "merge", met: g.gateMet, missing: g.missing, lane: g.decision, escalated: g.escalated, product: g.reason === "product", inputs, assessed });

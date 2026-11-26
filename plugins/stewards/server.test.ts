@@ -6626,6 +6626,45 @@ describe("questions to the user", () => {
     expect(row).toMatchObject({ hold: "waiting on ENG-9", holdBehind: ["ENG-9"], holdStack: ["ENG-8"] });
   });
 
+  it("bb stewards show flags the composed hold and merge hold (BB-413, C7)", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    t.hooks.store.patch(b.id, { hold: "Waiting on design", holdBehind: ["ENG-9"], holdStack: ["ENG-8"], mergeBehind: ["ENG-13"] });
+    const shown = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    expect(shown).toMatch(/HOLD: Waiting on design \(behind ENG-9\) \(stacked on ENG-8\)/u);
+    expect(shown).toMatch(/MERGE HOLD: behind ENG-13/u);
+  });
+
+  // BB-413 (C7) names one intended timing difference: the composed pull watch
+  // reads this look's `observed` snapshot, while the retired `pullWatch` read
+  // the previous look's `b.lastSnapshot`. A pull that opens, or merges, in the
+  // look itself therefore reads live/not-live here on that same look.
+  it("BB-413 named timing difference: a pull first linked this look is live on the same look", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    const live = (): boolean => (t.hooks.store.assessment(b.id) as { liveness: { live: boolean } } | null)!.liveness.live;
+    expect(live()).toBe(false);
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login (ENG-12)" }, { head: "bb/eng-12-fix" }));
+    await t.hooks.reconcilePass("p1");
+    // The retired predicate read the previous snapshot (no pull) and said false.
+    expect(live()).toBe(true);
+  });
+
+  it("BB-413 named timing difference: a pull merged this look stops being live on the same look", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    const live = (): boolean => (t.hooks.store.assessment(b.id) as { liveness: { live: boolean } } | null)!.liveness.live;
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login (ENG-12)" }, { head: "bb/eng-12-fix" }));
+    await t.hooks.reconcilePass("p1");
+    expect(live()).toBe(true);
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix login (ENG-12)", state: "merged" }, { head: "bb/eng-12-fix", merged: true }));
+    await t.hooks.reconcilePass("p1");
+    // The retired predicate read the previous snapshot (open) and stayed live.
+    expect(live()).toBe(false);
+  });
+
   it("the nightly wake carries the previous digest and the record since it", async () => {
     const t = await adopted();
     await t.hooks.nightlyPass("p1", "first");

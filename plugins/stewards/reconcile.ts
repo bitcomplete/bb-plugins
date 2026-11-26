@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { INITIATIVE_PLAYBOOK, isTerminal, labelPhaseName, phaseOf, type Playbook } from "./config.js";
 import type { Deployments } from "./deploy.js";
 import { isMarkerComment, latestReviewMarker, reviewMarker } from "./gate.js";
+import { schedulingHolds } from "./holds.js";
 import { gateState, reportedItem } from "./ready-gate.js";
 import type { EntitySnapshot, SnapshotComment, Source } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, ReadyState, StatusRecord, Worker } from "./store.js";
@@ -775,11 +776,15 @@ const pullOpen = (e: EntitySnapshot): boolean => e.pull !== null && e.state !== 
  */
 export function idleInActiveStage(b: IdleBinding, observed: Observed, now: number = Date.now()): boolean {
   if (b.stage !== "build" && b.stage !== "review") return false;
-  if (b.ending !== null || b.hold !== null) return false;
+  // BB-413 (C7): the `hold`/`ending`/`requeue` answer is the composed holds,
+  // the same derivation the composer folds, not a second test of the fields.
+  const holds = schedulingHolds(b, now);
+  const held = (id: string): boolean => holds.some((h) => h.id === id && h.held);
+  if (held("ending") || held("hold")) return false;
   // BB-247: a dated wait is something the plugin waits on. The binding is
   // parked until the date, so it is not idle and must not be woken with
   // "nothing is being waited on" before then.
-  if (b.requeueUntil !== null && b.requeueUntil > now) return false;
+  if (held("requeue")) return false;
   if (b.workers.some((w) => w.status === "running")) return false;
   if ([observed.entity, ...observed.pulls].some((e) => pullOpen(e) && ownPull(e.key, e.url, b.ownPulls) && !(b.gateMetPulls?.has(e.key.toLowerCase()) ?? false))) return false;
   if (Object.values(b.deployments).some((w) => w.state === "merged" || w.state === "deploying")) return false;

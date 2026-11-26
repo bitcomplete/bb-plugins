@@ -13,7 +13,7 @@
 // moved from multi-repo to native keep its old bindings' touches meaningful;
 // it can also match two different repos' same-named directory, which is
 // harmless (an extra schedule question) and unavoidable without the repo set.
-import { schedulingHolds } from "./contribution.js";
+import { bindingHeld } from "./holds.js";
 import type { Binding, Observed } from "./store.js";
 
 /** A touch as compared: lower case, forward slashes, no leading "./" or surrounding slashes, inner runs of slashes collapsed. */
@@ -93,7 +93,7 @@ export const atWork = (b: Binding, opts: AtWorkOptions = {}): boolean =>
   b.endedAt === null &&
   b.ending === null &&
   // BB-413 (C7): the composed `hold` hold, not the raw field.
-  !schedulingHolds(b, Date.now()).some((h) => h.id === "hold" && h.held) &&
+  !bindingHeld(b) &&
   (b.stage === "build" || b.stage === "review" || b.clearedToStart) &&
   b.touches.length > 0 &&
   !(b.lastSnapshot !== null && finished(b, b.lastSnapshot) && opts.runningWorker !== true);

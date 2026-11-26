@@ -102,7 +102,8 @@ import {
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mergeWorkaroundParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
-import { composeAssessment, schedulingHolds, type ComposedAssessment, type HoldContribution, type ResourceContribution } from "./contribution.js";
+import { composeAssessment, type ComposedAssessment, type HoldContribution, type ResourceContribution } from "./contribution.js";
+import { bindingHeld, schedulingHolds } from "./holds.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { ASK_ON_SLACK_CHOICE, NOT_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackCandidateLabel, slackNameCandidates, slackPersonKey, slackPersonLabel, slackPersonNotOnSlack, waitSlackAskOnceWhat, waitSlackInstruction, waitSlackTerminalWhat, type SlackCandidate, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
 import { assessedGate, currentStoredGate, storedGates } from "./assessed-gate.js";
@@ -5567,10 +5568,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         gatePulls.add(lc(observed.entity.key));
         if (observed.entity.url !== null) gatePulls.add(lc(observed.entity.url));
       }
+      // BB-413 (C7): the wake pull watch counts the belonging observed pulls,
+      // not the `gatePulls` seeded with `ownPulls`. A pull handed to another
+      // binding (BB-386) is still worker-owned but `pullBelongsToTicket` is
+      // false, so it is not this binding's watch.
+      const watchedPulls = new Set<string>();
       for (const e of [observed.entity, ...observed.pulls]) {
         if (e.pull === null || !pullBelongsToTicket(b, e, ownPulls)) continue;
         gatePulls.add(lc(e.key));
         if (e.url !== null) gatePulls.add(lc(e.url));
+        watchedPulls.add(lc(e.key));
+        if (e.url !== null) watchedPulls.add(lc(e.url));
       }
       // The decide-list mark comes from the files the snapshot already carries;
       // no extra GitHub read. Everything else is a row already in hand.
@@ -5603,6 +5611,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         observed,
         ownPulls,
         gatePulls,
+        watchedPulls,
         decisions,
         projectApprovals: projectApprovalsFor(b),
         rememberedRequesters,
@@ -6355,7 +6364,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           b.stage === "spec" &&
           gateState(playbook, b.ready, currentSpec).passed &&
           !assessWorker(store.workers(b.id)).inFlight &&
-          b.hold === null &&
+          !bindingHeld(b) &&
           !store.openEscalations(b.id).some((x) => x.kind === "approval" || x.kind === "schedule");
         if (!startStillDue) {
           b = store.patch(b.id, { pending: b.pending.filter((n) => n.text !== START_WORKER_WAKE) });
@@ -6395,7 +6404,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
       // Not now: keep the news as notes, delivered at the next turn. A held
       // binding still hears from its people (guidance, approvals, lifecycle).
-      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const deferred = (await settings.get()).paused || (bindingHeld(b) && reason === null && loudQueued === 0);
       const info = b.threadId === null ? null : await threadInfo(b.threadId);
       if (deferred || (info !== null && busy(info.status))) {
         keep(changes);
@@ -6941,7 +6950,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         keep();
         return;
       }
-      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const deferred = (await settings.get()).paused || (bindingHeld(b) && reason === null && loudQueued === 0);
       const info = b.threadId === null ? null : await threadInfo(b.threadId);
       if (deferred || (info !== null && busy(info.status))) {
         keep();
@@ -7063,7 +7072,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         keep();
         return;
       }
-      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const deferred = (await settings.get()).paused || (bindingHeld(b) && reason === null && loudQueued === 0);
       const info = b.threadId === null ? null : await threadInfo(b.threadId);
       if (deferred || (info !== null && busy(info.status))) {
         keep();
@@ -7125,7 +7134,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         keep();
         return;
       }
-      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const deferred = (await settings.get()).paused || (bindingHeld(b) && reason === null && loudQueued === 0);
       const info = b.threadId === null ? null : await threadInfo(b.threadId);
       if (deferred || (info !== null && busy(info.status))) {
         keep();
@@ -7322,7 +7331,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         keep();
         return;
       }
-      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const deferred = (await settings.get()).paused || (bindingHeld(b) && reason === null && loudQueued === 0);
       const info = b.threadId === null ? null : await threadInfo(b.threadId);
       if (deferred || (info !== null && busy(info.status))) {
         keep();
@@ -7542,7 +7551,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         keep();
         return;
       }
-      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const deferred = (await settings.get()).paused || (bindingHeld(b) && reason === null && loudQueued === 0);
       const info = b.threadId === null ? null : await threadInfo(b.threadId);
       if (deferred || (info !== null && busy(info.status))) {
         keep();
@@ -9380,7 +9389,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return null;
       };
       if (b.kind !== "ticket" || b.endedAt !== null || b.ending !== null || b.lastSnapshot === null) return withdraw("Withdrawn.", false);
-      if (b.hold !== null) return withdraw("Held.", false);
+      if (bindingHeld(b)) return withdraw("Held.", false);
       const gate = gateState(playbook, b.ready, specHashFor(b, b.lastSnapshot.entity));
       if (!gate.passed) return withdraw("Withdrawn: the ready gate no longer passes.", false);
       // Finished work is not scheduled against anything: there is nothing left to start.
@@ -14521,7 +14530,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // The same own-pull set the gate/merge loop uses (BB-52 rule 0), so a
           // ticket's own pull request counts as a source or not by one rule.
           const currentOwnPulls = current.kind === "ticket" && current.lastSnapshot !== null ? await ownPullKeys(current, store.workers(current.id), current.lastSnapshot) : new Set<string>();
-          const liveSource = rowLiveSource(bindingWakeSources(current, currentOwnPulls));
+          // BB-413 (C7): the row live-source answer is the legacy fallback for
+          // a report whose fresh assessment could not be built (a missing
+          // snapshot, playbook or config) or an ops binding. It is computed
+          // lazily, only on those paths, so a normal report does not pay the
+          // `store.workers`/`openEscalations`/`openNeeds`/`pullWatch` reads.
+          let liveSourceCache: boolean | null = null;
+          const liveSource = (): boolean => (liveSourceCache ??= rowLiveSource(bindingWakeSources(current, currentOwnPulls)));
           // BB-333/BB-375/BB-400: liveness and stall come from the one
           // assessment. The report derives the same answer here for its reply
           // (the reconcile that stores it may not have run since the wait was
@@ -14549,7 +14564,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // no stored assessment, so its report keeps the free-text rule the
           // ops reconcile writes with (the ops path is out of C5's scope).
           const storedStalled = (store.assessment(current.id)?.liveness as { stalled?: boolean } | null | undefined)?.stalled;
-          const noWakeSource = derivedStalled ?? storedStalled ?? (current.source === "ops" ? observedStall(current, liveSource, now()) : false);
+          const noWakeSource = derivedStalled ?? storedStalled ?? (current.source === "ops" ? observedStall(current, liveSource(), now()) : false);
           // BB-339: the open bindings the free text names, in the order they
           // appeared, so the report reply can point the steward at the hold it
           // can take in this turn. A key that resolves to nothing, to an ended
@@ -14562,7 +14577,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             : [];
           const stall = advanceStall(
             { count: current.requeueWakeCount, waitText: current.requeueWaitText, firstAt: current.requeueFirstAt },
-            { reason: wakeReason, waitingOn, liveSource: derivedStalled !== null ? !derivedStalled : liveSource, now: now(), until: current.requeueUntil },
+            { reason: wakeReason, waitingOn, liveSource: derivedStalled !== null ? !derivedStalled : liveSource(), now: now(), until: current.requeueUntil },
           );
           b = store.patch(b.id, {
             requeueWakeCount: stall.state.count,
@@ -15743,7 +15758,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // BB-350: a question forwarded from an open escalation is that
           // escalation's ask, so the flags list it once, not under both ids.
           const openPresent = new Set(open.map((x) => x.id));
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}`, b.mergeBehind.length === 0 ? null : `MERGE HOLD: behind ${b.mergeBehind.join(", ")}`, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.filter((x) => !(x.isQuestion && x.forwardedFrom !== null && openPresent.has(x.forwardedFrom))).map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
+          // BB-413 (C7): the held answer is the composed `hold`/`merge-behind`
+          // holds; the text still reads the binding's own fields.
+          const holds = schedulingHolds(b, now());
+          const held = (id: string): boolean => holds.some((h) => h.id === id && h.held);
+          const holdFlag = held("hold") ? `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}${b.holdStack.length === 0 ? "" : ` (stacked on ${b.holdStack.join(", ")})`}` : null;
+          const mergeFlag = held("merge-behind") ? `MERGE HOLD: behind ${b.mergeBehind.join(", ")}` : null;
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.adoptedBy === null ? null : `adopted by ${b.adoptedBy}`, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, holdFlag, mergeFlag, b.stackedPulls.length === 0 ? null : `BASE OF: ${b.stackedPulls.join(", ")}`, ...open.filter((x) => !(x.isQuestion && x.forwardedFrom !== null && openPresent.has(x.forwardedFrom))).map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${roles.length === 0 ? "" : `, role ${roles.join(", ")}`}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${b.noWakeSource ? "; waiting, no wake source" : s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}${b.requeueUntil === null ? "" : ` until ${iso(b.requeueUntil).slice(0, 10)}`}`}`}${b.wait === null ? "" : `; typed wait: ${waitPhrase(b.wait)}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
@@ -16054,7 +16075,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const followUps = store.escalationsWithPendingRationale(config.projectId, AFTER_THE_FACT_RATIONALE_WHY);
         const order = store
           .open(config.projectId)
-          .filter((b) => b.hold === null && b.ending === null)
+          .filter((b) => !schedulingHolds(b, now()).some((h) => (h.id === "hold" || h.id === "ending") && h.held))
           .sort((a, b) => (PRIORITY_ORDER[a.priority ?? "normal"] ?? 2) - (PRIORITY_ORDER[b.priority ?? "normal"] ?? 2) || (a.lastJudgmentAt ?? 0) - (b.lastJudgmentAt ?? 0));
         const woken: string[] = [];
         for (const b of order.slice(0, config.file.nightly.max)) {

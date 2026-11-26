@@ -138,6 +138,13 @@ export type AssessmentInput = {
    * `ownPulls`, so a caller that does not need the broader set is unchanged.
    */
   gatePulls?: ReadonlySet<string>;
+  /**
+   * The pulls the wake pull watch counts (BB-413, C7): the observed pulls that
+   * belong to the binding (`pullBelongsToTicket`), so a pull handed to another
+   * binding is excluded even while it is still worker-owned. Defaults to
+   * `gatePulls`.
+   */
+  watchedPulls?: ReadonlySet<string>;
   /** The decide-list mark for each own pull, from the files the snapshot already carries. */
   decisions: ReadonlyMap<string, DecideMark>;
   /** The plugin's recorded project approvals for the binding. */
@@ -519,12 +526,13 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     // whose effect on idle is the named fixture, not a divergence. The two
     // sides are sorted so contributor order never reads as a difference.
     const gateMetByPull = new Map(assessment.gate.pulls.map((p) => [lc(p.pull), p.met]));
+    const watchedPulls = input.watchedPulls ?? input.gatePulls ?? ownPulls;
     const assessedResources: string[] = [];
     let pullWatch = false;
     for (const e of ownPullEntities(observed, input.gatePulls ?? ownPulls)) {
       const open = pullIsOpen(e) && !(gateMetByPull.get(lc(e.key)) ?? false);
       assessedResources.push(`open-pull:${lc(e.key)}:${open && isOwn(e, ownPulls)}`);
-      if (binding.kind === "ticket" && open) pullWatch = true;
+      if (binding.kind === "ticket" && watchedPulls.has(lc(e.key)) && open) pullWatch = true;
     }
     if (binding.kind === "ticket") assessedResources.push(`pull-watch:${pullWatch}`);
     for (const key of leasedLinkedPullKeys(input)) assessedResources.push(`linked-pull:${lc(key)}:true`);

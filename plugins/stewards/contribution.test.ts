@@ -590,7 +590,7 @@ describe("the composed live-source answer covers every WakeSourceInput field (BB
 
   const ownPullInput = (): AssessmentInput => {
     const pr = openPull("acme/web#9");
-    return input({ observed: { entity: issue({ state: "In Progress" }), pulls: [pr] }, ownPulls: own(pr), gatePulls: own(pr), decisions: new Map([[pr.key.toLowerCase(), "user" as const]]) });
+    return input({ observed: { entity: issue({ state: "In Progress" }), pulls: [pr] }, ownPulls: own(pr), gatePulls: own(pr), watchedPulls: own(pr), decisions: new Map([[pr.key.toLowerCase(), "user" as const]]) });
   };
 
   const cases = (): Array<[string, AssessmentInput, boolean, boolean]> => [
@@ -617,6 +617,16 @@ describe("the composed live-source answer covers every WakeSourceInput field (BB
       expect(composed, label).toBe(expected);
       expect(composed, label).toBe(rowLiveSource(sourcesFor(i, pullRequestWatch)));
     }
+  });
+
+  it("excludes a pull handed to another binding from the pull watch (BB-386)", () => {
+    const pr = openPull("acme/web#9");
+    // Worker-owned and gated, but `pullBelongsToTicket` handed it to another
+    // binding, so `watchedPulls` is empty and the retired `pullWatch` read
+    // false; the composer must too.
+    const i = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [pr] }, ownPulls: own(pr), gatePulls: own(pr), watchedPulls: new Set<string>(), decisions: new Map([[pr.key.toLowerCase(), "user" as const]]) });
+    expect(composeAssessment(i).resources.find((r) => r.id === "pull-watch")!.active).toBe(false);
+    expect(composeAssessment(i).liveness.live).toBe(false);
   });
 });
 
