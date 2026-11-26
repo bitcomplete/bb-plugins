@@ -556,6 +556,17 @@ reported (with a note when a linked pull request could not be read) — so
 the project steward can see merged-but-open work without a second look,
 with no recommendation beyond holding behind it or starting now.
 
+A typed `binding` wait is delivered on the same edges (BB-410).
+`releaseBehind` — which runs when a binding begins and finishes ending and
+on the merged-pulls edge — scans the project's open bindings for a stored
+`wait: { kind: "binding", ref }` naming the ending key or binding id,
+case-insensitively, notes the waiter with what happened, clears the wait so
+the next look cannot re-derive it live, and schedules a reconcile whose wake
+carries the note as an actionable change line. A `binding` wait therefore
+behaves like `hold, behind` for waking. The other kinds whose liveness is a
+page item or a deployment watch are not released here: their close or settle
+is a different hook (BB-411).
+
 ### Judgment tier
 
 The steward is woken with one message in a fixed form:

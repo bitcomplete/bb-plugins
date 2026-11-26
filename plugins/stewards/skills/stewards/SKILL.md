@@ -345,7 +345,11 @@ Two tools are yours; everything else you do with the tools every thread has.
   same turn — a binding to hold behind (`steward_update { hold, behind }`), a
   typed `wait`, or a dated `until` — not at the next wake. A `pull` or
   `review` wait is leased beside the ticket's linked pulls and read on each
-  look; a change on it wakes the binding. If the free text names an open
+  look; a change on it wakes the binding. A `binding` wait is delivered on
+  the same edges a `behind` hold lifts: when the waited binding merges all
+  its pull requests or ends, the plugin wakes you with a change line and
+  clears the stale wait, so the next look cannot re-derive it live (BB-410).
+  If the free text names an open
   binding in the same project, the reply names it and the exact `hold,
   behind` call. Clear the mark by adding a real source or clearing the wait.
   If you wake by `requeue` twice in a row with the same wait and no source,
