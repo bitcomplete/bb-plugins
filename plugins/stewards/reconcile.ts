@@ -827,9 +827,10 @@ export function mechanicalStatus(prev: StatusRecord | null, event: MechanicalEve
     case "checks":
       // BB-409: a delivered round is the live next action for its own head; a
       // checks event on that head keeps the phrase, one on a new head clears it.
-      return prev.roundHeadSha !== null && prev.roundHeadSha === event.headSha
-        ? { ...base, roundHeadSha: prev.roundHeadSha }
-        : { ...base, nextAction: checksPhrase(event.state, event.failing), roundHeadSha: null };
+      // A push with no round phrase and unsettled checks changes nothing (BB-203).
+      if (prev.roundHeadSha !== null && prev.roundHeadSha !== undefined && prev.roundHeadSha === event.headSha) return { ...base, roundHeadSha: prev.roundHeadSha };
+      if (!SETTLED.has(event.state) && (prev.roundHeadSha === null || prev.roundHeadSha === undefined)) return prev;
+      return { ...base, nextAction: checksPhrase(event.state, event.failing), roundHeadSha: null };
     case "deployed":
       return { ...base, summary: `Deployed ${event.pull}.`, nextAction: "Close the ticket.", roundHeadSha: null };
     case "round":

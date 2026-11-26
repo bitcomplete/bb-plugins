@@ -1277,6 +1277,8 @@ describe("mechanical status and the user's open items (BB-203)", () => {
     expect(mechanicalStatus(roundStatus, { kind: "checks", pull: "acme/web#7", state: "success", failing: [], headSha: "bbbbbbb2" }, false, 6)).toMatchObject({ nextAction: "checks passed", roundHeadSha: null });
     // An approval clears it too.
     expect(mechanicalStatus(roundStatus, { kind: "approved", pull: "acme/web#7" }, false, 6)).toMatchObject({ nextAction: "The worker merges it.", roundHeadSha: null });
+    // A push with no round phrase and unsettled checks leaves the steward's next action alone (BB-203).
+    expect(mechanicalStatus(status(), { kind: "checks", pull: "acme/web#7", state: "pending", failing: [], headSha: "bbbbbbb2" }, false, 6)).toMatchObject({ nextAction: "Wait for the worker" });
   });
 
   it("keeps actor user only while a need or me escalation is open, and never invents a first report", () => {

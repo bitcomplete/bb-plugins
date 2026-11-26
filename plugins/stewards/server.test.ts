@@ -8675,6 +8675,18 @@ describe("needs you items", () => {
       expect(t.hooks.store.find("ENG-12")!.status!.nextAction).toBe("checks passed");
     });
 
+    it("leaves the status alone on a push with no round phrase", async () => {
+      const t = await withPull([]);
+      const b = t.binding();
+      t.hooks.store.patch(b.id, { status: { phase: "In Progress", summary: "Watching.", nextAction: "Wait for the reviewer", actor: "steward", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() }, statusAt: t.now() });
+      // A push to a new head with pending checks and no round phrase must not
+      // write "checks pending" over the steward's next action (BB-203).
+      t.entities.set("acme/web#7", pull({}, { head: "bb/eng-12-retry", headSha: "bbbbbbb2", checks: { state: "pending", failing: [] } }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(t.hooks.store.find("ENG-12")!.status!.nextAction).toBe("Wait for the reviewer");
+    });
+
     it("delivers to the parked worker when the signed review worker has ended", async () => {
       const t = await withPull([]);
       // Worker A signed the "Independent review running" comment and ended plainly.
