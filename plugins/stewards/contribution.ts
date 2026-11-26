@@ -276,8 +276,12 @@ function entityContribution(source: ContributionSource, input: AssessmentInput):
     if (w !== null) waits.push(w);
   }
   const resources: ResourceContribution[] = [];
-  for (const w of Object.values(input.binding.deployments)) {
-    resources.push({ source, id: `deployment:${lc(w.key)}`, active: w.state === "merged" || w.state === "deploying", subject: { kind: "pull", id: w.key } });
+  // The deployments map is keyed by the watch id (`<pull>` or
+  // `<pull>::<target>` for a named target, BB-132), so the resource id is the
+  // map key and the subject is still the pull. Keying by `w.key` would collapse
+  // two named targets into one id and diverge from `compare`.
+  for (const [key, w] of Object.entries(input.binding.deployments)) {
+    resources.push({ source, id: `deployment:${lc(key)}`, active: w.state === "merged" || w.state === "deploying", subject: { kind: "pull", id: w.key } });
   }
   resources.push({ source, id: "workers", active: anyWorkerInFlight(input.workers), subject: null });
   return { source, gate: [], waits, resources, holds: bindingHolds(source, input), reasons: [] };

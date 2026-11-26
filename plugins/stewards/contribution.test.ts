@@ -491,6 +491,12 @@ describe("the resources and holds contributions (BB-412, C6)", () => {
     ["a merged waited pull is an inactive waited-pull", waitInput({ kind: "pull", ref: "acme/web#9" }, { waitedPulls: waited(mergedPull("acme/web#9")) }), [["waited-pull:acme/web#9", false], ["workers", false]]],
     ["an unsettled deployment watch is a live deployment", input({ binding: binding({ deployments: { "acme/web#9": watch("acme/web#9", "merged") as never } }) }), [["deployment:acme/web#9", true], ["workers", false]]],
     ["a settled deployment watch is an inactive deployment", input({ binding: binding({ deployments: { "acme/web#9": watch("acme/web#9", "deployed") as never } }) }), [["deployment:acme/web#9", false], ["workers", false]]],
+    ["a named-target deployment watch is keyed by its watch id", input({ binding: binding({ deployments: { "acme/web#9::bb-gate": watch("acme/web#9", "merged") as never } }) }), [["deployment:acme/web#9::bb-gate", true], ["workers", false]]],
+    [
+      "two named-target watches on one pull keep distinct deployment ids",
+      input({ binding: binding({ deployments: { "acme/web#9::bb-gate": watch("acme/web#9", "merged") as never, "acme/web#9::devbox": watch("acme/web#9", "deployed") as never } }) }),
+      [["deployment:acme/web#9::bb-gate", true], ["deployment:acme/web#9::devbox", false], ["workers", false]],
+    ],
     ["a running worker is a live workers resource", input({ workers: [{ threadId: "thr_w1", status: "running" } as never] }), [["workers", true]]],
     ["a parked worker is still in flight, so workers is live", input({ workers: [parkedWorker()] }), [["workers", true]]],
   ];
