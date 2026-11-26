@@ -973,7 +973,15 @@ export const REVIEWER_ROUND_WAKE_MIGRATIONS = [
 // and nullable: a pre-migration build never reads the column.
 export const INITIATIVE_IDLE_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN idle_initiative_since INTEGER`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS, ...REHOME_MARK_MIGRATIONS, ...REVIEWER_ROUND_WAKE_MIGRATIONS, ...INITIATIVE_IDLE_MIGRATIONS];
+// BB-409: the once-per-round record for the changes-requested round delivered
+// to a parked worker. `reviewer_round_delivered` holds `pull#sha#round` for
+// each round already delivered, so a later look at the same round does not
+// re-wake the worker; a new round or a new push is a new key and re-arms it.
+// Append-only and defaulted: a row from before this group reads as no round
+// delivered and fires on the next look.
+export const REVIEWER_ROUND_DELIVER_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN reviewer_round_delivered TEXT NOT NULL DEFAULT '[]'`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS, ...WAKE_SOURCE_MIGRATIONS, ...SERVER_SETTINGS_MIGRATIONS, ...PULL_WATCH_MIGRATIONS, ...STACK_MIGRATIONS, ...ESCALATION_ROUTE_MIGRATIONS, ...DEPS_DECISION_MIGRATIONS, ...WORKER_STOP_REASON_MIGRATIONS, ...ASSUMPTION_MIGRATIONS, ...DATED_WAIT_MIGRATIONS, ...WAKE_RETRY_MIGRATIONS, ...MERGE_BEHIND_MIGRATIONS, ...RETARGET_PULLS_MIGRATIONS, ...STACKED_PULLS_MIGRATIONS, ...ASSESSMENT_MIGRATIONS, ...ENDED_READ_MIGRATIONS, ...HUDDLE_MIGRATIONS, ...STANDUP_MIGRATIONS, ...STANDUP_BINDING_MIGRATIONS, ...STANDUP_DELEGATION_MIGRATIONS, ...STANDUP_COMPLETED_MIGRATIONS, ...ALERTMANAGER_LOOK_MIGRATIONS, ...PULL_REQUESTER_MIGRATIONS, ...REVIEWER_REQUEST_MIGRATIONS, ...WORKER_PARK_MIGRATIONS, ...BACKLOG_LOOK_MIGRATIONS, ...CHECK_FINDING_MIGRATIONS, ...BACKLOG_SNAPSHOT_MIGRATIONS, ...TYPED_WAIT_MIGRATIONS, ...NON_ACTION_MIGRATIONS, ...WAIT_DIVERGENCE_MIGRATIONS, ...PLAYBOOK_REFRESH_MIGRATIONS, ...BACKLOG_WRITE_MIGRATIONS, ...WAIT_BUDGET_MIGRATIONS, ...WAIT_SLACK_MIGRATIONS, ...LEARNED_SLACK_MIGRATIONS, ...LOCAL_TICKET_MIGRATIONS, ...ESCALATION_REWAKE_MIGRATIONS, ...HANDOFF_MIGRATIONS, ...REHOME_MARK_MIGRATIONS, ...REVIEWER_ROUND_WAKE_MIGRATIONS, ...INITIATIVE_IDLE_MIGRATIONS, ...REVIEWER_ROUND_DELIVER_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1166,6 +1174,8 @@ export type Binding = {
   reviewerRoundWakes: string[];
   /** BB-392: the last look found this binding's own pull request eligible for the missing-reviewer-round wake (green, no marker, no worker, no live reviewer), so the status line names the missing round. */
   reviewerRoundMissing: boolean;
+  /** BB-409: the `pull#sha#round` keys already delivered to a parked worker, so a changes-requested round fires once. */
+  reviewerRoundDelivered: string[];
   /** Entity keys of the bindings whose open pull request this hold waits for (a stack-wait, BB-215): it lifts when every one has opened a pull request, not when they merge. */
   holdStack: string[];
   /** Entity keys the project steward was last asked to schedule this binding against; asked again only for a new one. */
@@ -1304,6 +1314,7 @@ function rowToBinding(r: BindingRow): Binding {
     reviewerRoundGrace: json(z.array(z.string()), str("reviewer_round_grace"), []),
     reviewerRoundWakes: json(z.array(z.string()), str("reviewer_round_wakes"), []),
     reviewerRoundMissing: Number(r.reviewer_round_missing ?? 0) === 1,
+    reviewerRoundDelivered: json(z.array(z.string()), str("reviewer_round_delivered"), []),
     holdStack: json(z.array(z.string()), str("hold_stack"), []),
     scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
     clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
@@ -1391,6 +1402,7 @@ const COLUMNS = {
   reviewerRoundGrace: "reviewer_round_grace",
   reviewerRoundWakes: "reviewer_round_wakes",
   reviewerRoundMissing: "reviewer_round_missing",
+  reviewerRoundDelivered: "reviewer_round_delivered",
   holdStack: "hold_stack",
   scheduleAsked: "schedule_asked",
   clearedToStart: "cleared_to_start",

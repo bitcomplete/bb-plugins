@@ -795,11 +795,20 @@ export type MechanicalEvent =
   | { kind: "approved"; pull: string }
   | { kind: "merged"; pull: string }
   | { kind: "checks"; pull: string; state: string; failing: readonly string[] }
-  | { kind: "deployed"; pull: string };
+  | { kind: "deployed"; pull: string }
+  // BB-409: a changes-requested reviewer round was delivered, so the page and
+  // sidebar name the round and verdict instead of the steward's stale wait.
+  | { kind: "round"; pull: string; round: number; verdict: string; told: boolean };
 
 /** The phrase a checks result folds into (BB-203): the summary stays the steward's. */
 export const checksPhrase = (state: string, failing: readonly string[]): string =>
   state === "success" ? "checks passed" : `checks ${state}${failing.length === 0 ? "" : ` (failing: ${failing.join(", ")})`}`;
+
+/** The reviewer's verdict as the status phrase reads it (BB-409): `changes-requested` reads with a space. */
+export const roundVerdictPhrase = (verdict: string): string => (verdict === "changes-requested" ? "changes requested" : verdict);
+
+/** Whether a status `nextAction` is a delivered reviewer round's phrase (BB-409). */
+const isRoundPhrase = (nextAction: string): boolean => /^reviewer round \d+: .+; (?:worker|steward) told$/u.test(nextAction);
 
 /**
  * The status record the plugin writes on an event it observed itself (BB-203),
@@ -819,9 +828,15 @@ export function mechanicalStatus(prev: StatusRecord | null, event: MechanicalEve
     case "merged":
       return { ...base, summary: `Merged ${event.pull}.`, nextAction: "Awaiting deployment." };
     case "checks":
-      return { ...base, nextAction: checksPhrase(event.state, event.failing) };
+      // BB-409: a delivered round is the live next action; a later checks event
+      // must not overwrite it with the older "checks passed" phrase.
+      return { ...base, nextAction: isRoundPhrase(prev.nextAction) ? prev.nextAction : checksPhrase(event.state, event.failing) };
     case "deployed":
       return { ...base, summary: `Deployed ${event.pull}.`, nextAction: "Close the ticket." };
+    case "round":
+      // BB-409: the round and its verdict, and who was told, so the row does
+      // not keep the steward's stale "reviewer running the first round".
+      return { ...base, nextAction: `reviewer round ${event.round}: ${roundVerdictPhrase(event.verdict)}; ${event.told ? "worker" : "steward"} told` };
   }
 }
 

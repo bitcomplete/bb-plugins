@@ -1258,6 +1258,23 @@ describe("mechanical status and the user's open items (BB-203)", () => {
     expect(checksPhrase("failure", ["ci"])).toBe("checks failure (failing: ci)");
   });
 
+  it("names the reviewer round, its verdict and who was told for a delivered round (BB-409)", () => {
+    // A changes-requested round reads with a space, so the page and sidebar
+    // name it instead of the steward's stale "reviewer running the first round".
+    expect(mechanicalStatus(status(), { kind: "round", pull: "acme/web#7", round: 1, verdict: "changes-requested", told: true }, false, 5)).toMatchObject({
+      summary: "Building.",
+      nextAction: "reviewer round 1: changes requested; worker told",
+    });
+    expect(mechanicalStatus(status(), { kind: "round", pull: "acme/web#7", round: 2, verdict: "changes-requested", told: false }, false, 5)).toMatchObject({
+      nextAction: "reviewer round 2: changes requested; steward told",
+    });
+    // A later checks event must not overwrite the live round phrase (BB-409).
+    const roundStatus = mechanicalStatus(status(), { kind: "round", pull: "acme/web#7", round: 1, verdict: "changes-requested", told: true }, false, 5)!;
+    expect(mechanicalStatus(roundStatus, { kind: "checks", pull: "acme/web#7", state: "success", failing: [] }, false, 6)).toMatchObject({ nextAction: "reviewer round 1: changes requested; worker told" });
+    // Once the steward reports again, a checks event folds as before.
+    expect(mechanicalStatus({ ...roundStatus, nextAction: "Wait" }, { kind: "checks", pull: "acme/web#7", state: "success", failing: [] }, false, 6)).toMatchObject({ nextAction: "checks passed" });
+  });
+
   it("keeps actor user only while a need or me escalation is open, and never invents a first report", () => {
     expect(mechanicalStatus(status(), { kind: "approved", pull: "acme/web#7" }, true, 5)!.actor).toBe("user");
     expect(mechanicalStatus(status(), { kind: "merged", pull: "acme/web#7" }, true, 5)!.actor).toBe("user");

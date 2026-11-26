@@ -24,15 +24,17 @@ ticket or pull request you were given and put it in your final message, then
 end the turn.
 
 **Ending a turn to wait.** The flow is not one turn: a step that waits on
-something outside it may end the turn and resume from the wake. When you end
-a turn waiting on something that will wake you — a reviewer's round, the
-approver, checks, a build, a deployment, the steward's answer — call
-`worker_park { waitingOn: "<what you wait on>" }` as your last action. The
-plugin then leaves this worker unarchived, shows it as parked, and wakes it
-when the thing happens. A turn that ends without the call is a plain finish:
-the plugin treats the worker as done and archives it, whatever its final
-message says. Do not rely on the words "waiting" or "parked" in your final
-message.
+something outside it may end the turn and resume from the wake. The plugin
+delivers exactly three waits to a parked worker: **a reviewer's round**, the
+**approver's decision**, and the **no-review gate** becoming met. For one of
+those, call `worker_park { waitingOn: "<what you wait on>" }` as your last
+action; the plugin then leaves this worker unarchived, shows it as parked,
+and wakes it when the round or decision lands. A wait on anything else —
+checks, a build, a deployment — is not delivered by the plugin: set a
+`github_watch` on it as well, so the turn resumes when it moves. A turn that
+ends without `worker_park` is a plain finish: the plugin treats the worker as
+done and archives it, whatever its final message says. Do not rely on the
+words "waiting" or "parked" in your final message.
 
 The project-specific parts are the project's, not this skill's: which
 repos depend on which, each repo's test command, the restart note, the
@@ -244,7 +246,9 @@ signed.
 
 Repeat until the merge gate below is met:
 
-1. **Wait for the reviewer:** `bb thread wait <reviewer-id> --status idle --timeout 45m`.
+1. **Wait for the reviewer:** `bb thread wait <reviewer-id> --status idle --timeout 45m`,
+   or end the turn with `worker_park { waitingOn: "the reviewer's round on <PR>" }`
+   and let the plugin wake you when the round lands (it delivers any verdict).
    On timeout, check `bb thread show <reviewer-id>`; if it is in `error`,
    `bb thread retry <reviewer-id>` once, then on a second failure proceed
    with the human review alone and say so on the PR. The wait can return

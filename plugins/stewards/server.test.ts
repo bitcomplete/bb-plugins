@@ -8606,6 +8606,108 @@ describe("needs you items", () => {
     });
   });
 
+  describe("the changes-requested round delivered to a parked worker (BB-409)", () => {
+    const round = comment({ id: "cr1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=changes-requested lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+
+    /** A parked worker, its thread idle, waiting on the reviewer's round. */
+    const parkWaiting = async (t: Awaited<ReturnType<typeof withPull>>, id = "thr_w1") => {
+      await t.created(id, t.steward, "ENG-12: Implement");
+      t.hooks.store.setWorker(id, "finished", "Waiting on the reviewer's round.");
+      t.hooks.store.parkWorker(id, "the reviewer's round");
+      t.threads.get(id)!.status = "idle";
+    };
+
+    it("wakes a parked worker, names the round in the status, and fires once per round", async () => {
+      const t = await withPull([]);
+      const b = t.binding();
+      // The steward's report the round's status replaces.
+      t.hooks.store.patch(b.id, { status: { phase: "In Progress", summary: "Checks pending.", nextAction: "reviewer running the first round", actor: "steward", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() }, statusAt: t.now() });
+      await parkWaiting(t);
+      // The reviewer posts the round at the current head.
+      t.entities.set("acme/web#7", pull({ comments: [round] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(t.sends.filter((s) => s.threadId === "thr_w1").some((s) => /Reviewer round 1 on acme\/web#7 at aaaaaaa: changes-requested/u.test(s.text) && /Address the blockers and re-request the round/u.test(s.text))).toBe(true);
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundDelivered).toEqual(["acme/web#7#aaaaaaa1#1"]);
+      expect(t.hooks.store.find("ENG-12")!.pending.some((n) => /Reviewer round 1 on acme\/web#7 at aaaaaaa: changes-requested; its worker was told\./u.test(n.text))).toBe(true);
+      // The page and sidebar status name the round and verdict, not the stale wait.
+      expect(t.hooks.store.find("ENG-12")!.status!.nextAction).toBe("reviewer round 1: changes requested; worker told");
+      const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; status: { nextAction: string } | null }> };
+      expect(sidebar.bindings.find((x) => x.key === "ENG-12")?.status?.nextAction).toBe("reviewer round 1: changes requested; worker told");
+      // A second look at the same round is quiet.
+      const wakes = t.sends.filter((s) => s.threadId === "thr_w1").length;
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(t.sends.filter((s) => s.threadId === "thr_w1").length).toBe(wakes);
+    });
+
+    it("keeps the round phrase when the checks finish on a later look", async () => {
+      const t = await withPull([]);
+      const b = t.binding();
+      t.hooks.store.patch(b.id, { status: { phase: "In Progress", summary: "Checks pending.", nextAction: "reviewer running the first round", actor: "steward", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() }, statusAt: t.now() });
+      await parkWaiting(t);
+      // The round lands while the checks are still pending.
+      t.entities.set("acme/web#7", pull({ comments: [round] }, { head: "bb/eng-12-retry", checks: { state: "pending", failing: [] } }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(t.hooks.store.find("ENG-12")!.status!.nextAction).toBe("reviewer round 1: changes requested; worker told");
+      // The checks finish on a later look: the round phrase survives.
+      t.entities.set("acme/web#7", pull({ comments: [round] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(t.hooks.store.find("ENG-12")!.status!.nextAction).toBe("reviewer round 1: changes requested; worker told");
+    });
+
+    it("wakes the steward to start a worker when no parked worker can be reached", async () => {
+      const t = await withPull([]);
+      // No worker at all: the round has no parked worker to reach.
+      t.entities.set("acme/web#7", pull({ comments: [round] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      const wake = t.sends.filter((s) => s.threadId === t.steward).at(-1)?.text ?? "";
+      expect(wake).toMatch(/Reviewer round 1 on acme\/web#7 at aaaaaaa: changes-requested/u);
+      expect(wake).toMatch(/Start a worker at the build-tickets review loop/u);
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundDelivered).toEqual(["acme/web#7#aaaaaaa1#1"]);
+    });
+
+    it("does not fire while a worker is running, nor for an approved round", async () => {
+      // A running worker is already acting on the round (the `bb thread wait` case).
+      const running = await withPull([]);
+      await running.created("thr_w1", running.steward, "ENG-12: Implement");
+      running.hooks.store.setWorker("thr_w1", "running", null);
+      running.entities.set("acme/web#7", pull({ comments: [round] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+      await running.ring("linear", "uuid-12");
+      await running.flush();
+      expect(running.sends.filter((s) => s.threadId === "thr_w1")).toEqual([]);
+      expect(running.hooks.store.find("ENG-12")!.reviewerRoundDelivered).toEqual([]);
+
+      // An approved round keeps its existing path.
+      const approved = await withPull([]);
+      await parkWaiting(approved);
+      approved.entities.set("acme/web#7", pull({ comments: [marker] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+      await approved.ring("linear", "uuid-12");
+      await approved.flush();
+      expect(approved.sends.filter((s) => s.threadId === "thr_w1").some((s) => /Reviewer round/u.test(s.text))).toBe(false);
+      expect(approved.hooks.store.find("ENG-12")!.reviewerRoundDelivered).toEqual([]);
+    });
+
+    it("re-arms on a new round or a new push", async () => {
+      const t = await withPull([]);
+      await parkWaiting(t);
+      t.entities.set("acme/web#7", pull({ comments: [round] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundDelivered).toEqual(["acme/web#7#aaaaaaa1#1"]);
+      // A second round on the same head is a new key and wakes again.
+      const round2 = comment({ id: "cr2", author: "trotterdylan", body: `<!-- bb-review round=2 sha=${head} verdict=changes-requested lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
+      t.entities.set("acme/web#7", pull({ comments: [round, round2] }, { head: "bb/eng-12-retry", checks: { state: "success", failing: [] } }));
+      await t.ring("linear", "uuid-12");
+      await t.flush();
+      expect(t.hooks.store.find("ENG-12")!.reviewerRoundDelivered).toEqual(["acme/web#7#aaaaaaa1#1", "acme/web#7#aaaaaaa1#2"]);
+      expect(t.sends.filter((s) => s.threadId === "thr_w1").some((s) => /Reviewer round 2 on acme\/web#7/u.test(s.text))).toBe(true);
+    });
+  });
+
   it("does not merge while a worker is still running", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));

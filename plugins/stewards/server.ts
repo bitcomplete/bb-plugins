@@ -118,8 +118,8 @@ import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTarget
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
 import { advanced, adoptedBySource, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, observedStall, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, repinInitiativeSpecText, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
-import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker } from "./gate.js";
-import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
+import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker, type ReviewMarker } from "./gate.js";
+import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, deliverReviewRound, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
 import { deliverEscalation, nextRoute, routedEscalations, routedTo, type EscalationsContext } from "./escalations.js";
 import { approvalWanted, briefGate, gateState, resolveChecklistItem, syncApprovalRequest, type ReadyGateContext } from "./ready-gate.js";
 import {
@@ -4633,6 +4633,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       clearGrace();
       wakes.push(ref);
       return true;
+    }
+
+    /**
+     * BB-409: a changes-requested reviewer round at the current head wakes the
+     * pull request's parked worker so it addresses the blockers and re-requests
+     * the round. The round is read with the gate's existing `latestReviewMarker`
+     * parse and delivered through `deliverReviewRound`, the same path as an
+     * approval. It fires once per (pull, head sha, round); a new round or a new
+     * push re-arms it. A worker mid-turn already acts on the round, so it is not
+     * woken, and an `approved` round keeps its existing path. When no parked
+     * worker can be reached the steward is told to start one.
+     */
+    async function maybeDeliverReviewRound(
+      b: Binding,
+      pull: EntitySnapshot,
+      g: { marker: ReviewMarker | null; headSha: string | null },
+      delivered: string[],
+      changes: Change[],
+    ): Promise<MechanicalEvent | null> {
+      const marker = g.marker;
+      if (marker === null || marker.verdict !== "changes-requested") return null;
+      if (marker.sha === "" || marker.sha !== g.headSha) return null;
+      if (assessWorker(store.workers(b.id)).running) return null;
+      const key = `${lc(pull.key)}#${marker.sha}#${marker.round}`;
+      if (delivered.some((x) => x === key)) return null;
+      delivered.push(key);
+      const told = await deliverReviewRound(approvalsCtx, b, pull, { round: marker.round, verdict: marker.verdict, sha: marker.sha });
+      // The fallback note reaches the steward with the next turn; pushing the
+      // line here makes this look's wake carry it even when the round is news
+      // and the wake is delivered in the same pass (the `raisePullStuck`
+      // pattern).
+      if (told === "steward") {
+        changes.push({ text: `Reviewer round ${marker.round} on ${pull.key} at ${shortSha(marker.sha)}: ${marker.verdict}. Start a worker at the build-tickets review loop to address the blockers and re-request the round.`, actionable: true });
+      }
+      return { kind: "round", pull: pull.key, round: marker.round, verdict: marker.verdict, told: told === "worker" };
     }
 
     /**
@@ -9968,6 +10003,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const reviewerRoundGrace = [...b.reviewerRoundGrace];
       const reviewerRoundWakes = [...b.reviewerRoundWakes];
       let reviewerRoundMissing = false;
+      // BB-409: the `pull#sha#round` keys already delivered to a parked worker,
+      // so a changes-requested round fires once and a new round or push re-arms.
+      const reviewerRoundDelivered = [...b.reviewerRoundDelivered];
       // BB-322: the gate for a pull request from the assessment this reconcile
       // just computed, so the approval sync reads the one assessment and never
       // falls back to its own `prGate`. A pull request the assessment does not
@@ -10249,6 +10287,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } else {
           store.closeNeedByKey(b.id, "merge", url, `The gate is not met: ${g.missing ?? "unknown"}.`);
           if (!foreignOwner && (await maybeWakeMissingReviewerRound(b, pull, g, changes, reviewerRoundGrace, reviewerRoundWakes))) reviewerRoundMissing = true;
+          // BB-409: a changes-requested round at the current head wakes the
+          // parked worker (or the steward, when none can be reached). The event
+          // is applied after this look's checks event, so the round phrase is
+          // what the page and sidebar show.
+          const round = foreignOwner ? null : await maybeDeliverReviewRound(b, pull, g, reviewerRoundDelivered, changes);
+          if (round !== null) events.push(round);
           decline(b, "gate-not-met", pull.key);
         }
       }
@@ -10282,6 +10326,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const nextReviewerRoundWakes = reviewerRoundWakes.slice(-20);
       if (nextReviewerRoundWakes.length !== b.reviewerRoundWakes.length || nextReviewerRoundWakes.some((k, i) => k !== b.reviewerRoundWakes[i])) {
         b = store.patch(b.id, { reviewerRoundWakes: nextReviewerRoundWakes });
+      }
+      // BB-409: keep the once-per-round delivery record, capped like the others.
+      const nextReviewerRoundDelivered = reviewerRoundDelivered.slice(-20);
+      if (nextReviewerRoundDelivered.length !== b.reviewerRoundDelivered.length || nextReviewerRoundDelivered.some((k, i) => k !== b.reviewerRoundDelivered[i])) {
+        b = store.patch(b.id, { reviewerRoundDelivered: nextReviewerRoundDelivered });
       }
       if (b.reviewerRoundMissing !== reviewerRoundMissing) b = store.patch(b.id, { reviewerRoundMissing });
       if (approvalRaised) await wakeProject(b.projectId, `an owner-reviewed pull request from ${b.entityKey}`, { digestDue: false });
@@ -13673,10 +13722,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "worker_park",
       description:
-        "End a worker's turn parked on something outside it: a reviewer's round, the approver, checks, a build, a deployment, the steward's answer. The plugin leaves this worker unarchived and wakes it when the thing you wait on happens. Call it as your last action before ending a turn you are not finishing; a turn that ends without it is a plain finish and the plugin treats the worker as done.",
+        "End a worker's turn parked on something outside it. The plugin leaves this worker unarchived and wakes it for exactly three waits: a reviewer's round, the approver's decision, and the no-review gate becoming met. A wait on anything else — checks, a build, a deployment — is not delivered by the plugin: set a `github_watch` on it too, so the turn resumes. Call it as your last action before ending a turn you are not finishing; a turn that ends without it is a plain finish and the plugin treats the worker as done.",
       presentation: { label: { pending: "Parking", completed: "Parked" } },
       parameters: z.object({
-        waitingOn: z.string().trim().min(1).max(300).describe("What the turn waits on: a reviewer's round, the owner's approval, checks, a build, a deployment, the steward. Free text, shown on the finish note."),
+        waitingOn: z.string().trim().min(1).max(300).describe("What the turn waits on: a reviewer's round, the approver's decision, the no-review gate. A wait on anything else (checks, a build, a deployment) also needs a `github_watch`. Free text, shown on the finish note."),
       }),
       execute: store.coalescingTool(async (input, { threadId }) => {
         const worker = store.worker(threadId);
