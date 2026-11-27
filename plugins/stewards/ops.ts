@@ -188,9 +188,15 @@ export type OpsJob = {
   finishedAt: string | null;
   succeeded: number;
   failed: number;
+  active: number;
 };
 
-/** The Job's outcome from its conditions first, then its counters. */
+/**
+ * The Job's outcome. A terminal condition decides first, so a Job with
+ * `succeeded: 1` and `Failed=True` still reads as failed; only with neither
+ * condition do the active counter and then the counters decide. A Job retrying
+ * (`failed: 1`, `active: 1`, no condition) reads as running, not failed.
+ */
 export function jobsOf(list: unknown): OpsJob[] {
   return arr(obj(list).items).map((j) => {
     const meta = obj(j.metadata);
@@ -200,7 +206,9 @@ export function jobsOf(list: unknown): OpsJob[] {
     const failed = conditions.find((c) => c.type === "Failed" && c.status === "True");
     const succeeded = num(status.succeeded) ?? 0;
     const failures = num(status.failed) ?? 0;
-    const outcome: OpsJob["outcome"] = complete !== undefined || succeeded > 0 ? "succeeded" : failed !== undefined || failures > 0 ? "failed" : status.startTime !== undefined ? "running" : "unknown";
+    const active = num(status.active) ?? 0;
+    const outcome: OpsJob["outcome"] =
+      failed !== undefined ? "failed" : complete !== undefined ? "succeeded" : active > 0 ? "running" : succeeded > 0 ? "succeeded" : failures > 0 ? "failed" : status.startTime !== undefined ? "running" : "unknown";
     const condition = failed ?? complete;
     return {
       name: str(meta.name) ?? "?",
@@ -212,6 +220,7 @@ export function jobsOf(list: unknown): OpsJob[] {
       finishedAt: str(status.completionTime) ?? str(condition?.lastTransitionTime),
       succeeded,
       failed: failures,
+      active,
     };
   });
 }

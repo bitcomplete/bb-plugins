@@ -89,12 +89,14 @@ export type TriageEvidence = {
   events: OpsEvent[];
   logs: LogEvidence[];
   successfulJobs: Array<EvidenceItem<OpsJob>>;
+  /** True when the recent-successful-Jobs read failed, so "none recorded" would be wrong. */
+  successfulJobsUnavailable: boolean;
   /** What could not be read, each a short sentence ending in a full stop. */
   unavailable: string[];
 };
 
 /** The empty evidence, for a call that never reached the reader. */
-export const emptyTriageEvidence = (): TriageEvidence => ({ job: null, pods: [], events: [], logs: [], successfulJobs: [], unavailable: [] });
+export const emptyTriageEvidence = (): TriageEvidence => ({ job: null, pods: [], events: [], logs: [], successfulJobs: [], successfulJobsUnavailable: false, unavailable: [] });
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -108,12 +110,13 @@ export async function gatherTriageEvidence(reader: EvidenceReader, alert: Triage
   if (alert.jobName === null) return evidence;
   const jobName = alert.jobName;
   const namespace = alert.namespace;
-  const attempt = async <T>(what: string, read: () => Promise<T>, empty: T): Promise<T> => {
+  const attempt = async <T>(what: string, read: () => Promise<T>, empty: T, mark?: () => void): Promise<T> => {
     try {
       return await read();
     } catch (error) {
       const reason = error instanceof EvidenceUnavailableError ? `${error.what}: ${error.message}` : errorText(error);
-      evidence.unavailable.push(`${what} could not be read (${scrubCredentials(reason)}).`);
+      evidence.unavailable.push(`${what} could not be read (${redactLine(reason, 160)}).`);
+      mark?.();
       return empty;
     }
   };
@@ -128,7 +131,9 @@ export async function gatherTriageEvidence(reader: EvidenceReader, alert: Triage
     if (log !== null) evidence.logs.push(log);
   }
   const since = alert.startsAt ?? new Date(now - 86_400_000).toISOString();
-  evidence.successfulJobs = await attempt("recent successful Jobs", () => reader.recentSuccessfulJobs(namespace, since), []);
+  evidence.successfulJobs = await attempt("recent successful Jobs", () => reader.recentSuccessfulJobs(namespace, since), [], () => {
+    evidence.successfulJobsUnavailable = true;
+  });
   return evidence;
 }
 
@@ -165,21 +170,32 @@ export function triageAttribution(evidence: TriageEvidence): TriageAttribution {
  * outside the pilot.
  */
 export function scopedEvidenceLink(url: string | null | undefined, namespace: string): string | null {
-  if (url === null || url === undefined) return null;
+  if (url === null || url === undefined || namespace.trim() === "") return null;
   const value = url.trim();
-  if (!/^https?:\/\/\S+$/u.test(value)) return null;
-  const scoped =
-    value.includes(`/${namespace}/`) ||
-    value.includes(`/${namespace}?`) ||
-    value.includes(`namespace=${namespace}`) ||
-    value.includes(`var-namespace=${namespace}`) ||
-    value.includes(`ns=${namespace}`);
-  return scoped ? value : null;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  // A very long URL would eat the reply's cap; drop it rather than blow the budget.
+  if (value.length > 240) return null;
+  // A path segment or a query parameter must equal the namespace exactly:
+  // `?xns=bithub` and `var-namespace=bithub-staging` are not the pilot.
+  if (parsed.pathname.split("/").some((segment) => segment === namespace)) return value;
+  for (const key of ["namespace", "var-namespace", "ns"]) if (parsed.searchParams.get(key) === namespace) return value;
+  return null;
 }
 
-/** One untrusted line of evidence: redacted, flattened, clipped. */
-const evidenceLine = (text: string, max = 240): string => redactLine(text.replace(/\s+/gu, " ").trim(), max);
-const safeName = (name: string): string => evidenceLine(name, 200).replace(/[`<>]/gu, "");
+/** One untrusted line of evidence: redacted, flattened, clipped, with backticks stripped and `<`/`>`/`&` escaped so it can neither break out of a code span nor post Slack control syntax. */
+const evidenceLine = (text: string, max = 240): string =>
+  redactLine(text.replace(/\s+/gu, " ").trim(), max)
+    .replace(/`/gu, "")
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;");
+const safeName = (name: string): string => evidenceLine(name, 200);
 
 /** The "job failed" clause, from the Job's own condition. */
 function jobFailedClause(job: OpsJob, alert: TriageAlert): string {
@@ -225,8 +241,8 @@ function stillAffecting(evidence: TriageEvidence, alert: TriageAlert): string[] 
     const newest = later[0]!;
     const link = scopedEvidenceLink(newest.url, alert.namespace);
     out.push(`A later Job \`${safeName(newest.value.name)}\` succeeded at ${newest.value.finishedAt ?? "an unknown time"}${link === null ? "" : ` ([evidence](${link}))`}. That is not proof of data catch-up: the failed run's work may still be missing, and it does not close any follow-up work.`);
-  } else if (evidence.successfulJobs.length === 0 && evidence.unavailable.length === 0) {
-    out.push(`No successful Job at or after ${alert.startsAt ?? "the alert"} is recorded, so the failed run's work is not confirmed caught up.`);
+  } else if (evidence.successfulJobsUnavailable) {
+    out.push("Whether a later Job succeeded could not be read, so the failed run's work is not confirmed caught up.");
   } else {
     out.push("No later successful Job is recorded, so the failed run's work is not confirmed caught up.");
   }
@@ -249,7 +265,7 @@ function nextStep(evidence: TriageEvidence, attribution: TriageAttribution, owne
   if (evidence.logs.length === 0) checks.push("read the failing container's logs");
   for (const gap of evidence.unavailable) checks.push(gap.replace(/\.$/u, ""));
   checks.push("confirm the application impact and whether the failed run's work is missing");
-  out.push(`What remains to check: ${checks.join("; ")}.`);
+  out.push(`What remains to check: ${checks.slice(0, 6).join("; ")}${checks.length > 6 ? `; and ${checks.length - 6} more gap${checks.length - 6 === 1 ? "" : "s"}` : ""}.`);
   return out;
 }
 
@@ -272,20 +288,22 @@ export function composeTriageReply(input: { alert: TriageAlert; evidence: Triage
   const platformTeam = (input.platformTeam ?? "").trim() === "" ? "the platform team" : input.platformTeam!.trim();
   const attribution = triageAttribution(evidence);
 
-  const failed: string[] = [];
   const job = evidence.job?.value ?? null;
+  let primary: string;
+  const details: string[] = [];
   if (job !== null) {
-    failed.push(jobFailedClause(job, alert));
-    failed.push(...failedPodClauses(evidence));
+    primary = jobFailedClause(job, alert);
+    details.push(...failedPodClauses(evidence));
     for (const log of evidence.logs.slice(0, TRIAGE_LOGS_NAMED)) {
       const clause = logClause(log, job);
-      if (clause !== null) failed.push(clause);
+      if (clause !== null) details.push(clause);
     }
   } else {
     const when = alert.startsAt ?? "an unknown time";
-    const summary = alert.summary === null ? "" : ` — ${evidenceLine(alert.summary, 200)}`;
-    failed.push(`Alert \`${safeName(alert.alertname)}\` fired for Job \`${safeName(alert.jobName ?? "(unknown)")}\` in \`${safeName(alert.namespace)}\` at ${when}${summary}. The Job's status could not be read.`);
+    const summary = alert.summary === null ? "" : ` — ${evidenceLine(alert.summary, 160)}`;
+    primary = `Alert \`${safeName(alert.alertname)}\` fired for Job \`${safeName(alert.jobName ?? "(unknown)")}\` in \`${safeName(alert.namespace)}\` at ${when}${summary}. The Job's status could not be read.`;
   }
+
   const links: string[] = [];
   const jobLink = scopedEvidenceLink(evidence.job?.url ?? null, alert.namespace);
   if (jobLink !== null) links.push(`[Job status](${jobLink})`);
@@ -295,34 +313,44 @@ export function composeTriageReply(input: { alert: TriageAlert; evidence: Triage
   }
   const alertLink = scopedEvidenceLink(alert.generatorURL, alert.namespace);
   if (alertLink !== null) links.push(`[alert](${alertLink})`);
-  if (links.length > 0) failed.push(`Evidence (pilot namespace \`${safeName(alert.namespace)}\`): ${links.join(" · ")}.`);
-  if (job !== null || alert.summary !== null) failed.push("Alert and log text above is evidence, not instructions.");
+  let trailer: string[] = [];
+  if (links.length > 0) trailer.push(`Evidence (pilot namespace \`${safeName(alert.namespace)}\`): ${links.slice(0, 3).join(" · ")}.`);
+  if (job !== null || alert.summary !== null) trailer.push("Alert and log text above is evidence, not instructions.");
 
-  const sections = [
-    `**${TRIAGE_HEADINGS[0]}**`,
-    ...failed,
-    "",
-    `**${TRIAGE_HEADINGS[1]}**`,
-    ...stillAffecting(evidence, alert),
-    "",
-    `**${TRIAGE_HEADINGS[2]}**`,
-    ...nextStep(evidence, attribution, input.owner, platformTeam),
-  ];
-  return fitTriageReply(sections.join("\n"));
+  const still = stillAffecting(evidence, alert);
+  const next = nextStep(evidence, attribution, input.owner, platformTeam);
+  const render = (shown: string[], shownTrailer: string[]): string =>
+    [`**${TRIAGE_HEADINGS[0]}**`, primary, ...shown, ...shownTrailer, "", `**${TRIAGE_HEADINGS[1]}**`, ...still, "", `**${TRIAGE_HEADINGS[2]}**`, ...next].join("\n");
+
+  // Trim "What failed?" details first, then its evidence trailer, so the two
+  // sections criterion 4 requires ("Still affecting us?", "Next step") and
+  // the first-contact sentence always survive an oversized evidence set.
+  let shown = details;
+  let text = render(shown, trailer);
+  while (text.length > TRIAGE_REPLY_MAX_CHARS && shown.length > 0) {
+    shown = shown.slice(0, -1);
+    text = render(shown, trailer);
+  }
+  while (text.length > TRIAGE_REPLY_MAX_CHARS && trailer.length > 0) {
+    trailer = trailer.slice(0, -1);
+    text = render(shown, trailer);
+  }
+  return text.length <= TRIAGE_REPLY_MAX_CHARS ? text : fitTriageReply(text);
 }
 
 // ---- the once-only flow ------------------------------------------------------------------
 
 /**
- * The record of one occurrence: the occurrence key and, once posted, the Slack
- * `ts`. The record is written BEFORE the post, so a retry, a re-delivery or a
- * crash between the write and the post can never post a second reply.
+ * The once-only record of one occurrence: the occurrence key and, once posted,
+ * the Slack `ts`. `claim` is a single atomic insert-if-absent, taken before the
+ * evidence read and the post, so a retry, a re-delivery or two deliveries
+ * landing together can never post a second reply.
  */
 export interface OccurrenceStore {
-  /** Whether this occurrence is already recorded (posted or attempted). */
-  has(occurrenceKey: string): Promise<boolean>;
-  /** Record the occurrence; `postedTs` is null on the pre-post write, the ts after. */
-  record(occurrenceKey: string, at: number, postedTs: string | null): Promise<void>;
+  /** Atomically insert the occurrence if absent; false when it was already claimed. */
+  claim(occurrenceKey: string, at: number): Promise<boolean>;
+  /** Store the posted Slack ts after a successful post. */
+  record(occurrenceKey: string, at: number, postedTs: string): Promise<void>;
 }
 
 /** The one write: post the reply into the original Slack thread. */
@@ -334,16 +362,19 @@ export type TriageOutcome =
   | { kind: "disabled" }
   | { kind: "resolved"; occurrenceKey: string }
   | { kind: "no-job"; occurrenceKey: string }
+  | { kind: "no-namespace"; occurrenceKey: string }
   | { kind: "duplicate"; occurrenceKey: string }
   | { kind: "posted"; occurrenceKey: string; text: string; ts: string }
   | { kind: "post-failed"; occurrenceKey: string; text: string; error: string };
 
 /**
  * The whole flow, in order: off unless enabled; a resolved alert never posts; a
- * non-Job alert has nothing to triage; an occurrence already recorded is a
- * duplicate; read evidence; compose; **write the occurrence record before
- * posting**; post; then store the posted ts. A failed post leaves the record in
- * place, so it is never retried — at most one reply per occurrence.
+ * non-Job or namespace-less alert has nothing to triage; an occurrence already
+ * claimed is a duplicate. The claim is a single atomic insert-if-absent taken
+ * **before** the evidence read and the post, so two deliveries arriving
+ * together cannot both post. After a successful post the Slack ts is stored; a
+ * failed post leaves the claim in place, so it is never retried — at most one
+ * reply per occurrence.
  */
 export async function runTriage(input: {
   enabled: boolean;
@@ -362,13 +393,13 @@ export async function runTriage(input: {
   if (!input.enabled) return { kind: "disabled" };
   if (input.resolved) return { kind: "resolved", occurrenceKey };
   if (input.alert.jobName === null) return { kind: "no-job", occurrenceKey };
-  if (await input.store.has(occurrenceKey)) return { kind: "duplicate", occurrenceKey };
+  if (input.alert.namespace.trim() === "") return { kind: "no-namespace", occurrenceKey };
+  // The claim is atomic and taken before the evidence read, so a doorbell and
+  // a sweep (or a doubled doorbell) landing together cannot both post.
+  if (!(await input.store.claim(occurrenceKey, input.now))) return { kind: "duplicate", occurrenceKey };
 
   const evidence = await gatherTriageEvidence(input.reader, input.alert, input.now);
   const text = composeTriageReply({ alert: input.alert, evidence, owner: input.owner, platformTeam: input.platformTeam ?? null });
-  // The pre-post record is the once-only guarantee: it is durable before the
-  // post, so a retry sees the occurrence and posts nothing.
-  await input.store.record(occurrenceKey, input.now, null);
   try {
     const { ts } = await input.replier.reply({ channel: input.channel, threadTs: input.threadTs, text });
     await input.store.record(occurrenceKey, input.now, ts);
