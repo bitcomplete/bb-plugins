@@ -356,6 +356,39 @@ describe("the composed reasons divergence (BB-415, C8)", () => {
     expect(compare(i, assess(i), composeAssessment(i), new Set()).filter((d) => d.surface === "compose.reasons")).toEqual([]);
   });
 
+  // BB-416: `pullContributions` emits one `pull-foreign-owner` per observed
+  // foreign pull (the detail names the pull), while the recorded side is a
+  // `Set` of codes. Keying the comparison by code, not by occurrence, keeps a
+  // binding with several foreign pulls from reading as recorded 1 vs composed
+  // N for the rest of its life.
+  it("records nothing when several foreign-owner pulls compose one code the look declined once", () => {
+    const foreign = [
+      pull({ key: "acme/web#21", url: "https://github.com/acme/web/pull/21" }),
+      pull({ key: "acme/web#22", url: "https://github.com/acme/web/pull/22" }),
+      pull({ key: "acme/web#23", url: "https://github.com/acme/web/pull/23" }),
+    ];
+    const i = input({ observed: { entity: issue({ state: "In Progress" }), pulls: foreign } });
+    // The per-pull reasons stay: the composer still emits one per pull, and the
+    // detail names the pull, not just the code.
+    const composed = composeAssessment(i).reasons.filter((r) => r.code === "pull-foreign-owner");
+    expect(composed).toHaveLength(3);
+    expect(composed.map((r) => r.detail)).toEqual(["acme/web#21", "acme/web#22", "acme/web#23"]);
+    // The comparison keys the distinct code set, so one recorded code matches.
+    expect(compare(i, assess(i), composeAssessment(i), new Set(["pull-foreign-owner"])).filter((d) => d.surface === "compose.reasons")).toEqual([]);
+  });
+
+  it("still records a compose.reasons row when the distinct code sets differ", () => {
+    const foreign = [
+      pull({ key: "acme/web#21", url: "https://github.com/acme/web/pull/21" }),
+      pull({ key: "acme/web#22", url: "https://github.com/acme/web/pull/22" }),
+    ];
+    const i = input({ observed: { entity: issue({ state: "In Progress" }), pulls: foreign } });
+    const rows = compare(i, assess(i), composeAssessment(i), new Set(["pull-foreign-owner", "base-not-default"])).filter((d) => d.surface === "compose.reasons");
+    expect(rows).toHaveLength(1);
+    // `recorded` and `composed` count distinct codes, not occurrences.
+    expect(rows[0]).toMatchObject({ surface: "compose.reasons", old: "base-not-default,pull-foreign-owner", new: "pull-foreign-owner", inputs: { binding: "b1", recorded: 2, composed: 1 } });
+  });
+
   it("ignores a reconcile-level code no contributor owns", () => {
     const i = input();
     expect(compare(i, assess(i), composeAssessment(i), new Set(["nothing-to-do", "worker-busy"])).filter((d) => d.surface === "compose.reasons")).toEqual([]);
