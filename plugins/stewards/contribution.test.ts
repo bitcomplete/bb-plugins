@@ -794,17 +794,44 @@ describe("a served contribution (BB-418)", () => {
     expect(composed.reasons).toEqual([served.reasons[0]]);
   });
 
-  it("is shadow only: it never changes the authoritative composed answer", () => {
+  it("folds a source with no in-process contributor into the authoritative answer, beside the core items", () => {
     const i = onlyGateMetAt("build");
     const before = composeAssessment(i);
     const after = composeAssessment({ ...i, served: [served] });
-    // The ready gate, the per-pull merge gate, the resources and holds all come
-    // from the in-process contributors; a served contribution cannot set them.
+    // The figma gate item, wait, resource, hold and reason reach the composed
+    // answer; the github merge gate and the ready gate stay core-only.
+    expect(after.gate.met).toBe(false);
+    expect(after.gate.missing).toBe("the design is not approved");
+    expect(after.gate.pulls).toEqual(before.gate.pulls);
+    expect(after.gate.readyPassed).toBe(before.gate.readyPassed);
+    expect(after.waits).toEqual([...before.waits, served.waits[0]]);
+    expect(after.resources).toEqual(expect.arrayContaining([...before.resources, served.resources[0]]));
+    expect(after.holds).toEqual(expect.arrayContaining([...before.holds, served.holds[0]]));
+    expect(after.reasons).toEqual([...before.reasons, served.reasons[0]]);
+  });
+
+  it("shadows a source with an in-process contributor: it never changes the authoritative answer", () => {
+    // A served `linear` contribution is shadowed, not folded, so the binding's
+    // own holds and typed wait are untouched.
+    const servedLinear: Contribution = { source: "linear", gate: [{ source: "linear", subject: { kind: "step", id: "spec" }, id: "spec-approved", met: false, missing: "the spec is not approved", lane: "user", escalated: false, product: false, inputs: "spec-approved@1" }], waits: [], resources: [], holds: [], reasons: [] };
+    const i = input();
+    const before = composeAssessment(i);
+    const after = composeAssessment({ ...i, served: [servedLinear] });
     expect(after.gate).toEqual(before.gate);
     expect(after.waits).toEqual(before.waits);
     expect(after.resources).toEqual(before.resources);
     expect(after.holds).toEqual(before.holds);
     expect(after.liveness).toEqual(before.liveness);
+  });
+
+  it("does not let a served hold with a core id flip the liveness", () => {
+    // The figma source serves a `hold` hold, the id the in-process scheduling
+    // holds use. Liveness reads the in-process holds only, so it is unchanged.
+    const before = composeAssessment(input());
+    const servedHold: Contribution = { source: "figma", gate: [], waits: [], resources: [], holds: [{ source: "figma", id: "hold", held: true, behind: [] }], reasons: [] };
+    const after = composeAssessment(input({ served: [servedHold] }));
+    expect(after.liveness).toEqual(before.liveness);
+    expect(after.holds).toEqual(expect.arrayContaining([{ source: "figma", id: "hold", held: true, behind: [] }]));
   });
 
   it("keeps the github merge gate in the authoritative answer when a github contribution is served", () => {

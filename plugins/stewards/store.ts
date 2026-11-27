@@ -9,7 +9,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
-import { entitySnapshotSchema, type Source } from "./source-contract.js";
+import { contributionSchema, entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
 import { depsLookSchema, type DepsLook } from "./deps.js";
 import { deploymentsSchema, type Deployments } from "./deploy.js";
@@ -1089,6 +1089,13 @@ export const storedStatusRecordSchema = z
 export const observedSchema = z.object({
   entity: entitySnapshotSchema,
   pulls: z.array(entitySnapshotSchema).default([]),
+  /**
+   * BB-418 (BB-291 C10): the contributions a source served beside the entity's
+   * snapshot, so the report path derives the same assessment the reconcile
+   * stored without re-reading the source. Optional: a row written before this
+   * field, or a source that serves nothing, has none.
+   */
+  served: z.array(contributionSchema).optional(),
   /**
    * BB-312: when the snapshot was read, so the entity cache can tell a fresh
    * stored snapshot from a stale one. Optional: a row written before this

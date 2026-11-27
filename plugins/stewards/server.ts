@@ -3915,10 +3915,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function freshObserved(b: Binding): Promise<{ observed: Observed; complete: boolean } | null> {
       if (b.lastSnapshot === null) return null;
       if (b.source === "ops") return { observed: b.lastSnapshot, complete: true };
-      const fresh = await snapshot(b.source, b.entityId).catch(() => null);
-      if (fresh === null) return { observed: b.lastSnapshot, complete: false };
-      const entity = keepRelations(b.lastSnapshot?.entity ?? null, fresh);
-      if (b.kind !== "ticket") return { observed: { entity, pulls: [], at: now() }, complete: true };
+      const read = await snapshotWithContribution(b.source, b.entityId).catch(() => null);
+      if (read === null || read.entity === null) return { observed: b.lastSnapshot, complete: false };
+      const entity = keepRelations(b.lastSnapshot?.entity ?? null, read.entity);
+      // BB-418 (BB-291 C10): carry a served contribution on the fresh observation
+      // too, so every path that rebuilds the assessment sees the same one.
+      const served = read.contribution === null ? {} : { served: [read.contribution] };
+      if (b.kind !== "ticket") return { observed: { entity, pulls: [], at: now(), ...served }, complete: true };
       const keys = linkedPullKeys(entity);
       const pulls = await linkedPulls(entity, b.lastSnapshot);
       let complete = pulls.length >= keys.length;
@@ -3938,7 +3941,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           bb.log.warn(`stewards: could not read ${h.pullKey}, handed to ${b.entityKey}: ${errorMessage(error)}`);
         }
       }
-      return { observed: { entity, pulls, at: now() }, complete };
+      return { observed: { entity, pulls, at: now(), ...served }, complete };
     }
 
     /**
@@ -5566,7 +5569,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       playbook: Playbook,
       currentSpecHash: string,
       config: ProjectConfig,
-      served?: readonly Contribution[],
     ): Promise<AssessmentInput> {
       // BB-322: gate every pull request that belongs to the binding, the same
       // set `syncNeeds` acts on, not only the worker-reported own ones. A
@@ -5636,7 +5638,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         waitBudgets: config.file.waitBudgets,
         playbook,
         currentSpecHash,
-        served,
+        // BB-418 (BB-291 C10): the contributions the source served beside the
+        // entity's snapshot, persisted on the observation so the report path
+        // derives the same assessment the reconcile stored, with no re-read.
+        served: observed.served,
         now: now(),
         waitedPulls,
         hasOpenBinding: (key) => {
@@ -5690,9 +5695,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       playbook: Playbook,
       currentSpecHash: string,
       config: ProjectConfig,
-      served?: readonly Contribution[],
     ): Promise<{ assessment: Assessment; input: AssessmentInput }> {
-      const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config, served);
+      const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config);
       // BB-380 (C2) / BB-387 (C3) / BB-400 (C5): the composed answer is the
       // gate's source and the liveness answer, computed once and handed to
       // `assess`, so the reconcile does not compose twice; the waits/holds are
@@ -5841,7 +5845,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         }
       }
-      const observed: Observed = { entity, pulls: linked, at: now() };
+      // BB-418 (BB-291 C10): carry the source's contribution on the observation
+      // the look writes, so the report path derives the same assessment.
+      const observed: Observed = { entity, pulls: linked, at: now(), ...(served === null ? {} : { served: [served] }) };
       const prev = b.lastSnapshot;
 
       // BB-53: a merged pull request whose playbook names a deployment target
@@ -6128,7 +6134,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-400: the composer's idleBase reads `binding.stage`, so assess with
         // this look's stage (from `phaseAndStage`), not the stage stored before
         // the look. The old `assessIdle` call used the same local.
-        const built = await assessBinding({ ...b, stage }, observed, workers, ownPulls, playbook, currentSpec, config, served === null ? undefined : [served]);
+        const built = await assessBinding({ ...b, stage }, observed, workers, ownPulls, playbook, currentSpec, config);
         assessment = built.assessment;
         assessmentInput = built.input;
       } catch (error) {

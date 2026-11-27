@@ -579,14 +579,25 @@ function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): 
 
 /**
  * The composition for one binding, from the rows the look already holds. It
- * folds the in-process contributors only (BB-418, BB-291 C10): a contribution
- * served over the source contract is composed and compared in shadow
- * (`compare`'s `compose.served` surface) but never reaches this authoritative
- * answer, so it cannot set the ready gate or the core's per-pull merge gate.
+ * folds the in-process contributors, plus the contributions a source served
+ * over the source contract (BB-418, BB-291 C10) whose source has no in-process
+ * contributor: a new plugin (e.g. `figma`) has nothing to shadow, so it adds
+ * its gate items, waits, resources, holds and reasons beside the in-process
+ * ones. Its items carry no wrapped `assessed` gate, so `gate.pulls` and the
+ * ready gate stay core-only.
+ *
+ * A served contribution whose source has an in-process contributor is never
+ * folded here: it is shadowed by `compare`'s `compose.served` surface instead,
+ * so it cannot set or remove the core's items. The liveness is computed from
+ * the in-process items only, so a served hold, wait or resource with a core id
+ * cannot flip live, idle or stalled.
  */
 export function composeAssessment(input: AssessmentInput): ComposedAssessment {
-  const composed = compose(CONTRIBUTORS.map((c) => c.contribute(input)));
+  const inProcess = CONTRIBUTORS.map((c) => c.contribute(input));
+  const additive = (input.served ?? []).filter((c) => inProcessContributor(c.source) === null);
+  const composed = compose([...inProcess, ...additive]);
   composed.gate.readyPassed = gateState(input.playbook, input.binding.ready, input.currentSpecHash).passed;
-  composed.liveness = composeLiveness(input, composed);
+  // With nothing additive, `composed` is already the in-process answer.
+  composed.liveness = composeLiveness(input, additive.length === 0 ? composed : compose(inProcess));
   return composed;
 }
