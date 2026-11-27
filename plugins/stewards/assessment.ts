@@ -12,7 +12,7 @@
 // over the same rows and returns every place the old answer and the assessment
 // disagree, so the divergence log can be read for several days before any
 // consumer reads the assessment.
-import { composeAssessment, pullGate, type ComposedAssessment } from "./contribution.js";
+import { composeAssessment, contributionText, inProcessContributor, pullGate, type ComposedAssessment } from "./contribution.js";
 import { latestReviewMarker, type PrGate, type ProjectApprovalRecord } from "./gate.js";
 import { parsePullRef } from "./github.js";
 import { gateState } from "./ready-gate.js";
@@ -594,6 +594,21 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
           composed: composedReasons.length,
         });
       }
+    }
+
+    // BB-418 (BB-291 C10): the contribution a source served over the source
+    // contract, against what the in-process contributor would have said. The
+    // served answer is shadow only: `composeAssessment` never folds it, so it
+    // cannot set the ready gate or the core's per-pull merge gate. A source
+    // with no in-process contributor has nothing to compare, and there is no
+    // live source serving in production, so this surface is empty there. Both
+    // sides are canonical text, so contributor order is not a difference.
+    for (const served of input.served ?? []) {
+      const inProcess = inProcessContributor(served.source);
+      if (inProcess === null) continue;
+      const expected = contributionText(inProcess.contribute(input));
+      const actual = contributionText(served);
+      if (expected !== actual) add("compose.served", expected, actual, { binding: binding.id, source: served.source });
     }
   }
   return out;

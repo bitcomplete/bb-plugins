@@ -437,6 +437,43 @@ export const localContributor: SourceContributor = {
 /** The in-process contributors, in the order the composer folds them. */
 export const CONTRIBUTORS: readonly SourceContributor[] = [githubContributor, linearContributor, localContributor];
 
+const CONTRIBUTOR_BY_SOURCE: ReadonlyMap<string, SourceContributor> = new Map(CONTRIBUTORS.map((c) => [c.source, c]));
+
+/** The in-process contributor for a source, or null when the source has none (a new plugin, e.g. `figma`). */
+export function inProcessContributor(source: string): SourceContributor | null {
+  return CONTRIBUTOR_BY_SOURCE.get(source) ?? null;
+}
+
+/**
+ * BB-418 (BB-291 C10): whether a source may serve this contribution. A source
+ * may serve its own built-in contribution (the source whose `sourceSnapshot`
+ * carries it) or a contribution for a source with no in-process contributor; it
+ * may not serve another built-in source's contribution, and every item must
+ * carry the contribution's own source. Invalid reads as null, so a source
+ * cannot impersonate `github`, `linear` or `local` from another snapshot.
+ */
+export function acceptServedContribution(servingSource: string, contribution: Contribution): Contribution | null {
+  if (CONTRIBUTOR_BY_SOURCE.has(contribution.source) && contribution.source !== servingSource) return null;
+  const items: ReadonlyArray<{ source: string }> = [...contribution.gate, ...contribution.waits, ...contribution.resources, ...contribution.holds, ...contribution.reasons];
+  if (items.some((item) => item.source !== contribution.source)) return null;
+  return contribution;
+}
+
+/**
+ * A canonical, comparable text for one contribution, for the `compose.served`
+ * shadow (BB-418): the same item facts in a stable order, so contributor order
+ * and the wrapped `assessed` gate (core-only) are not a difference. Pure, and
+ * carries only ids, states and timestamps.
+ */
+export function contributionText(c: SourceContribution): string {
+  const gate = c.gate.map((g) => `${g.subject.kind}:${g.subject.id}:${g.id}:${g.met}:${g.missing ?? ""}:${g.lane}:${g.escalated}:${g.product}`).sort();
+  const waits = c.waits.map((w) => `${w.kind}:${w.ref}:${w.live}:${w.fingerprint ?? ""}:${w.budgetMs ?? ""}:${w.overdueMs ?? ""}`).sort();
+  const resources = c.resources.map((r) => `${r.id}:${r.active}:${r.subject === null ? "" : `${r.subject.kind}:${r.subject.id}`}`).sort();
+  const holds = c.holds.map((h) => `${h.id}:${h.held}:${h.behind.join("|")}`).sort();
+  const reasons = c.reasons.map((r) => `${r.code}:${r.detail ?? ""}`).sort();
+  return JSON.stringify({ source: c.source, gate, waits, resources, holds, reasons });
+}
+
 /**
  * Fold the sources' contributions into one answer. The gate roll-up is every
  * item's `met`, the first item's lane, and the first unmet item's `missing`;
@@ -541,24 +578,14 @@ function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): 
 }
 
 /**
- * The contributions to fold: the built-in contributors, except for a source
- * that served its own contribution over the source contract (BB-418, BB-291
- * C10) — the core never falls back for a source that served, even an empty one
- * — plus every served contribution whose source has no built-in contributor.
- * A served contribution rides `sourceSnapshot`, so it adds no store read or
- * source call here.
+ * The composition for one binding, from the rows the look already holds. It
+ * folds the in-process contributors only (BB-418, BB-291 C10): a contribution
+ * served over the source contract is composed and compared in shadow
+ * (`compare`'s `compose.served` surface) but never reaches this authoritative
+ * answer, so it cannot set the ready gate or the core's per-pull merge gate.
  */
-function contributionsFor(input: AssessmentInput): SourceContribution[] {
-  const served: readonly Contribution[] = input.served ?? [];
-  const servedSources = new Set(served.map((c) => c.source));
-  return [...CONTRIBUTORS.filter((c) => !servedSources.has(c.source)).map((c) => c.contribute(input)), ...served];
-}
-
-/** The composition for one binding, from the rows the look already holds. */
 export function composeAssessment(input: AssessmentInput): ComposedAssessment {
-  const composed = compose(contributionsFor(input));
-  // The ready gate is core policy over the playbook and the spec hash, set
-  // after the contributions fold, so a served contribution can never set it.
+  const composed = compose(CONTRIBUTORS.map((c) => c.contribute(input)));
   composed.gate.readyPassed = gateState(input.playbook, input.binding.ready, input.currentSpecHash).passed;
   composed.liveness = composeLiveness(input, composed);
   return composed;

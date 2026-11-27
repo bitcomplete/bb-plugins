@@ -13,11 +13,10 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { assess, compare, type AssessmentInput } from "./assessment.js";
-import { compose, composeAssessment, githubContributor, linearContributor, localContributor, type GateContribution, type SourceContribution } from "./contribution.js";
+import { acceptServedContribution, compose, composeAssessment, githubContributor, linearContributor, localContributor, type GateContribution, type SourceContribution } from "./contribution.js";
 import { parsePlaybook, type Playbook } from "./config.js";
 import { comment, issue, parkedWorker, pull } from "./fixtures.js";
 import { approvalMarkerLine } from "./gate.js";
-import { gateState } from "./ready-gate.js";
 import { readyStateSchema, type StatusRecord } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
 import { rowLiveSource, type WakeSourceInput } from "./wake-source.js";
@@ -785,39 +784,58 @@ describe("a served contribution (BB-418)", () => {
     reasons: [{ source: "figma", code: "design-pending", detail: "file-1", at: 1_000_000 }],
   };
 
-  it("composes a served source's gate item, wait, resource, hold and reason through the same path", () => {
-    const composed = composeAssessment(input({ served: [served] }));
+  it("is folded by the same compose() path as an in-process contribution", () => {
+    const composed = compose([served]);
     expect(composed.gate.met).toBe(false);
     expect(composed.gate.missing).toBe("the design is not approved");
     expect(composed.waits).toEqual([served.waits[0]]);
-    expect(composed.resources).toEqual(expect.arrayContaining([served.resources[0]]));
-    expect(composed.holds).toEqual(expect.arrayContaining([served.holds[0]]));
+    expect(composed.resources).toEqual([served.resources[0]]);
+    expect(composed.holds).toEqual([served.holds[0]]);
     expect(composed.reasons).toEqual([served.reasons[0]]);
   });
 
-  it("cannot set the ready gate or the core's per-pull merge gate", () => {
-    const i = input({ served: [served] });
-    const composed = composeAssessment(i);
-    // `pulls` carries only items with a wrapped `assessed` gate, which a served
-    // item never has; the ready gate is core policy set after the fold.
-    expect(composed.gate.pulls).toEqual([]);
-    expect(composed.gate.readyPassed).toBe(gateState(i.playbook, i.binding.ready, i.currentSpecHash).passed);
+  it("is shadow only: it never changes the authoritative composed answer", () => {
+    const i = onlyGateMetAt("build");
+    const before = composeAssessment(i);
+    const after = composeAssessment({ ...i, served: [served] });
+    // The ready gate, the per-pull merge gate, the resources and holds all come
+    // from the in-process contributors; a served contribution cannot set them.
+    expect(after.gate).toEqual(before.gate);
+    expect(after.waits).toEqual(before.waits);
+    expect(after.resources).toEqual(before.resources);
+    expect(after.holds).toEqual(before.holds);
+    expect(after.liveness).toEqual(before.liveness);
   });
 
-  it("never falls back to the in-process contributor for a source that served", () => {
-    // A linear binding with a worker wait: in-process, linear contributes the
-    // wait; a served empty linear contribution drops it, because the core never
-    // falls back when the field is present.
-    const i = waitInput({ kind: "worker", ref: "thr_w1" }, { workers: [{ threadId: "thr_w1", status: "running" } as never] });
-    expect(composeAssessment(i).waits).toHaveLength(1);
-    const servedEmpty: AssessmentInput = { ...i, served: [{ source: "linear", gate: [], waits: [], resources: [], holds: [], reasons: [] }] };
-    expect(composeAssessment(servedEmpty).waits).toEqual([]);
-  });
-
-  it("keeps the in-process contributor for a source that served nothing", () => {
-    // The github contributor's per-pull merge gate is unchanged by a figma
-    // contribution: only github served nothing, so it still composes.
-    const composed = composeAssessment({ ...onlyGateMetAt("build"), served: [served] });
+  it("keeps the github merge gate in the authoritative answer when a github contribution is served", () => {
+    const servedGithub: Contribution = { source: "github", gate: [{ source: "github", subject: { kind: "pull", id: "acme/web#7" }, id: "merge", met: true, missing: null, lane: "user", escalated: false, product: false, inputs: "served" }], waits: [], resources: [], holds: [], reasons: [] };
+    const composed = composeAssessment({ ...onlyGateMetAt("build"), served: [servedGithub] });
     expect(composed.gate.pulls.map((p) => p.pull)).toEqual(["acme/web#7"]);
+  });
+
+  it("logs a compose.served divergence against the in-process contributor for the same source", () => {
+    // A served `linear` contribution differs from the in-process linear
+    // contribution, which carries the binding's holds.
+    const servedLinear: Contribution = { source: "linear", gate: [{ source: "linear", subject: { kind: "step", id: "spec" }, id: "spec-approved", met: false, missing: "the spec is not approved", lane: "user", escalated: false, product: false, inputs: "spec-approved@1" }], waits: [], resources: [], holds: [], reasons: [] };
+    const i = input({ served: [servedLinear] });
+    const rows = compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface === "compose.served");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.inputs.source).toBe("linear");
+  });
+
+  it("logs nothing when the served contribution matches the in-process one", () => {
+    const i = input();
+    const served = JSON.parse(JSON.stringify(linearContributor.contribute(i))) as Contribution;
+    const rows = compare({ ...i, served: [served] }, assess(i), composeAssessment(i)).filter((d) => d.surface === "compose.served");
+    expect(rows).toEqual([]);
+  });
+
+  it("rejects another built-in source's contribution and a mismatched item source", () => {
+    const empty = (source: string): Contribution => ({ source, gate: [], waits: [], resources: [], holds: [], reasons: [] });
+    expect(acceptServedContribution("linear", empty("github"))).toBeNull();
+    expect(acceptServedContribution("linear", empty("linear"))).not.toBeNull();
+    expect(acceptServedContribution("linear", empty("figma"))).not.toBeNull();
+    const mismatched: Contribution = { source: "figma", gate: [{ source: "linear", subject: { kind: "artifact", id: "f" }, id: "x", met: true, missing: null, lane: "user", escalated: false, product: false, inputs: "x" }], waits: [], resources: [], holds: [], reasons: [] };
+    expect(acceptServedContribution("linear", mismatched)).toBeNull();
   });
 });

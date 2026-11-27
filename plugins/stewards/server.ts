@@ -102,7 +102,7 @@ import {
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mergeWorkaroundParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
-import { composeAssessment, type ComposedAssessment, type HoldContribution, type ResourceContribution } from "./contribution.js";
+import { acceptServedContribution, composeAssessment, type ComposedAssessment, type HoldContribution, type ResourceContribution } from "./contribution.js";
 import { bindingHeld, schedulingHolds } from "./holds.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { ASK_ON_SLACK_CHOICE, NOT_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackCandidateLabel, slackNameCandidates, slackPersonKey, slackPersonLabel, slackPersonNotOnSlack, waitSlackAskOnceWhat, waitSlackInstruction, waitSlackTerminalWhat, type SlackCandidate, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
@@ -3750,7 +3750,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function snapshotWithContribution(source: Source, id: string): Promise<{ entity: EntitySnapshot | null; contribution: Contribution | null }> {
       const out = await sourceRpc(source, "sourceSnapshot", { id }, sourceContract.sourceSnapshot.output);
-      return { entity: out.snapshot === null ? null : entitySnapshotSchema.parse(out.snapshot), contribution: out.contribution ?? null };
+      // A source may serve its own built-in contribution or one for a source
+      // with no in-process contributor, never another built-in source's.
+      const raw = out.contribution ?? null;
+      const contribution = raw === null ? null : acceptServedContribution(source, raw);
+      if (raw !== null && contribution === null) bb.log.warn(`stewards: ${source} served a contribution for ${id} that names another source; ignored`);
+      return { entity: out.snapshot === null ? null : entitySnapshotSchema.parse(out.snapshot), contribution };
     }
 
     async function snapshot(source: Source, id: string): Promise<EntitySnapshot | null> {

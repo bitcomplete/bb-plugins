@@ -1,14 +1,14 @@
 // BB-418 (BB-291 C10): a source's contribution rides `sourceSnapshot`. No live
 // source serves one yet, so the production path always falls back to the
 // in-process contributors; this test serves one through the fake source and
-// checks it reaches the binding's stored assessment, proving the read path
-// adds no separate call.
+// checks it reaches the `compose.served` shadow without changing the
+// authoritative assessment, proving the read path adds no separate call.
 import { describe, expect, it } from "vitest";
 import { issue } from "./fixtures.js";
 import { setup } from "./test-world.js";
 
 describe("a served contribution rides sourceSnapshot (BB-418)", () => {
-  it("composes the source's contribution into the binding's stored assessment", async () => {
+  it("reaches the compose.served shadow without changing the authoritative assessment", async () => {
     const t = await setup();
     t.threads.set("thr_steward", { status: "idle", archivedAt: null });
     const b = t.hooks.store.create({
@@ -27,24 +27,33 @@ describe("a served contribution rides sourceSnapshot (BB-418)", () => {
     });
     t.hooks.store.patch(b.id, { threadId: "thr_steward" });
     t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", stateType: "started" }));
-    // The fake source serves a contribution beside its snapshot, on the same
-    // `sourceSnapshot` call. Nothing in the core names figma or the stage.
+    // The fake linear source serves a contribution beside its snapshot, on the
+    // same `sourceSnapshot` call. It names a step and a made-up gate item, and
+    // differs from the in-process linear contribution, so the shadow logs it.
     t.serveContribution("uuid-12", {
-      source: "figma",
-      gate: [{ source: "figma", subject: { kind: "artifact", id: "file-1" }, id: "design-approved", met: false, missing: "the design is not approved", lane: "user", escalated: false, product: false, inputs: "design-approved@1" }],
+      source: "linear",
+      gate: [{ source: "linear", subject: { kind: "step", id: "spec" }, id: "spec-approved", met: false, missing: "the spec is not approved", lane: "user", escalated: false, product: false, inputs: "spec-approved@1" }],
       waits: [],
-      resources: [{ source: "figma", id: "artifact:file-1", active: true, subject: { kind: "artifact", id: "file-1" } }],
+      resources: [{ source: "linear", id: "served:artifact", active: true, subject: { kind: "step", id: "spec" } }],
       holds: [],
       reasons: [],
     });
     await t.hooks.reconcilePass("p1");
-    const row = t.hooks.store.assessment(b.id) as { gate: { met: boolean; missing: string | null; pulls: unknown[] }; resources: Array<{ id: string; active: boolean }> } | null;
+    // The served contribution is folded by the same `compose()` and compared
+    // against the in-process linear contribution; the difference is logged.
+    const rows = t.hooks.store.divergences({ bindingId: b.id, surface: "compose.served" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.inputs.source).toBe("linear");
+    // The authoritative assessment is unchanged: the served gate item did not
+    // set the composed gate or the stored rows.
+    const row = t.hooks.store.assessment(b.id) as { gate: { met: boolean; missing: string | null; pulls: unknown[] }; resources: Array<{ id: string }> } | null;
     expect(row).not.toBeNull();
-    // The served gate item folds into the composed gate, and its resource is
-    // stored. The per-pull merge gate stays empty: a served item carries no
-    // wrapped `assessed` gate, so it cannot set the core's merge gate.
-    expect(row!.gate).toMatchObject({ met: false, missing: "the design is not approved" });
+    // The binding has no own pull, so the in-process gate is met; the served
+    // unmet gate item did not reach the authoritative answer.
     expect(row!.gate.pulls).toEqual([]);
-    expect(row!.resources).toEqual(expect.arrayContaining([expect.objectContaining({ id: "artifact:file-1", active: true })]));
+    expect(row!.gate.met).toBe(true);
+    // The core's in-process resources are present; the served resource is not.
+    expect(row!.resources.map((r) => r.id)).toContain("workers");
+    expect(row!.resources.map((r) => r.id)).not.toContain("served:artifact");
   });
 });
