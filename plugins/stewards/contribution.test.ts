@@ -305,9 +305,11 @@ describe("the github contributor (BB-380)", () => {
 // ---------------------------------------------------------------------------
 
 describe("the reasons contribution (BB-415, C8)", () => {
-  it("derives the local binding-level declines from the binding row", () => {
-    expect(localContributor.contribute(input({ binding: binding({ ending: "terminal" }) })).reasons).toEqual([{ source: "local", code: "ending-in-progress", detail: "terminal", at: 1_000_000 }]);
-    expect(localContributor.contribute(input({ binding: binding({ followThroughUntil: 1 }) })).reasons).toEqual([{ source: "local", code: "follow-through-ran-out", detail: null, at: 1_000_000 }]);
+  it("derives the local binding-level decline from the binding row", () => {
+    // `stay-ended`, `ending-in-progress` and `follow-through-ran-out` are
+    // recorded on looks that return before `assessBinding`, so the composer
+    // never sees their state; only the hold's `deferred` is derived.
+    expect(localContributor.contribute(input({ binding: binding({ ending: "terminal" }) })).reasons).toEqual([]);
     expect(localContributor.contribute(input({ binding: binding({ hold: "a freeze" }) })).reasons).toEqual([{ source: "local", code: "deferred", detail: "a freeze", at: 1_000_000 }]);
   });
 

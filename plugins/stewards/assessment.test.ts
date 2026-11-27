@@ -360,6 +360,15 @@ describe("the composed reasons divergence (BB-415, C8)", () => {
     const i = input();
     expect(compare(i, assess(i), composeAssessment(i), new Set(["nothing-to-do", "worker-busy"])).filter((d) => d.surface === "compose.reasons")).toEqual([]);
   });
+
+  it("yields a composed deferred to the look's nothing-to-do or worker-busy decline", () => {
+    const held = input({ binding: binding({ hold: "a freeze" }) });
+    expect(composeAssessment(held).reasons).toEqual([{ source: "local", code: "deferred", detail: "a freeze", at: 1_000_000 }]);
+    expect(compare(held, assess(held), composeAssessment(held), new Set(["nothing-to-do"])).filter((d) => d.surface === "compose.reasons")).toEqual([]);
+    expect(compare(held, assess(held), composeAssessment(held), new Set(["worker-busy"])).filter((d) => d.surface === "compose.reasons")).toEqual([]);
+    // The look actually deferred: both sides agree.
+    expect(compare(held, assess(held), composeAssessment(held), new Set(["deferred"])).filter((d) => d.surface === "compose.reasons")).toEqual([]);
+  });
 });
 
 describe("the divergence store", () => {

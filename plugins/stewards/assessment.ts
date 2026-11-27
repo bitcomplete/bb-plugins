@@ -116,7 +116,7 @@ export type AssessmentInput = {
   binding: Pick<
     Binding,
     "id" | "entityKey" | "kind" | "ready" | "stage" | "ending" | "hold" | "deployments" | "requeueUntil" | "status" | "createdAt" | "advancedAt" | "phase"
-  > & { wait?: Binding["wait"]; waitSince?: number | null; holdBehind?: Binding["holdBehind"]; holdStack?: Binding["holdStack"]; mergeBehind?: Binding["mergeBehind"]; followThroughUntil?: Binding["followThroughUntil"] };
+  > & { wait?: Binding["wait"]; waitSince?: number | null; holdBehind?: Binding["holdBehind"]; holdStack?: Binding["holdStack"]; mergeBehind?: Binding["mergeBehind"] };
   /**
    * Fresh snapshots of the binding's waited `pull`/`review` refs (BB-333),
    * keyed by lowercased `owner/repo#N`. Read by the look, never stored in the
@@ -558,7 +558,15 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     // not compared. `inputs` carries counts and the codes, never free text.
     if (declined !== undefined) {
       const recordedReasons = [...declined].filter((c) => isNonActionCode(c) && CONTRIBUTED_REASON_CODES.has(c)).sort();
-      const composedReasons = composed.reasons.map((r) => r.code).sort();
+      // `deferred` is the one local reason the composer approximates: it
+      // composes it whenever the binding is on hold. The reconcile declines
+      // `nothing-to-do` or `worker-busy` before it ever reaches its own defer
+      // check, so a held binding with nothing changed or a busy steward would
+      // otherwise read as `""` against `deferred` on most looks.
+      const composedReasons = composed.reasons
+        .filter((r) => r.code !== "deferred" || (!declined.has("nothing-to-do") && !declined.has("worker-busy")))
+        .map((r) => r.code)
+        .sort();
       if (recordedReasons.join(",") !== composedReasons.join(",")) {
         add("compose.reasons", recordedReasons.join(","), composedReasons.join(","), {
           binding: binding.id,

@@ -313,20 +313,18 @@ function pullReasons(input: AssessmentInput, e: EntitySnapshot, g: PrGate): Reas
 }
 
 /**
- * BB-415 (C8): the binding-level reasons the local source has for not acting,
- * derived from the binding row the assessment already holds. `stay-ended` and
- * the paused or loud-change halves of `deferred` are not derivable from these
- * rows (they read `lifecycle`, `settings` and the look's change queue), so the
- * composer leaves them to the recorded non-actions and the `compose.reasons`
- * divergence.
+ * BB-415 (C8): the one local reason the composer can approximate, from the
+ * binding row the assessment already holds. `stay-ended`, `ending-in-progress`
+ * and `follow-through-ran-out` are recorded on looks that return before
+ * `assessBinding`, so a compared look never reaches their branches; they cannot
+ * be compared under no-added-reads and stay with the recorded non-actions.
+ * `deferred` is the binding's hold, and `compare` yields it to the
+ * `nothing-to-do`/`worker-busy` declines, which run before the reconcile's own
+ * defer check.
  */
 function bindingReasons(input: AssessmentInput): Reason[] {
-  const b = input.binding;
-  const out: Reason[] = [];
-  if (b.ending !== null) out.push({ source: "local", code: "ending-in-progress", detail: b.ending, at: input.now });
-  if (b.followThroughUntil != null && input.now >= b.followThroughUntil) out.push({ source: "local", code: "follow-through-ran-out", detail: null, at: input.now });
-  if (b.hold !== null) out.push({ source: "local", code: "deferred", detail: b.hold, at: input.now });
-  return out;
+  const hold = input.binding.hold;
+  return hold === null ? [] : [{ source: "local", code: "deferred", detail: hold, at: input.now }];
 }
 
 /** The pull request contributions: the merge gate items, the open-pull resources and the pull/review/deployment wait. */

@@ -484,6 +484,29 @@ describe("the compose.reasons divergence (BB-415)", () => {
     await t.flush();
     expect(t.hooks.store.divergences({ bindingId: b.id, surface: "compose.reasons" })).toEqual([]);
   });
+
+  it("records nothing for a held binding with nothing changed", async () => {
+    const t = await setup();
+    t.threads.set("thr_steward", { status: "idle", archivedAt: null });
+    t.entities.set("uuid-12", issue());
+    const b = create(t);
+    t.hooks.store.patch(b.id, { threadId: "thr_steward", hold: "a freeze" });
+    await t.hooks.reconcilePass("p1");
+    await t.flush();
+    written(t, b, "nothing-to-do");
+    expect(t.hooks.store.divergences({ bindingId: b.id, surface: "compose.reasons" })).toEqual([]);
+  });
+
+  it("records nothing for a terminal binding following through", async () => {
+    const t = await setup();
+    t.threads.set("thr_steward", { status: "idle", archivedAt: null });
+    t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed" }));
+    const b = create(t, { threadId: "thr_steward", phase: "Done", stage: "build" });
+    t.hooks.store.patch(b.id, { ending: "terminal", endingAt: 1, followThrough: "wrap up", followThroughUntil: t.now() + 86_400_000 });
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.hooks.store.divergences({ bindingId: b.id, surface: "compose.reasons" })).toEqual([]);
+  });
 });
 
 // ---- the render surfaces -----------------------------------------------------
