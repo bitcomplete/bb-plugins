@@ -13,6 +13,7 @@
 // moved from multi-repo to native keep its old bindings' touches meaningful;
 // it can also match two different repos' same-named directory, which is
 // harmless (an extra schedule question) and unavoidable without the repo set.
+import { DEFAULT_ACTIVE_STAGES } from "./config.js";
 import { bindingHeld } from "./holds.js";
 import type { Binding, Observed } from "./store.js";
 
@@ -77,24 +78,28 @@ export function finished(b: Binding, observed: Observed): boolean {
   return b.endedAt !== null || b.ending === "terminal" || b.noMorePulls === true;
 }
 
-/** What a caller knows beyond the binding's last snapshot: whether a worker is still running. */
-export type AtWorkOptions = { runningWorker?: boolean };
+/** What a caller knows beyond the binding's last snapshot: whether a worker is still running, and the playbook's declared active stages. */
+export type AtWorkOptions = {
+  runningWorker?: boolean;
+  /** BB-417: the binding's declared `active` stages; the default set when the caller has no playbook in hand. */
+  activeStages?: ReadonlySet<string>;
+};
 
 /**
- * Whether a binding is at work on its touches: being built or reviewed, or
- * cleared to start (its gate passed, nothing holds or schedules it: the
- * steward is moving it and starting a worker, and Linear's state reaches the
- * plugin a look later); not held, not ending, not ended, and not finished
- * with no worker still running. A ticket whose pull requests have merged but
- * whose steward has not reported that no more are coming is still at work:
- * the next pull request is a conflict, not a rebase.
+ * Whether a binding is at work on its touches: in an `active` stage (the
+ * declared worker loop), or cleared to start (its gate passed, nothing holds or
+ * schedules it: the steward is moving it and starting a worker, and Linear's
+ * state reaches the plugin a look later); not held, not ending, not ended, and
+ * not finished with no worker still running. A ticket whose pull requests have
+ * merged but whose steward has not reported that no more are coming is still at
+ * work: the next pull request is a conflict, not a rebase.
  */
 export const atWork = (b: Binding, opts: AtWorkOptions = {}): boolean =>
   b.endedAt === null &&
   b.ending === null &&
   // BB-413 (C7): the composed `hold` hold, not the raw field.
   !bindingHeld(b) &&
-  (b.stage === "build" || b.stage === "review" || b.clearedToStart) &&
+  ((b.stage !== null && (opts.activeStages ?? DEFAULT_ACTIVE_STAGES).has(b.stage)) || b.clearedToStart) &&
   b.touches.length > 0 &&
   !(b.lastSnapshot !== null && finished(b, b.lastSnapshot) && opts.runningWorker !== true);
 
@@ -122,8 +127,8 @@ export function overlapping(b: Binding, open: readonly Binding[]): Conflict[] {
  * oldest first, judged from the last snapshot alone. Rendering and tests use
  * this; the schedule request path re-reads GitHub first (BB-54).
  */
-export function conflictsOf(b: Binding, open: readonly Binding[]): Conflict[] {
-  return overlapping(b, open).filter((c) => atWork(c.with));
+export function conflictsOf(b: Binding, open: readonly Binding[], activeStages: ReadonlySet<string> = DEFAULT_ACTIVE_STAGES): Conflict[] {
+  return overlapping(b, open).filter((c) => atWork(c.with, { activeStages }));
 }
 
 /**

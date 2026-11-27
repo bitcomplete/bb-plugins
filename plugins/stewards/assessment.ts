@@ -18,7 +18,7 @@ import { parsePullRef } from "./github.js";
 import { gateState } from "./ready-gate.js";
 import { CONTRIBUTED_REASON_CODES, isNonActionCode } from "./non-actions.js";
 import { anyWorkerInFlight, productGateOptions, runningWorkerReason, stuckDue } from "./reconcile.js";
-import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
+import { isStartStage, waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
 import type { Contribution, EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Worker } from "./store.js";
 import type { Wait, WaitKind } from "./wait.js";
@@ -502,7 +502,7 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
       `behind:${holdBehind.length > 0}`,
       `stack:${holdStack.length > 0}`,
       `merge-behind:${mergeBehind.length > 0}`,
-      `ready-gate:${binding.stage === "spec" && !readyPassed}`,
+      `ready-gate:${isStartStage(input.playbook.stages, binding.stage) && !readyPassed}`,
     ].join(",");
     const composedHolds = composed.holds.map((h) => `${h.id}:${h.held}`).join(",");
     if (assessedHolds !== composedHolds) {

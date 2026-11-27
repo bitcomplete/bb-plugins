@@ -30,6 +30,13 @@ const unknownStrategy = (text: string) =>
     ].join("\n"),
   );
 
+/** A playbook whose declared stage carries a kind no branch knows. */
+const unknownStageKind = (text: string) =>
+  text.replace(
+    "source: linear\n",
+    ["source: linear", "stages:", "  spec:   { kind: start }", "  design: { kind: manual }", "  build:  { kind: active }", "  review: { kind: active }", ""].join("\n"),
+  );
+
 const unsupportedLines = (problems: string[]) => problems.filter((p) => p.includes("unsupported until restart"));
 
 describe("an unsupported playbook value (BB-355)", () => {
@@ -69,6 +76,26 @@ describe("an unsupported playbook value (BB-355)", () => {
     expect(lines[0]).toMatch(/stewards\/playbooks\/linear-tickets\.md/u);
     expect(lines[0]).toContain("magic");
     expect(lines[0]).toContain("deployment.carries[0].strategy.kind");
+    expect(lines[0]).toMatch(/restarts onto a newer image/u);
+  });
+
+  it("does the same for an unrecognised stage kind (BB-417)", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    const before = await t.hooks.loadConfig("p1", true);
+    const version = before!.playbooks.ticket!.version;
+
+    t.files[playbookPath("linear-tickets")] = unknownStageKind(LINEAR_TICKETS);
+    t.hooks.forgetConfigs();
+    const after = await t.hooks.loadConfig("p1", true);
+
+    // The binding keeps running under the last good copy; the unknown kind is
+    // named as unsupported until restart, never read as a typo or silently kept.
+    expect(after!.playbooks.ticket!.version).toBe(version);
+    const lines = unsupportedLines(after!.problems);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/stewards\/playbooks\/linear-tickets\.md/u);
+    expect(lines[0]).toContain("stages.design.kind");
+    expect(lines[0]).toContain("manual");
     expect(lines[0]).toMatch(/restarts onto a newer image/u);
   });
 
