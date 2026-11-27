@@ -4,6 +4,8 @@ import {
   ALERTMANAGER_URL_ENV,
   alertOf,
   alertmanagerChanges,
+  alertmanagerLookSchema,
+  alertmanagerOccurrenceKey,
   alertmanagerSightings,
   alertmanagerSummary,
   alertsOf,
@@ -157,6 +159,8 @@ describe("what changed between two looks", () => {
     fingerprint: "a1b2c3d4e5f6",
     alertname: "KubePodCrashLooping",
     namespace: "web-production",
+    jobName: null,
+    occurrenceKey: "a1b2c3d4e5f6#@2026-10-20T14:30:00Z",
     severity: "warning",
     status: "active",
     summary: "Pod is crash looping",
@@ -229,6 +233,8 @@ describe("the wake", () => {
         fingerprint: "a1b2c3d4e5f6",
         alertname: "KubePodCrashLooping",
         namespace: "web-production",
+        jobName: null,
+        occurrenceKey: "a1b2c3d4e5f6#@2026-10-20T14:30:00Z",
         severity: "warning",
         status: "active",
         summary: "Pod is crash looping",
@@ -276,5 +282,22 @@ describe("the wake", () => {
     const text = formatAlertmanagerWake({ reason: "changed", binding, playbook, look: resolved, target: { target: "ENG", source: "linear" }, label: "bb-managed", owner: "me", autoAdopt: [], escalations: [], changes: [] });
     expect(text).toContain("is no longer firing");
     expect(text).toContain("never close the ticket");
+  });
+});
+
+describe("Job correlation (BB-419)", () => {
+  it("reads job_name from the labels and derives the occurrence key from it", () => {
+    const alert = alertOf(apiAlert({ labels: { alertname: "KubeJobFailed", namespace: "bithub", job_name: "bithub-deel-sync-28934567", severity: "warning" } }))!;
+    expect(alert.jobName).toBe("bithub-deel-sync-28934567");
+    expect(alertmanagerOccurrenceKey(alert)).toBe("a1b2c3d4e5f6#bithub-deel-sync-28934567@2026-10-20T14:30:00Z");
+    // A non-Job alert names no Job and keys on the empty Job.
+    expect(alertmanagerOccurrenceKey(alertOf(apiAlert())!)).toBe("a1b2c3d4e5f6#@2026-10-20T14:30:00Z");
+  });
+
+  it("parses a look stored before the Job fields existed, with safe defaults", () => {
+    const stored = { at: now, target: "alertmanager/web-production", error: null, active: 0, notes: [], findings: [{ fingerprint: "a1b2c3d4e5f6", alertname: "KubePodCrashLooping", namespace: "web-production", severity: "warning", status: "active", summary: null, description: null, startsAt: null, endsAt: null, updatedAt: null, generatorURL: null, labels: [], annotations: [], reasons: ["new"], resolved: false, class: "new", ticket: null, ticketState: null, firstSeenAt: now, lastCommentedAt: null }] };
+    const parsed = alertmanagerLookSchema.safeParse(stored);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.findings[0]).toMatchObject({ jobName: null, occurrenceKey: "" });
   });
 });
