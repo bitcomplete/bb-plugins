@@ -4,12 +4,13 @@
 // unknown stage in `phases`, and zero or two `start` stages. The BB-377
 // characterization test pins the default three-stage behavior unchanged.
 import { describe, expect, it } from "vitest";
-import { DEFAULT_ACTIVE_STAGES, activeStageSet, activeStages, firstActiveStage, isActiveStage, isStartStage, lastActiveStage, parsePlaybook, phaseOf, stageProblems } from "./config.js";
-import { issue, parkedWorker } from "./fixtures.js";
+import { DEFAULT_ACTIVE_STAGES, activeStageSet, activeStages, firstActiveStage, isActiveStage, isStartStage, lastActiveStage, parsePlaybook, phaseOf, playbookPath, stageProblems } from "./config.js";
+import { issue, parkedWorker, pull } from "./fixtures.js";
 import { idleInActiveStage, isOwnStageChange, phaseAndStage, type IdleBinding } from "./reconcile.js";
 import { atWork } from "./schedule.js";
 import type { Binding } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
+import { setup } from "./test-world.js";
 
 /** The linear-tickets playbook with a four-stage declaration and a `label:design` phase. */
 const FOUR_STAGE = LINEAR_TICKETS.replace(
@@ -18,6 +19,9 @@ const FOUR_STAGE = LINEAR_TICKETS.replace(
 ).replace('  In Progress: { stage: build, stuck: 2d }', '  "label:design": { stage: design }\n  In Progress: { stage: build }');
 
 const parsed = (text: string) => parsePlaybook(text, "linear-tickets");
+
+/** FOUR_STAGE with the last active stage named `ship`, so `lastActiveStage` cannot be a hardcoded "review". */
+const LAST_SHIP = FOUR_STAGE.replace("  review: { kind: active, stuck: 3d }", "  ship:   { kind: active, stuck: 3d }").replace("  In Review:   { stage: review, stuck: 3d }", "  In Review:   { stage: ship, stuck: 3d }");
 
 describe("a playbook declares its stages (BB-417)", () => {
   it("parses a four-stage playbook and carries each stage's kind and stuck window", () => {
@@ -130,6 +134,17 @@ describe("a malformed stage declaration is rejected (BB-417)", () => {
     expect(p.error).toContain("shipped");
   });
 
+  it("does not accept an inherited Object key as a stage name", () => {
+    // `toString in stages` is true by prototype, so the old check accepted it
+    // and then read no kind. It must be rejected as undeclared.
+    const text = FOUR_STAGE.replace("In Progress: { stage: build }", "In Progress: { stage: toString }");
+    const p = parsed(text);
+    expect(p.ok).toBe(false);
+    if (p.ok) return;
+    expect(p.error).toContain("phases.In Progress.stage");
+    expect(p.error).toContain("toString");
+  });
+
   it("rejects a declaration with no start stage", () => {
     const text = FOUR_STAGE.replace("spec:   { kind: start }", "spec:   { kind: active }");
     const p = parsed(text);
@@ -150,5 +165,100 @@ describe("a malformed stage declaration is rejected (BB-417)", () => {
     expect(stageProblems({ a: { kind: "active", stuckMs: null } }, {})).toMatch(/exactly one start/);
     expect(stageProblems({ a: { kind: "start", stuckMs: null }, b: { kind: "start", stuckMs: null } }, {})).toMatch(/exactly one start/);
     expect(stageProblems({ a: { kind: "start", stuckMs: null } }, { X: { stage: "b" } })).toMatch(/phases\.X\.stage/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The server's stage consumers against a declared-stages playbook. These are
+// the paths the ticket rewires: the ready-gate flag and the schedule
+// withdrawal. Replacing `firstActiveStage(playbook.stages)` with "build" (or
+// `lastActiveStage(...)` with "review") must fail one of them.
+// ---------------------------------------------------------------------------
+
+describe("the server reads the declared set, not a stage name (BB-417)", () => {
+  const flagged = /before the ready gate passed/u;
+
+  /** A bound ticket in the declared playbook's `spec` stage, with its project steward and steward. */
+  async function boundFour() {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = FOUR_STAGE;
+    t.hooks.forgetConfigs();
+    await t.hooks.loadConfig("p1", true);
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const wakes = () => t.sends.filter((s) => s.threadId === steward).map((s) => s.text);
+    const move = async (entity: ReturnType<typeof issue>) => {
+      const before = wakes().length;
+      t.entities.set("uuid-12", entity);
+      await t.ring("linear", "uuid-12");
+      expect(wakes().length).toBeGreaterThan(before);
+      return wakes().at(-1)!;
+    };
+    return { t, project, steward, move };
+  }
+
+  it("raises the ready-gate flag entering the first active stage (design) from spec", async () => {
+    const { move } = await boundFour();
+    // The `design` label moves the phase to the declared `design` stage, the
+    // first active stage; no approval and nothing reported, so the gate is unmet.
+    expect(await move(issue({ labels: ["bb-managed", "design"] }))).toMatch(flagged);
+  });
+
+  it("does not raise the flag entering a later active stage (build) from spec", async () => {
+    const { move } = await boundFour();
+    // Build is the second active stage, not the first: only the entry into the
+    // first active stage counts as entering build (the steward's ruling).
+    expect(await move(issue({ state: "In Progress", stateType: "started" }))).not.toMatch(flagged);
+  });
+
+  /** ENG-12 at work and ENG-13 with a ready gate and a filed schedule request, over the given declared-stages playbook. */
+  async function twoFour(playbook: string = FOUR_STAGE) {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = playbook;
+    t.hooks.forgetConfigs();
+    await t.hooks.loadConfig("p1", true);
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull());
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO" }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const [project, first, second] = t.spawns.map((x) => x.id) as [string, string, string];
+    const toProject = () => t.sends.filter((s) => s.threadId === project);
+    await t.tool("steward_report", { phase: "In Progress", summary: "Worker building.", nextAction: "Wait for the pull request", actor: "steward", touches: ["web/src/login"] }, first);
+    const ready = { phase: "Todo", summary: "Spec posted.", nextAction: "Start a worker", actor: "steward", ready: { checklist: [1, 2, 3, 4, 5].map((item) => ({ item, met: true })), substantial: false }, touches: ["web/src"] };
+    await t.tool("steward_report", ready, second);
+    const id = /(esc_[\w-]+) from ENG-13 \(schedule\)/u.exec(toProject()[0]!.text)![1]!;
+    return { t, project, first, second, toProject, id };
+  }
+
+  it("does not withdraw a design-stage ticket's scheduling request as the work has started", async () => {
+    const { t, id } = await twoFour();
+    // ENG-13 enters the declared first active stage (design) and links a new
+    // pull request: the request is not withdrawn, so the overlap check re-runs.
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", labels: ["bb-managed", "design"], state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#9", url: "https://github.com/acme/web/pull/9" }] }));
+    t.entities.set("acme/web#9", pull({ state: "open" }, { merged: false }));
+    await t.ring("linear", "uuid-13");
+    expect(t.hooks.store.find("ENG-13")!.stage).toBe("design");
+    expect(t.hooks.store.escalation(id)!.resolution ?? "").not.toMatch(/the work has started/u);
+  });
+
+  it("withdraws a review-stage ticket's scheduling request as the work has started", async () => {
+    const { t, id } = await twoFour();
+    // Review is the last active stage: the request is withdrawn.
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Review", stateType: "started" }));
+    await t.ring("linear", "uuid-13");
+    expect(t.hooks.store.find("ENG-13")!.stage).toBe("review");
+    expect(t.hooks.store.escalation(id)!.resolution).toMatch(/the work has started/u);
+  });
+
+  it("withdraws at the last active stage even when it is not named review", async () => {
+    const { t, id } = await twoFour(LAST_SHIP);
+    // The declared last active stage is `ship`; the withdrawal must follow it,
+    // not the name "review".
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO", state: "In Review", stateType: "started" }));
+    await t.ring("linear", "uuid-13");
+    expect(t.hooks.store.find("ENG-13")!.stage).toBe("ship");
+    expect(t.hooks.store.escalation(id)!.resolution).toMatch(/the work has started/u);
   });
 });

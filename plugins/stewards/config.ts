@@ -814,15 +814,15 @@ export function stageProblems(stages: Stages, phases: Record<string, { stage?: s
   const starts = Object.values(stages).filter((d) => d.kind === "start").length;
   if (starts !== 1) return `stages must declare exactly one start stage; this playbook declares ${starts}`;
   for (const [state, phase] of Object.entries(phases)) {
-    if (phase.stage !== undefined && !(phase.stage in stages)) return `phases.${state}.stage names ${JSON.stringify(phase.stage)}, which stages does not declare`;
+    if (phase.stage !== undefined && !Object.hasOwn(stages, phase.stage)) return `phases.${state}.stage names ${JSON.stringify(phase.stage)}, which stages does not declare`;
   }
   return null;
 }
 
-/** The kind of a declared stage, or null when the set does not declare it. */
+/** The kind of a declared stage, or null when the set does not declare it (own keys only, so `toString` is not a stage). */
 export function stageKind(stages: Stages, stage: string | null | undefined): StageKind | null {
-  if (stage === null || stage === undefined) return null;
-  return stages[stage]?.kind ?? null;
+  if (stage === null || stage === undefined || !Object.hasOwn(stages, stage)) return null;
+  return stages[stage]!.kind;
 }
 
 /** Whether a stage is the one `start` stage (the ready gate applies there). */
@@ -1285,7 +1285,9 @@ export function phaseOf(playbook: Playbook, state: string): { name: string; stag
   const stage = phase.stage ?? null;
   // The phase's own `stuck` wins; a stage-declared `stuck` is the fallback, so
   // a playbook that moves its windows onto `stages` reads the same either way.
-  const stuckMs = phase.stuck ?? (stage === null ? null : (playbook.stages?.[stage]?.stuckMs ?? null));
+  // Own keys only: `toString` and friends are not declared stages.
+  const stageDecl = stage !== null && Object.hasOwn(playbook.stages, stage) ? playbook.stages[stage]! : null;
+  const stuckMs = phase.stuck ?? stageDecl?.stuckMs ?? null;
   return { name: key, stage, stuckMs };
 }
 
