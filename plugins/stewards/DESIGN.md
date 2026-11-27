@@ -733,6 +733,20 @@ disagreement.
   read-only. Nothing reads the assessment to decide or render anything: a
   consumer is added only after the comparison has run clean in production for
   several days. The log's `inputs` hold only ids, shas, states and timestamps.
+- **The `compose.reasons` surface (BB-415, C8).** Each source contributes the
+  reasons it has for not acting, from rows `assess()` already reads. The
+  github contributor derives the per-pull declines it can see in the snapshot,
+  the gate and the binding's merge hold (`gate-not-met`, `pull-draft`,
+  `pull-closed`, `pull-foreign-owner`, `merge-held`); the local contributor the
+  binding-level declines in the binding row (`ending-in-progress`,
+  `follow-through-ran-out`, `deferred`); the linear contributor none. The
+  `reasons` are shadow: the existing `non_actions` writes and renders stay the
+  answer. `compare` logs the recorded reason codes against the composed codes,
+  both sorted, under `compose.reasons`. A code whose condition needs a source
+  call or a merge race (`base-not-default`, `retarget-needed`, `head-moved`,
+  `stay-ended`) is not derivable from those rows, so it appears as a divergence
+  until a later consumer gives it a home. The contribution adds no store read
+  and no source call.
 
 ### Non-action reasons (BB-335)
 

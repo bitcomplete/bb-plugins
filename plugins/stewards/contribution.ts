@@ -34,6 +34,7 @@ import { prGate, type PrGate, type PrGateOptions, type ProjectApprovalRecord } f
 import { schedulingHolds, type HoldContribution } from "./holds.js";
 import { idleInActiveStage, observedStall, productGateOptions } from "./reconcile.js";
 import { gateState } from "./ready-gate.js";
+import type { NonActionCode } from "./non-actions.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation } from "./store.js";
 import type { Wait, WaitKind } from "./wait.js";
@@ -283,6 +284,42 @@ function entityContribution(source: ContributionSource, input: AssessmentInput):
   return { source, gate: [], waits, resources, holds: bindingHolds(source, input), reasons: [] };
 }
 
+/**
+ * BB-415 (C8): the reasons the github source has for not acting on one pull
+ * request, derived from the snapshot, the gate and the binding's own hold rows
+ * -- the rows `assess()` already reads. The recorded per-pull declines are
+ * mutually exclusive per look (`syncNeeds` continues after the first), so the
+ * composer mirrors that precedence. A code whose condition needs a source call
+ * or a merge race (`base-not-default`, `retarget-needed`, `head-moved`) is not
+ * derivable here; the `compose.reasons` divergence records it until the
+ * consumer slice gives it a home.
+ */
+function pullReasons(input: AssessmentInput, e: EntitySnapshot, g: PrGate): Reason[] {
+  const reason = (code: NonActionCode): Reason => ({ source: "github", code, detail: e.key, at: input.now });
+  if (e.pull !== null && lc(e.state) === "closed" && e.pull.merged !== true) return [reason("pull-closed")];
+  if (!g.gateMet) return [reason("gate-not-met")];
+  if ((input.binding.mergeBehind ?? []).length > 0) return [reason("merge-held")];
+  if (e.pull?.draft === true) return [reason("pull-draft")];
+  return [];
+}
+
+/**
+ * BB-415 (C8): the binding-level reasons the local source has for not acting,
+ * derived from the binding row the assessment already holds. `stay-ended` and
+ * the paused or loud-change halves of `deferred` are not derivable from these
+ * rows (they read `lifecycle`, `settings` and the look's change queue), so the
+ * composer leaves them to the recorded non-actions and the `compose.reasons`
+ * divergence.
+ */
+function bindingReasons(input: AssessmentInput): Reason[] {
+  const b = input.binding;
+  const out: Reason[] = [];
+  if (b.ending !== null) out.push({ source: "local", code: "ending-in-progress", detail: b.ending, at: input.now });
+  if (b.followThroughUntil != null && input.now >= b.followThroughUntil) out.push({ source: "local", code: "follow-through-ran-out", detail: null, at: input.now });
+  if (b.hold !== null) out.push({ source: "local", code: "deferred", detail: b.hold, at: input.now });
+  return out;
+}
+
 /** The pull request contributions: the merge gate items, the open-pull resources and the pull/review/deployment wait. */
 function pullContributions(input: AssessmentInput): { gate: GateContribution[]; waits: WaitContribution[]; resources: ResourceContribution[]; reasons: Reason[] } {
   const { binding, observed, ownPulls, decisions, projectApprovals, escalations } = input;
@@ -315,7 +352,18 @@ function pullContributions(input: AssessmentInput): { gate: GateContribution[]; 
     // binding's own non-worker pull, is gated but does not suppress the idle
     // wake.
     resources.push({ source: "github", id: `open-pull:${lc(e.key)}`, active: pullIsOpen(e) && !g.gateMet && isOwn(e, ownPulls), subject: { kind: "pull", id: e.key } });
-    if (!g.gateMet && g.missing !== null) reasons.push({ source: "github", code: "gate-not-met", detail: g.missing, at: input.now });
+    reasons.push(...pullReasons(input, e, g));
+  }
+  // A pull the ticket observed but that does not belong to it (BB-386) is the
+  // `pull-foreign-owner` decline. `watchedPulls` is the belonging set
+  // `buildAssessmentInput` builds with `pullBelongsToTicket`, so an observed
+  // pull outside it is foreign; the gate loop above only sees `gatePulls`, so
+  // the foreign ones are named here from the same rows.
+  if (binding.kind === "ticket") {
+    for (const e of observed.pulls) {
+      if (watchedPulls.has(lc(e.key)) || (e.url !== null && watchedPulls.has(lc(e.url)))) continue;
+      reasons.push({ source: "github", code: "pull-foreign-owner", detail: e.key, at: input.now });
+    }
   }
   // BB-412 (C6): the pulls the binding watches beside its own: the ticket's
   // leased linked pulls and a typed `pull`/`review` wait's leased ref. They are
@@ -363,10 +411,10 @@ export const linearContributor: SourceContributor = {
   contribute: (input) => entityContribution("linear", input),
 };
 
-/** The local source: its ticket's non-pull typed wait and the binding's holds. */
+/** The local source: its ticket's non-pull typed wait, the binding's holds, and the binding-level reasons. */
 export const localContributor: SourceContributor = {
   source: "local",
-  contribute: (input) => entityContribution("local", input),
+  contribute: (input) => ({ ...entityContribution("local", input), reasons: bindingReasons(input) }),
 };
 
 /** The in-process contributors, in the order the composer folds them. */

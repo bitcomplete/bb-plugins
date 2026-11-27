@@ -16,6 +16,7 @@ import { composeAssessment, pullGate, type ComposedAssessment } from "./contribu
 import { latestReviewMarker, type PrGate, type ProjectApprovalRecord } from "./gate.js";
 import { parsePullRef } from "./github.js";
 import { gateState } from "./ready-gate.js";
+import { isNonActionCode } from "./non-actions.js";
 import { anyWorkerInFlight, productGateOptions, runningWorkerReason, stuckDue } from "./reconcile.js";
 import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
 import type { EntitySnapshot } from "./source-contract.js";
@@ -115,7 +116,7 @@ export type AssessmentInput = {
   binding: Pick<
     Binding,
     "id" | "entityKey" | "kind" | "ready" | "stage" | "ending" | "hold" | "deployments" | "requeueUntil" | "status" | "createdAt" | "advancedAt" | "phase"
-  > & { wait?: Binding["wait"]; waitSince?: number | null; holdBehind?: Binding["holdBehind"]; holdStack?: Binding["holdStack"]; mergeBehind?: Binding["mergeBehind"] };
+  > & { wait?: Binding["wait"]; waitSince?: number | null; holdBehind?: Binding["holdBehind"]; holdStack?: Binding["holdStack"]; mergeBehind?: Binding["mergeBehind"]; followThroughUntil?: Binding["followThroughUntil"]; nonActions?: Binding["nonActions"] };
   /**
    * Fresh snapshots of the binding's waited `pull`/`review` refs (BB-333),
    * keyed by lowercased `owner/repo#N`. Read by the look, never stored in the
@@ -407,7 +408,12 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  * composed answer and they cannot diverge either). BB-412 (C6) completes
  * `compose.holds` and adds `compose.resources`. The composed answer is a
  * refactor of today's derivation, so a row on one of them is a defect, not a
- * fixture. Each old side is derived here from the raw rows (the binding, the
+ * fixture. BB-415 (C8) adds `compose.reasons`: the recorded non-action codes
+ * against the composed reasons, both sorted. Unlike the others, a row here is
+ * expected evidence, not a defect: the composer derives only the reasons the
+ * rows in hand can express, so a recorded code that needs a source call or a
+ * merge race shows as a divergence until the consumer slice gives it a home.
+ * Each old side is derived here from the raw rows (the binding, the
  * snapshot, the deployments and the workers), never from the composer's own
  * output. The comparison runs only when the caller passes the composed
  * answer; the C1 characterization tests call `compare` without one and see the
@@ -535,6 +541,23 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
         deployments: Object.keys(binding.deployments).length,
         linkedPulls: leasedLinkedPullKeys(input).length,
         waitKind: binding.wait?.kind ?? null,
+      });
+    }
+
+    // BB-415 (C8): the composed reasons against the recorded non-action codes.
+    // Both sides are sorted, so contributor order is not a difference. The
+    // recorded set is the latest reason per code (BB-335) and persists across
+    // looks, so a code the composer does not derive this look -- one that needs
+    // a source call or a merge race -- is a real divergence, the shadow's
+    // evidence for the consumer slice. `inputs` carries counts and the codes,
+    // never free text.
+    const recordedReasons = Object.keys(binding.nonActions ?? {}).filter(isNonActionCode).sort();
+    const composedReasons = composed.reasons.map((r) => r.code).sort();
+    if (recordedReasons.join(",") !== composedReasons.join(",")) {
+      add("compose.reasons", recordedReasons.join(","), composedReasons.join(","), {
+        binding: binding.id,
+        recorded: recordedReasons.length,
+        composed: composedReasons.length,
       });
     }
   }

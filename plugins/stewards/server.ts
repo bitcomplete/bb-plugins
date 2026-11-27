@@ -17029,7 +17029,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             description: "Every place the shadow assessment disagrees with the predicate it will replace, one row per distinct (binding, surface, old, new) with a first/last seen time and a count. --binding filters by binding id or entity key, --surface by surface name. --json emits the rows. Nothing reads the log to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's divergences (binding id or entity key)" },
-              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, approvals.gate, approvals.pageRefusal, compose.waits, compose.holds, compose.resources)" },
+              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, approvals.gate, approvals.pageRefusal, compose.waits, compose.holds, compose.resources, compose.reasons)" },
               project: PROJECT_OPTION,
               json: JSON_OPTION,
             },

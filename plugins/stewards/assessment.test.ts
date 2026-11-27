@@ -321,7 +321,29 @@ describe("the composed resources and holds divergences (BB-412, C6)", () => {
     // The linked pull is not an own pull and the parked worker is not running,
     // so neither suppresses the idle wake, and there is no divergence.
     expect(composed.liveness.idle).toBe(true);
-    expect(compare(i, assess(i), composed).filter((d) => d.surface.startsWith("compose."))).toEqual([]);
+    expect(compare(i, assess(i), composed).filter((d) => d.surface !== "compose.reasons" && d.surface.startsWith("compose."))).toEqual([]);
+  });
+});
+
+// BB-415 (C8): the composed reasons divergence. The recorded non-action codes
+// are the old side; a mismatch records, a match records nothing.
+describe("the composed reasons divergence (BB-415, C8)", () => {
+  it("records a compose.reasons row when the recorded codes and the composed codes differ", () => {
+    const i = input({ binding: binding({ nonActions: { "merge-refused": { date: "2026-11-27", text: "x" } } }) });
+    const rows = compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface === "compose.reasons");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ surface: "compose.reasons", old: "merge-refused", new: "", inputs: { binding: "b1", recorded: 1, composed: 0 } });
+  });
+
+  it("records nothing when the recorded codes and the composed codes match", () => {
+    const second = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
+    const i = input({
+      binding: binding({ nonActions: { "gate-not-met": { date: "2026-11-27", text: "x" } } }),
+      observed: { entity: issue({ state: "In Progress" }), pulls: [second] },
+      ownPulls: own(second),
+      decisions: new Map([[second.key.toLowerCase(), "user"]]),
+    });
+    expect(compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface === "compose.reasons")).toEqual([]);
   });
 });
 
