@@ -2,7 +2,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { SOURCE_PLUGIN_IDS, entitySnapshotSchema, isMissingPlugin, signatureLine, signedBy, snapshotPullSchema, sourceContract, sourceSchema } from "./source-contract.js";
+import { CONTRIBUTION_WAIT_KINDS, SOURCE_PLUGIN_IDS, contributionSchema, entitySnapshotSchema, isMissingPlugin, signatureLine, signedBy, snapshotPullSchema, sourceContract, sourceSchema } from "./source-contract.js";
+import { WAIT_KINDS } from "./wait.js";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
@@ -81,6 +82,39 @@ describe("source-contract.ts", () => {
     expect(entitySnapshotSchema.parse({ ...base, blockedBy: ["ENG-2"] }).blockedBy).toEqual(["ENG-2"]);
     // Absent by default: a source that did not read relations omits it.
     expect(entitySnapshotSchema.parse(base).blockedBy).toBeUndefined();
+  });
+
+  it("carries an optional, additive contribution beside the snapshot (BB-418, BB-291 C10)", () => {
+    // A source that omits the field still parses; the field is what a source
+    // that can contribute serves, and the core composes it in place of the
+    // in-process contributor.
+    expect(sourceContract.sourceSnapshot.output.parse({ snapshot: null }).contribution).toBeUndefined();
+    // Present and empty is distinct from absent: the source serves and says
+    // nothing to contribute.
+    expect(sourceContract.sourceSnapshot.output.parse({ snapshot: null, contribution: { source: "figma" } })).toMatchObject({
+      contribution: { source: "figma", gate: [], waits: [], resources: [], holds: [], reasons: [] },
+    });
+    // A full contribution for a made-up stage parses: a gate item, a wait, a
+    // resource, a hold and a reason, none of them figma- or stage-named by the
+    // contract itself.
+    const contribution = {
+      source: "figma",
+      gate: [{ source: "figma", subject: { kind: "artifact", id: "file-1" }, id: "design-approved", met: false, missing: "the design is not approved", lane: "user", inputs: "design-approved@1" }],
+      waits: [{ source: "figma", kind: "person", ref: "need_design", live: true, fingerprint: null, budgetMs: null, since: null, overdueMs: null }],
+      resources: [{ source: "figma", id: "artifact:file-1", active: true, subject: { kind: "artifact", id: "file-1" } }],
+      holds: [{ source: "figma", id: "design-review", held: true, behind: [] }],
+      reasons: [{ source: "figma", code: "design-pending", detail: "file-1", at: 1 }],
+    };
+    const parsed = sourceContract.sourceSnapshot.output.parse({ snapshot: null, contribution });
+    expect(parsed.contribution).toMatchObject({ source: "figma", gate: [{ id: "design-approved", met: false }], waits: [{ kind: "person" }], resources: [{ id: "artifact:file-1" }], holds: [{ id: "design-review" }], reasons: [{ code: "design-pending" }] });
+    // An invalid contribution is rejected: a wait kind outside the closed set.
+    expect(sourceContract.sourceSnapshot.output.safeParse({ snapshot: null, contribution: { source: "figma", waits: [{ source: "figma", kind: "someday", ref: "x", live: true, fingerprint: null, budgetMs: null, since: null, overdueMs: null }] } }).success).toBe(false);
+    // A gate item may not set the core's wrapped pull gate (`assessed`) or any
+    // other key the core reads for the merge gate: the schema is strict.
+    expect(contributionSchema.safeParse({ source: "figma", gate: [{ source: "figma", subject: { kind: "pull", id: "acme/web#1" }, id: "merge", met: true, missing: null, lane: "user", inputs: "x", assessed: { gateMet: true } }] }).success).toBe(false);
+    expect(contributionSchema.safeParse({ source: "figma", readyPassed: true }).success).toBe(false);
+    // The contribution's wait kinds mirror the plugin's own closed set.
+    expect([...CONTRIBUTION_WAIT_KINDS]).toEqual([...WAIT_KINDS]);
   });
 
   it("reads the last signature in a body", () => {

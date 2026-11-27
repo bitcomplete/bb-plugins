@@ -36,7 +36,7 @@ import { schedulingHolds, type HoldContribution } from "./holds.js";
 import { idleInActiveStage, observedStall, productGateOptions } from "./reconcile.js";
 import { gateState } from "./ready-gate.js";
 import type { NonActionCode } from "./non-actions.js";
-import type { EntitySnapshot } from "./source-contract.js";
+import type { Contribution, EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation } from "./store.js";
 import type { Wait, WaitKind } from "./wait.js";
 
@@ -102,8 +102,13 @@ export function forwardedToOwner(escalations: readonly Escalation[], e: EntitySn
   return escalations.some((x) => x.status === "open" && x.kind === "approval" && x.route === "user" && x.resolutionKind === "approve-decline" && lc(x.url) === url);
 }
 
-/** The source plugins a contribution can come from, as the design names them. */
-export type ContributionSource = "github" | "linear" | "local";
+/**
+ * The source a contribution comes from, as the design names it. The built-in
+ * contributors are `github`, `linear` and `local`; a source plugin that serves
+ * its own contribution over the source contract (BB-418, BB-291 C10) may use
+ * any id, so the core names no closed source set.
+ */
+export type ContributionSource = string;
 
 /** What a contribution is about, as the design names it. */
 export type ContributionSubject = { kind: "pull" | "artifact" | "step" | "entity"; id: string };
@@ -129,8 +134,13 @@ export type GateContribution = {
   product: boolean;
   /** The fingerprint of the gate's inputs (BB-210). */
   inputs: string;
-  /** The wrapped today's gate, so the composer can reproduce `assess()` exactly. */
-  assessed: AssessedGate;
+  /**
+   * The wrapped today's gate, so the composer can reproduce `assess()` exactly.
+   * The built-in github contributor sets it; a contribution served over the
+   * source contract (BB-418, BB-291 C10) never does, so a served item cannot
+   * set or replace the core's per-pull merge gate.
+   */
+  assessed?: AssessedGate;
 };
 
 /** One wait a source contributes, wrapping today's typed-wait derivation. */
@@ -427,6 +437,43 @@ export const localContributor: SourceContributor = {
 /** The in-process contributors, in the order the composer folds them. */
 export const CONTRIBUTORS: readonly SourceContributor[] = [githubContributor, linearContributor, localContributor];
 
+const CONTRIBUTOR_BY_SOURCE: ReadonlyMap<string, SourceContributor> = new Map(CONTRIBUTORS.map((c) => [c.source, c]));
+
+/** The in-process contributor for a source, or null when the source has none (a new plugin, e.g. `figma`). */
+export function inProcessContributor(source: string): SourceContributor | null {
+  return CONTRIBUTOR_BY_SOURCE.get(source) ?? null;
+}
+
+/**
+ * BB-418 (BB-291 C10): whether a source may serve this contribution. A source
+ * may serve its own built-in contribution (the source whose `sourceSnapshot`
+ * carries it) or a contribution for a source with no in-process contributor; it
+ * may not serve another built-in source's contribution, and every item must
+ * carry the contribution's own source. Invalid reads as null, so a source
+ * cannot impersonate `github`, `linear` or `local` from another snapshot.
+ */
+export function acceptServedContribution(servingSource: string, contribution: Contribution): Contribution | null {
+  if (CONTRIBUTOR_BY_SOURCE.has(contribution.source) && contribution.source !== servingSource) return null;
+  const items: ReadonlyArray<{ source: string }> = [...contribution.gate, ...contribution.waits, ...contribution.resources, ...contribution.holds, ...contribution.reasons];
+  if (items.some((item) => item.source !== contribution.source)) return null;
+  return contribution;
+}
+
+/**
+ * A canonical, comparable text for one contribution, for the `compose.served`
+ * shadow (BB-418): the same item facts in a stable order, so contributor order
+ * and the wrapped `assessed` gate (core-only) are not a difference. Pure, and
+ * carries only ids, states and timestamps.
+ */
+export function contributionText(c: SourceContribution): string {
+  const gate = c.gate.map((g) => `${g.subject.kind}:${g.subject.id}:${g.id}:${g.met}:${g.missing ?? ""}:${g.lane}:${g.escalated}:${g.product}`).sort();
+  const waits = c.waits.map((w) => `${w.kind}:${w.ref}:${w.live}:${w.fingerprint ?? ""}:${w.budgetMs ?? ""}:${w.overdueMs ?? ""}`).sort();
+  const resources = c.resources.map((r) => `${r.id}:${r.active}:${r.subject === null ? "" : `${r.subject.kind}:${r.subject.id}`}`).sort();
+  const holds = c.holds.map((h) => `${h.id}:${h.held}:${h.behind.join("|")}`).sort();
+  const reasons = c.reasons.map((r) => `${r.code}:${r.detail ?? ""}`).sort();
+  return JSON.stringify({ source: c.source, gate, waits, resources, holds, reasons });
+}
+
 /**
  * Fold the sources' contributions into one answer. The gate roll-up is every
  * item's `met`, the first item's lane, and the first unmet item's `missing`;
@@ -439,8 +486,10 @@ export function compose(contributions: readonly SourceContribution[]): ComposedA
     gate: {
       // The roll-up reads the contribution fields, not the wrapped gate, so
       // `assess()` returns the contributor's `met`, `lane` and `missing`
-      // rather than re-deriving them from the wrapped gate.
-      pulls: gateItems.map((g) => g.assessed),
+      // rather than re-deriving them from the wrapped gate. Only an item with a
+      // wrapped `assessed` gate is a per-pull merge gate; a served item
+      // (BB-418) has none and adds no entry to `pulls`.
+      pulls: gateItems.flatMap((g) => (g.assessed === undefined ? [] : [g.assessed])),
       met: gateItems.every((g) => g.met),
       decision: gateItems[0]?.lane ?? "user",
       missing: gateItems.find((g) => !g.met)?.missing ?? null,
@@ -528,10 +577,27 @@ function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): 
   };
 }
 
-/** The composition for one binding, from the rows the look already holds. */
+/**
+ * The composition for one binding, from the rows the look already holds. It
+ * folds the in-process contributors, plus the contributions a source served
+ * over the source contract (BB-418, BB-291 C10) whose source has no in-process
+ * contributor: a new plugin (e.g. `figma`) has nothing to shadow, so it adds
+ * its gate items, waits, resources, holds and reasons beside the in-process
+ * ones. Its items carry no wrapped `assessed` gate, so `gate.pulls` and the
+ * ready gate stay core-only.
+ *
+ * A served contribution whose source has an in-process contributor is never
+ * folded here: it is shadowed by `compare`'s `compose.served` surface instead,
+ * so it cannot set or remove the core's items. The liveness is computed from
+ * the in-process items only, so a served hold, wait or resource with a core id
+ * cannot flip live, idle or stalled.
+ */
 export function composeAssessment(input: AssessmentInput): ComposedAssessment {
-  const composed = compose(CONTRIBUTORS.map((c) => c.contribute(input)));
+  const inProcess = CONTRIBUTORS.map((c) => c.contribute(input));
+  const additive = (input.served ?? []).filter((c) => inProcessContributor(c.source) === null);
+  const composed = compose([...inProcess, ...additive]);
   composed.gate.readyPassed = gateState(input.playbook, input.binding.ready, input.currentSpecHash).passed;
-  composed.liveness = composeLiveness(input, composed);
+  // With nothing additive, `composed` is already the in-process answer.
+  composed.liveness = composeLiveness(input, additive.length === 0 ? composed : compose(inProcess));
   return composed;
 }

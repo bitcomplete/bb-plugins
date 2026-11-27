@@ -304,6 +304,104 @@ export const entitySnapshotSchema = z.object({
 });
 export type EntitySnapshot = z.infer<typeof entitySnapshotSchema>;
 
+// ---- per-source contributions (BB-418, BB-291 C10) --------------------------
+
+/**
+ * The wait kinds a contribution may carry. This mirrors `WAIT_KINDS` in
+ * stewards' `wait.ts`, which this file cannot import (it is copied into the
+ * source plugins); `contract.test.ts` fails when the two drift.
+ */
+export const CONTRIBUTION_WAIT_KINDS = ["pull", "review", "deployment", "worker", "binding", "date", "person", "external"] as const;
+
+/** What a contributed gate item is about. */
+export const contributionSubjectSchema = z.object({
+  kind: z.enum(["pull", "artifact", "step", "entity"]),
+  id: z.string().min(1),
+});
+export type ContributionSubject = z.infer<typeof contributionSubjectSchema>;
+
+/**
+ * One gate item a source contributes. It carries its own verdict; it never
+ * carries the wrapped pull gate the core keeps for the merge surfaces
+ * (`assessed`), so a served contribution can add gate items but cannot set the
+ * ready gate or the core's per-pull merge gate. Strict: an unknown key, the
+ * wrapped `assessed` gate included, is rejected rather than silently dropped.
+ */
+export const contributionGateItemSchema = z.strictObject({
+  source: z.string().min(1),
+  subject: contributionSubjectSchema,
+  id: z.string().min(1),
+  met: z.boolean(),
+  missing: z.string().nullable(),
+  lane: z.enum(["project", "user"]),
+  escalated: z.boolean().default(false),
+  product: z.boolean().default(false),
+  inputs: z.string(),
+});
+export type ContributionGateItem = z.infer<typeof contributionGateItemSchema>;
+
+/** One wait a source contributes, the typed wait the composer folds. */
+export const contributionWaitSchema = z.strictObject({
+  source: z.string().min(1),
+  kind: z.enum(CONTRIBUTION_WAIT_KINDS),
+  ref: z.string(),
+  live: z.boolean(),
+  fingerprint: z.string().nullable(),
+  budgetMs: z.number().nullable(),
+  since: z.number().nullable(),
+  overdueMs: z.number().nullable(),
+});
+export type ContributionWait = z.infer<typeof contributionWaitSchema>;
+
+/** One resource a source contributes: something the binding owns or watches. */
+export const contributionResourceSchema = z.strictObject({
+  source: z.string().min(1),
+  id: z.string().min(1),
+  active: z.boolean(),
+  subject: contributionSubjectSchema.nullable(),
+});
+export type ContributionResource = z.infer<typeof contributionResourceSchema>;
+
+/** One hold a source contributes. */
+export const contributionHoldSchema = z.strictObject({
+  source: z.string().min(1),
+  id: z.string().min(1),
+  held: z.boolean(),
+  behind: z.array(z.string()),
+});
+export type ContributionHold = z.infer<typeof contributionHoldSchema>;
+
+/** One reason a source contributes. */
+export const contributionReasonSchema = z.strictObject({
+  source: z.string().min(1),
+  code: z.string().min(1),
+  detail: z.string().nullable(),
+  at: z.number(),
+});
+export type ContributionReason = z.infer<typeof contributionReasonSchema>;
+
+/**
+ * A source's contribution for one entity (BB-418, BB-291 C10), served beside
+ * its snapshot. It is the same shape the composer's in-process contributors
+ * return, minus the wrapped `assessed` pull gate (see `contributionGateItemSchema`).
+ *
+ * Open question 4 is settled as a named, strictly typed field: a source that
+ * omits `contribution` serves nothing and the core uses its in-process
+ * contributor for that source; a source that sends `contribution: {…}` with
+ * empty arrays serves a contribution that says nothing to contribute, and the
+ * core never falls back for it. Absent and empty are therefore distinct. The
+ * field rides `sourceSnapshot`, so it adds no store read or source call.
+ */
+export const contributionSchema = z.strictObject({
+  source: z.string().min(1),
+  gate: z.array(contributionGateItemSchema).default([]),
+  waits: z.array(contributionWaitSchema).default([]),
+  resources: z.array(contributionResourceSchema).default([]),
+  holds: z.array(contributionHoldSchema).default([]),
+  reasons: z.array(contributionReasonSchema).default([]),
+});
+export type Contribution = z.infer<typeof contributionSchema>;
+
 export const adoptableEntitySchema = z.object({
   id: z.string(),
   key: z.string(),
@@ -399,7 +497,16 @@ export const sourceContract = {
   /** One entity, by Linear key or UUID, or by GitHub "owner/repo#12". Null when it does not exist or is not visible. */
   sourceSnapshot: {
     input: z.object({ id: z.string().min(1).max(300) }),
-    output: z.object({ snapshot: entitySnapshotSchema.nullable() }),
+    output: z.object({
+      snapshot: entitySnapshotSchema.nullable(),
+      /**
+       * BB-418 (BB-291 C10): what the source contributes for this entity. Omitted
+       * means the core uses its in-process contributor for the source; present
+       * (even with empty arrays) means the source serves and the core never
+       * falls back. Additive: a source that does not serve it still parses.
+       */
+      contribution: contributionSchema.optional(),
+    }),
   },
   /**
    * Whether a project's configuration makes sense to this source: each unit

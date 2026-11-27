@@ -12,14 +12,14 @@
 // over the same rows and returns every place the old answer and the assessment
 // disagree, so the divergence log can be read for several days before any
 // consumer reads the assessment.
-import { composeAssessment, pullGate, type ComposedAssessment } from "./contribution.js";
+import { composeAssessment, contributionText, inProcessContributor, pullGate, type ComposedAssessment } from "./contribution.js";
 import { latestReviewMarker, type PrGate, type ProjectApprovalRecord } from "./gate.js";
 import { parsePullRef } from "./github.js";
 import { gateState } from "./ready-gate.js";
 import { CONTRIBUTED_REASON_CODES, isNonActionCode } from "./non-actions.js";
 import { anyWorkerInFlight, productGateOptions, runningWorkerReason, stuckDue } from "./reconcile.js";
 import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
-import type { EntitySnapshot } from "./source-contract.js";
+import type { Contribution, EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Worker } from "./store.js";
 import type { Wait, WaitKind } from "./wait.js";
 
@@ -170,6 +170,14 @@ export type AssessmentInput = {
   waitBudgets?: Partial<Record<WaitBudgetKind, number | null>>;
   /** The spec hash the ready gate compares its approval against. */
   currentSpecHash: string;
+  /**
+   * BB-418 (BB-291 C10): the contributions a source served beside its snapshot,
+   * already validated against `source-contract.ts`. A source present here is
+   * composed from this list and never falls back to its in-process contributor;
+   * a source absent here uses its in-process contributor. Omitted reads as no
+   * served contribution, exactly as today.
+   */
+  served?: readonly Contribution[];
   now: number;
 };
 
@@ -467,11 +475,18 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
   // retired the `compose.gate` comparison: the gate now comes from the composed
   // answer, so it cannot diverge.
   if (composed !== undefined) {
+    // BB-418 (BB-291 C10): the existing `compose.*` surfaces compare the
+    // in-process answer against the rows. A contribution served for a source
+    // with no in-process contributor is new and not derivable from those rows,
+    // so it is left to `compose.served` below; a served contribution for a
+    // built-in source is never folded, so it is not in `composed` either. The
+    // in-process-only composition is the same object when nothing is served.
+    const core = input.served === undefined || input.served.length === 0 ? composed : composeAssessment({ ...input, served: undefined });
     // The typed wait the assessment derived, against the composed item. A
     // binding has at most one stored typed wait, so the match is by kind and ref.
-    const composedWait = composed.waits.find((w) => w.kind === (assessment.wait?.kind ?? "") && w.ref === (assessment.wait?.ref ?? "")) ?? null;
+    const composedWait = core.waits.find((w) => w.kind === (assessment.wait?.kind ?? "") && w.ref === (assessment.wait?.ref ?? "")) ?? null;
     if (assessment.wait === null) {
-      if (composed.waits.length > 0) add("compose.waits", "none", composed.waits.map((w) => `${w.kind} ${w.ref}`).join(","), { binding: binding.id });
+      if (core.waits.length > 0) add("compose.waits", "none", core.waits.map((w) => `${w.kind} ${w.ref}`).join(","), { binding: binding.id });
     } else if (composedWait === null) {
       add("compose.waits", `${assessment.wait.kind} ${assessment.wait.ref}`, "none", { binding: binding.id });
     } else {
@@ -496,7 +511,7 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
       `merge-behind:${mergeBehind.length > 0}`,
       `ready-gate:${binding.stage === "spec" && !readyPassed}`,
     ].join(",");
-    const composedHolds = composed.holds.map((h) => `${h.id}:${h.held}`).join(",");
+    const composedHolds = core.holds.map((h) => `${h.id}:${h.held}`).join(",");
     if (assessedHolds !== composedHolds) {
       add("compose.holds", assessedHolds, composedHolds, {
         binding: binding.id,
@@ -535,13 +550,13 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     assessedResources.push(`parked-workers:${workers.some((w) => w.status === "finished" && w.parkedWaitingOn !== null)}`);
     assessedResources.push(`escalations:${input.escalations.length > 0}`);
     assessedResources.push(`needs:${input.needs.length > 0}`);
-    const composedResources = composed.resources.map((r) => `${r.id}:${r.active}`);
+    const composedResources = core.resources.map((r) => `${r.id}:${r.active}`);
     assessedResources.sort();
     composedResources.sort();
     if (assessedResources.join(",") !== composedResources.join(",")) {
       add("compose.resources", assessedResources.join(","), composedResources.join(","), {
         binding: binding.id,
-        resources: composed.resources.length,
+        resources: core.resources.length,
         workers: workers.length,
         deployments: Object.keys(binding.deployments).length,
         linkedPulls: leasedLinkedPullKeys(input).length,
@@ -574,7 +589,7 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
       // otherwise read as `""` against `deferred` on most looks.
       const composedReasons = [
         ...new Set(
-          composed.reasons
+          core.reasons
             .filter((r) => r.code !== "deferred" || (!declined.has("nothing-to-do") && !declined.has("worker-busy")))
             .map((r) => r.code),
         ),
@@ -586,6 +601,22 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
           composed: composedReasons.length,
         });
       }
+    }
+
+    // BB-418 (BB-291 C10): the contribution a source served over the source
+    // contract, against what the in-process contributor would have said. A
+    // source with an in-process contributor is shadowed here and never folded
+    // by `composeAssessment`, so it cannot set or remove the core's items; a
+    // source with no in-process contributor has nothing to compare and folds
+    // additively instead. There is no live source serving in production, so
+    // this surface is empty there. Both sides are canonical text, so
+    // contributor order is not a difference.
+    for (const served of input.served ?? []) {
+      const inProcess = inProcessContributor(served.source);
+      if (inProcess === null) continue;
+      const expected = contributionText(inProcess.contribute(input));
+      const actual = contributionText(served);
+      if (expected !== actual) add("compose.served", expected, actual, { binding: binding.id, source: served.source });
     }
   }
   return out;

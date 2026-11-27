@@ -102,7 +102,7 @@ import {
 import { decideForPull, explainDecision, formatDecisionListing, globMatches, type BigDecision } from "./decisions.js";
 import { ADOPTION_WHY, adoptionNeedLine, approveSpecNeedParts, forwardedQuestionParts, forwardWhy, lessonDecideParts, mergeNeedParts, mergeWorkaroundParts, mixedEvidenceDecideParts, playbookRefreshQuestionParts, repeatedObjectionQuestionParts } from "./need-parts.js";
 import { ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, assess, assessWorker, compare, ownPullEntities, waitOverdueMs, type Assessment, type AssessmentInput } from "./assessment.js";
-import { composeAssessment, type ComposedAssessment, type HoldContribution, type ResourceContribution } from "./contribution.js";
+import { acceptServedContribution, composeAssessment, type ComposedAssessment, type HoldContribution, type ResourceContribution } from "./contribution.js";
 import { bindingHeld, schedulingHolds } from "./holds.js";
 import { nonActionsSchema, sortedNonActions, type NonActionCode } from "./non-actions.js";
 import { ASK_ON_SLACK_CHOICE, NOT_ON_SLACK_CHOICE, SLACK_PLUGIN_ID, slackCanSend, slackCandidateLabel, slackNameCandidates, slackPersonKey, slackPersonLabel, slackPersonNotOnSlack, waitSlackAskOnceWhat, waitSlackInstruction, waitSlackTerminalWhat, type SlackCandidate, type SlackPerson, type SlackStatus, type WaitSlackContext } from "./wait-slack.js";
@@ -133,6 +133,7 @@ import {
   stewardsContract,
   workflowRunSchema,
   type BacklogIssue,
+  type Contribution,
   type DependabotAlert,
   type DependabotSeverity,
   type Deployment,
@@ -3741,9 +3742,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- the sources ---------------------------------------------------------------------
 
-    async function snapshot(source: Source, id: string): Promise<EntitySnapshot | null> {
+    /**
+     * The entity snapshot and, when the source serves one (BB-418, BB-291 C10),
+     * its contribution. The contribution rides the same `sourceSnapshot` call,
+     * so it adds no store read or source call; a source that omits it reads as
+     * null.
+     */
+    async function snapshotWithContribution(source: Source, id: string): Promise<{ entity: EntitySnapshot | null; contribution: Contribution | null }> {
       const out = await sourceRpc(source, "sourceSnapshot", { id }, sourceContract.sourceSnapshot.output);
-      return out.snapshot === null ? null : entitySnapshotSchema.parse(out.snapshot);
+      // A source may serve its own built-in contribution or one for a source
+      // with no in-process contributor, never another built-in source's.
+      const raw = out.contribution ?? null;
+      const contribution = raw === null ? null : acceptServedContribution(source, raw);
+      if (raw !== null && contribution === null) bb.log.warn(`stewards: ${source} served a contribution for ${id} that names another source; ignored`);
+      return { entity: out.snapshot === null ? null : entitySnapshotSchema.parse(out.snapshot), contribution };
+    }
+
+    async function snapshot(source: Source, id: string): Promise<EntitySnapshot | null> {
+      return (await snapshotWithContribution(source, id)).entity;
     }
 
     /**
@@ -3899,10 +3915,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function freshObserved(b: Binding): Promise<{ observed: Observed; complete: boolean } | null> {
       if (b.lastSnapshot === null) return null;
       if (b.source === "ops") return { observed: b.lastSnapshot, complete: true };
-      const fresh = await snapshot(b.source, b.entityId).catch(() => null);
-      if (fresh === null) return { observed: b.lastSnapshot, complete: false };
-      const entity = keepRelations(b.lastSnapshot?.entity ?? null, fresh);
-      if (b.kind !== "ticket") return { observed: { entity, pulls: [], at: now() }, complete: true };
+      const read = await snapshotWithContribution(b.source, b.entityId).catch(() => null);
+      if (read === null || read.entity === null) return { observed: b.lastSnapshot, complete: false };
+      const entity = keepRelations(b.lastSnapshot?.entity ?? null, read.entity);
+      // BB-418 (BB-291 C10): carry a served contribution on the fresh observation
+      // too, so every path that rebuilds the assessment sees the same one.
+      const served = read.contribution === null ? {} : { served: [read.contribution] };
+      if (b.kind !== "ticket") return { observed: { entity, pulls: [], at: now(), ...served }, complete: true };
       const keys = linkedPullKeys(entity);
       const pulls = await linkedPulls(entity, b.lastSnapshot);
       let complete = pulls.length >= keys.length;
@@ -3922,7 +3941,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           bb.log.warn(`stewards: could not read ${h.pullKey}, handed to ${b.entityKey}: ${errorMessage(error)}`);
         }
       }
-      return { observed: { entity, pulls, at: now() }, complete };
+      return { observed: { entity, pulls, at: now(), ...served }, complete };
     }
 
     /**
@@ -5619,6 +5638,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         waitBudgets: config.file.waitBudgets,
         playbook,
         currentSpecHash,
+        // BB-418 (BB-291 C10): the contributions the source served beside the
+        // entity's snapshot, persisted on the observation so the report path
+        // derives the same assessment the reconcile stored, with no re-read.
+        served: observed.served,
         now: now(),
         waitedPulls,
         hasOpenBinding: (key) => {
@@ -5787,8 +5810,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       let entity: EntitySnapshot | null;
+      // BB-418 (BB-291 C10): the source's contribution for this entity, read
+      // from the same `sourceSnapshot` output. No live source serves one yet, so
+      // this is null in production; a source that serves it composes in place of
+      // its in-process contributor.
+      let served: Contribution | null = null;
       try {
-        entity = await snapshot(b.source, b.entityId);
+        const read = await snapshotWithContribution(b.source, b.entityId);
+        entity = read.entity;
+        served = read.contribution;
       } catch (error) {
         bb.log.warn(`stewards: could not read ${b.entityKey}: ${errorMessage(error)}`);
         decline(b, "entity-unreadable");
@@ -5815,7 +5845,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         }
       }
-      const observed: Observed = { entity, pulls: linked, at: now() };
+      // BB-418 (BB-291 C10): carry the source's contribution on the observation
+      // the look writes, so the report path derives the same assessment.
+      const observed: Observed = { entity, pulls: linked, at: now(), ...(served === null ? {} : { served: [served] }) };
       const prev = b.lastSnapshot;
 
       // BB-53: a merged pull request whose playbook names a deployment target
