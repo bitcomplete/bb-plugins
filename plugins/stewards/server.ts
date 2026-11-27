@@ -6897,7 +6897,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // `bindingWakeSources` is the same live-source read the retired column
       // used, so the ops cost is unchanged.
       const opsLive = rowLiveSource(bindingWakeSources(b, new Set()));
-      store.recordAssessment({ bindingId: b.id, at: now(), gate: {}, worker: {}, liveness: { stalled: observedStall(b, opsLive, now()), live: opsLive }, resources: [], holds: [] });
+      // The holds are the binding's own scheduling holds, so `bb stewards show`
+      // agrees with its `[HOLD: …]` flag; resources stay empty (no composed
+      // answer exists for an ops binding).
+      store.recordAssessment({ bindingId: b.id, at: now(), gate: {}, worker: {}, liveness: { stalled: observedStall(b, opsLive, now()), live: opsLive }, resources: [], holds: schedulingHolds(b, now()) });
       if (target.kind === "dependabot") {
         await reconcileDeps(b, config, playbook, target, force);
         return;

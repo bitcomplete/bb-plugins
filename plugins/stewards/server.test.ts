@@ -11197,6 +11197,11 @@ describe("ops stewards", () => {
     t.hooks.store.escalate({ bindingId: id, kind: "decision", question: "Which model?", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1" });
     await t.hooks.reconcilePass("p1");
     expect(derivedStalled(t.hooks.store.find(TARGET)!, t.now())).toBe(false);
+    // The ops assessment stores the binding's scheduling holds, so `bb stewards
+    // show` agrees with its `[HOLD: …]` flag.
+    t.hooks.store.patch(id, { hold: "behind ENG-9" });
+    await t.hooks.reconcilePass("p1");
+    expect((await t.harness.behavior.runCli(["show", TARGET, "--project", "p1"])).stdout).toContain("Composed holds: hold");
   });
 
   it("watches a configured target, files one ticket for a crash loop, and comments on it while it keeps crashing", async () => {
