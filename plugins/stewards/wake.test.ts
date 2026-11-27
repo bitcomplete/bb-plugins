@@ -143,21 +143,21 @@ describe("a steward's wake", () => {
 
   // BB-154: a binding marked waiting with no wake source carries one paragraph
   // naming what the plugin does not track and what the steward can do.
-  it("carries the no-wake-source paragraph only while marked", () => {
+  it("carries the no-wake-source paragraph while the rows derive a stall", () => {
     const { s, bind } = world();
     const binding = bind("ENG-12");
     const status = { phase: "In Progress", summary: "Waiting on the vendor.", nextAction: "the vendor", actor: "other" as const, waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T };
     s.patch(binding.id, { status });
-    const marked = formatWake(wakeInput({ binding: s.binding(binding.id)! }));
-    expect(marked).not.toContain("**Waiting with no wake source.**");
-
-    s.patch(binding.id, { noWakeSource: true });
     const wake = formatWake(wakeInput({ binding: s.binding(binding.id)! }));
     expect(wake).toContain("**Waiting with no wake source.**");
     expect(wake).toContain("Nothing the plugin tracks will deliver this wait");
     expect(wake).toContain('"the vendor\'s reply"');
     expect(wake).toContain("a binding to hold behind, a pull request, a deployment target, a worker");
     expect(wake).toContain("the condition is your own to re-examine");
+
+    // No free-text wait means nothing is stalled, so no paragraph.
+    s.patch(binding.id, { status: null });
+    expect(formatWake(wakeInput({ binding: s.binding(binding.id)! }))).not.toContain("**Waiting with no wake source.**");
   });
 
   // BB-194: a failed watch is settled and will not wake the steward, so the
@@ -188,7 +188,7 @@ describe("a steward's wake", () => {
     });
     s.patch(binding.id, {
       deployments: { "acme/web#7": watch("acme/web#7", "failed"), "acme/web#8": watch("acme/web#8", "failed"), "acme/web#9": watch("acme/web#9", "merged") },
-      noWakeSource: true,
+      status: { phase: "In Progress", summary: "Waiting.", nextAction: "the vendor", actor: "other", waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T },
     });
     const wake = formatWake(wakeInput({ binding: s.binding(binding.id)! }));
     expect(wake).toContain("The failed deployment watches for acme/web#7, acme/web#8 are settled and will not wake you on their own");
@@ -324,7 +324,7 @@ describe("the nightly prompt", () => {
         { escalation: approval, from: moved },
       ],
       stuck: [{ escalation: stuck, from: held }],
-      noWakeSource: [],
+      stalled: [],
       stall: [],
       held: [held],
     };
@@ -430,7 +430,7 @@ describe("the nightly prompt", () => {
     expect(wake).toContain(`steward_update { lessonAction: { id: "${trial.id}", action: "complete" } }`);
     // The digest is built from the records, which never carry trial lessons,
     // so a trial rule cannot be listed as an owner priority (BB-288).
-    const records: DigestRecords = { previous: null, since: T, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [] };
+    const records: DigestRecords = { previous: null, since: T, moved: [], ended: [], answered: [], withUser: [], stuck: [], stalled: [], stall: [], held: [] };
     const digest = formatRecords(records, []).join("\n");
     expect(digest).not.toContain(trial.id);
     expect(digest).not.toContain("Auth is the plugin's.");
@@ -550,7 +550,7 @@ describe("the nightly prompt", () => {
     const { s } = world();
     const q = s.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });
     const questions = [{ question: q, about: null }];
-    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [] };
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], stalled: [], stall: [], held: [] };
     const wake = (timeZone?: string) => formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions, records, ...(timeZone === undefined ? {} : { timeZone }) });
     // 05:00Z on the 18th is still the evening of the 17th in Los Angeles.
     expect(wake("America/Los_Angeles")).toContain(`- ${q.id} (asked 2026-10-17): Freeze on Friday?`);
@@ -559,7 +559,7 @@ describe("the nightly prompt", () => {
   });
 
   it("says so when there is nothing, and leaves the record out of a wake that wants no digest", () => {
-    const empty: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [] };
+    const empty: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], stalled: [], stall: [], held: [] };
     const nightly = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions: [], records: empty });
     expect(nightly).toMatch(/### Your previous digest\n\nNone yet\./u);
     expect(nightly).toMatch(/### What moved\n\nNothing moved\./u);
@@ -576,13 +576,12 @@ describe("the nightly prompt", () => {
     const { s, bind } = world();
     const marked = bind("ENG-12");
     s.patch(marked.id, {
-      noWakeSource: true,
       requeueWakeCount: 2,
       status: { phase: "In Progress", summary: "Waiting.", nextAction: "the vendor", actor: "other", waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T },
     });
     const stall = s.escalate({ bindingId: marked.id, kind: "stall", question: "ENG-12 has woken by requeue 2 times with the same wait.", meanwhile: "Waiting.", route: "project", recommendation: null });
     const current = s.binding(marked.id)!;
-    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [current], stall: [{ escalation: stall, from: current }], held: [] };
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], stalled: [current], stall: [{ escalation: stall, from: current }], held: [] };
     const wake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions: [], records });
     expect(wake).toContain("### Waiting with no wake source");
     expect(wake).toContain("- ENG-12 (ticket, In Progress): waiting with no wake source: the vendor's reply (2 requeue-only wakes)");
@@ -599,7 +598,7 @@ describe("the nightly prompt", () => {
       status: { phase: "In Progress", summary: "Waiting.", nextAction: "the vendor", actor: "other", waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T },
     });
     const current = s.binding(dated.id)!;
-    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], datedWaits: [current], held: [] };
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], stalled: [], stall: [], datedWaits: [current], held: [] };
     const digest = formatRecords(records, []).join("\n");
     expect(digest).toContain("### Dated waits");
     expect(digest).toContain("- ENG-12 (ticket, In Progress): waiting on the vendor's reply until 2026-12-01");
@@ -749,10 +748,10 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
     lastCommentedAt: null,
     ...over,
   });
-  const opsWake = (finding: OpsFinding) =>
+  const opsWake = (finding: OpsFinding, b = binding("k8s-namespace/web-production")) =>
     formatOpsWake({
       reason: "changed",
-      binding: binding("k8s-namespace/web-production"),
+      binding: b,
       playbook: parsedPlaybook(OPS_WATCH, "ops-watch"),
       look: { at, target: "k8s-namespace/web-production", error: null, pods: 1, healthy: 0, deployments: [], warnings: [], logs: "unneeded", notes: [], findings: [finding] },
       target: { target: "ENG", source: "linear" },
@@ -809,6 +808,13 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
   it("shows the class, the ticket and the assignee for every class, in both formatters", () => {
     expect(opsWake(opsFinding())).toMatch(/New \(no ticket found\)/u);
     expect(opsWake(opsFinding())).toMatch(/Assignee: Jane/u);
+    // BB-414: the ops no-wake-source paragraph is the derived stall, so a live
+    // source (the reconcile's stored liveness) suppresses it.
+    const waitStatus = { phase: "watching", summary: "Waiting.", nextAction: "the vendor", actor: "other" as const, waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at };
+    const stalled = { ...binding("k8s-namespace/web-production"), status: waitStatus, assessedLiveness: { stalled: true, live: false } };
+    const live = { ...binding("k8s-namespace/web-production"), status: waitStatus, assessedLiveness: { stalled: false, live: true } };
+    expect(opsWake(opsFinding(), stalled)).toContain("**Waiting with no wake source.**");
+    expect(opsWake(opsFinding(), live)).not.toContain("**Waiting with no wake source.**");
     const recurring = opsWake(opsFinding({ class: "recurring", ticket: "ENG-50", ticketState: "In Progress" }));
     expect(recurring).toMatch(/Recurring on ENG-50 \(open\)/u);
     expect(recurring).toMatch(/ticket ENG-50 \(In Progress\)/u);
@@ -1052,7 +1058,7 @@ describe("initiative progress (BB-243)", () => {
   it("rides on the project steward's binding list and digest lines", () => {
     const { s, bind } = world();
     const b = s.patch(bind("ENG-12").id, { status: status("Driving the initiative."), advancedAt: T - 3_600_000, lastSnapshot: { entity: initiative({ comments: [met("Scope memo approved (owner)"), met("Claim filed (owner)")] }), pulls: [] } });
-    const records: DigestRecords = { previous: null, since: T - DAY, moved: [b], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [b], stall: [], held: [b] };
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [b], ended: [], answered: [], withUser: [], stuck: [], stalled: [b], stall: [], held: [b] };
     const wake = formatProjectWake({ reason: "nightly", bindings: [{ binding: b, openEscalations: [] }], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions: [], records });
     expect(wake).toContain("- ENG-12 (ticket, In Progress): Driving the initiative. Next: Open the PR (steward) [criteria 2/3]");
     expect(wake).toMatch(/- ENG-12 \(ticket, In Progress\), moved .*\[criteria 2\/3\]/u);
@@ -1151,7 +1157,7 @@ describe("initiative idle (BB-406)", () => {
 
   it("renders the idle line in the digest's stuck-or-held section", () => {
     const b = idle({ idleInitiativeSince: T - 5 * 3_600_000 }, { comments: [met("Scope memo approved (owner)")] });
-    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [], idle: [b] };
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], stalled: [], stall: [], held: [], idle: [b] };
     const text = formatRecords(records, [], "UTC", T).join("\n");
     expect(text).toContain("ENG-12: idle 5h — 2 unmet criteria");
     // With no idle initiative the section is exactly as before.
@@ -1180,7 +1186,7 @@ describe("recorded assumptions (BB-251)", () => {
     const wake = formatProjectWake({ reason: "nightly", bindings: [{ binding, openEscalations: [] }], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], assumptions: rows });
     expect(wake).toContain("## Assumptions (open)");
     expect(wake).toContain("Assuming: SSO is out of scope");
-    const records: DigestRecords = { previous: null, since: T, moved: [], ended: [], answered: [], withUser: [], stuck: [], noWakeSource: [], stall: [], held: [], assumptions: rows };
+    const records: DigestRecords = { previous: null, since: T, moved: [], ended: [], answered: [], withUser: [], stuck: [], stalled: [], stall: [], held: [], assumptions: rows };
     const digest = formatRecords(records, []).join("\n");
     expect(digest).toContain("### Assumptions (open)");
     expect(digest).toContain("Assuming: SSO is out of scope");

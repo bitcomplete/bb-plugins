@@ -4,8 +4,8 @@
 // self / unvalidatable downgrade to `external`.
 //
 // It derives nothing: PR 1 only validates, stores and renders the wait. The
-// liveness, idle and stall derivation from the kind is PR 2, in the assessment
-// module beside `noWakeSource`.
+// liveness, idle and stall derivation from the kind is PR 2, in the composer
+// (`composeLiveness`) and read through `derivedStalled`.
 import { z } from "zod";
 import { parsePullRef } from "./github.js";
 import { parseUntil } from "./wake-source.js";

@@ -39,7 +39,7 @@ export interface SidebarBinding {
   /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
   overdueMs: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
-  noWakeSource: boolean;
+  stalled: boolean;
   /** BB-392: the binding's only unmet gate piece is the reviewer round, so the row names it. Optional so a client built from the previous image still validates. */
   reviewerRoundMissing?: boolean;
   /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. Optional so a client built from the previous image still validates. */
@@ -153,7 +153,7 @@ export interface SidebarEffort {
   /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
   overdueMs: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
-  noWakeSource: boolean;
+  stalled: boolean;
   /** BB-392: the binding's only unmet gate piece is the reviewer round, so the row names it. */
   reviewerRoundMissing?: boolean;
   /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. */
@@ -299,7 +299,7 @@ export interface EffortStatus {
   /** BB-351: the wait's age in ms when `overdue`, for `, overdue <duration>`; null otherwise. */
   overdueMs?: number | null;
   /** Waiting with nothing the plugin tracks to wake it (BB-154). */
-  noWakeSource?: boolean;
+  stalled?: boolean;
   /** BB-392: the binding's only unmet gate piece is the reviewer round, so the row names it. */
   reviewerRoundMissing?: boolean;
   /** BB-406: when an initiative was first seen idle, or null; the row shows `idle <duration>`. */
@@ -328,7 +328,7 @@ const wakeFailed = (e: EffortStatus): boolean => e.wakeFailure !== null && e.wak
  */
 export function effortState(e: EffortStatus): SidebarEffortState {
   if (e.needsUser) return "you";
-  if (e.stuck || wakeFailed(e) || e.noWakeSource === true || e.overdue === true) return "blocked";
+  if (e.stuck || wakeFailed(e) || e.stalled === true || e.overdue === true) return "blocked";
   if (isRunning(e)) return "running";
   return "quiet";
 }
@@ -345,7 +345,7 @@ function isWaitingEffort(e: EffortStatus, now: number): boolean {
   if (waitingOnNamesFinishedWorker(e.waitingOn ?? null, e.workers ?? [], e.wait)) return false;
   if (e.hold !== null) return true;
   if (e.delegateWait !== null && e.delegateWait !== undefined && e.delegateWait !== "") return true;
-  if (e.wait !== null && e.wait !== undefined && e.noWakeSource !== true) return true;
+  if (e.wait !== null && e.wait !== undefined && e.stalled !== true) return true;
   if (e.waitingUntil !== null && e.waitingUntil !== undefined && e.waitingUntil > now) return true;
   return e.statusActor === "other" && e.statusNextAction !== null && e.statusNextAction !== undefined && e.statusNextAction.trim() !== "";
 }
@@ -511,7 +511,7 @@ function baseEffortPhrase(e: EffortStatus, now: number): string {
   // escalation and a no-wake-source wait outrank the quiet delegate-wait and
   // hold phrases.
   if (e.stuck) return "stuck";
-  if (e.noWakeSource) return "waiting, no wake source";
+  if (e.stalled) return "waiting, no wake source";
   if (e.delegateWait !== null && e.delegateWait !== undefined && e.delegateWait !== "") return `waiting on review from ${e.delegateWait}`;
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
   // A running worker or reviewer paints the blue ring, but the count is of
@@ -583,7 +583,7 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     wait: null,
     overdue: false,
     overdueMs: null,
-    noWakeSource: false,
+    stalled: false,
     reviewerRoundMissing: false,
     idleInitiativeSince: null,
     idleInitiativeUnmet: null,
@@ -811,7 +811,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       wait: b.wait,
       overdue: b.overdue,
       overdueMs: b.overdueMs,
-      noWakeSource: b.noWakeSource,
+      stalled: b.stalled,
       reviewerRoundMissing: b.reviewerRoundMissing ?? false,
       idleInitiativeSince: b.idleInitiativeSince ?? null,
       idleInitiativeUnmet: b.idleInitiativeUnmet ?? null,
@@ -916,7 +916,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       wait: null,
       overdue: false,
       overdueMs: null,
-      noWakeSource: false,
+      stalled: false,
       idleInitiativeSince: null,
       idleInitiativeUnmet: null,
       wakeFailure: null,

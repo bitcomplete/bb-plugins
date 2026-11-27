@@ -18,6 +18,7 @@ import type { BacklogIssue } from "./source-contract.js";
 import type { BacklogLook, BacklogSnapshot } from "./ops.js";
 import type { BacklogWrite } from "./backlog-triage.js";
 import type { DigestRecords } from "./wake.js";
+import { derivedStalled } from "./reconcile.js";
 import { createHash } from "node:crypto";
 import type { CheckFinding } from "./template-stamp.js";
 
@@ -105,7 +106,7 @@ export type Briefing = {
   stuck: {
     stuck: Array<{ escalation: Escalation; from: Binding }>;
     held: Binding[];
-    noWakeSource: Binding[];
+    stalled: Binding[];
     stall: Array<{ escalation: Escalation; from: Binding }>;
     datedWaits: Binding[];
     /** BB-406: idle initiatives, rendered as one `idle <duration>` line each. Optional so a briefing literal from before this field still type-checks. */
@@ -164,7 +165,8 @@ export function createBriefing(store: Store, now: () => number): (projectId: str
       stuck: {
         stuck: openWith((x) => x.kind === "stuck"),
         held: open.filter((b) => b.hold !== null),
-        noWakeSource: open.filter((b) => b.noWakeSource),
+        // BB-414: the derived stall, not the retired column.
+        stalled: open.filter((b) => derivedStalled(b, now())),
         stall: openWith((x) => x.kind === "stall"),
         // BB-247: the dated waits still ahead, listed separately from stalls.
         datedWaits: open.filter((b) => b.requeueUntil !== null && b.requeueUntil > now()),
@@ -217,7 +219,7 @@ export function toDigestRecords(briefing: Briefing): DigestRecords {
     needs: briefing.decisions.needs,
     assumptions: briefing.assumptions,
     stuck: briefing.stuck.stuck,
-    noWakeSource: briefing.stuck.noWakeSource,
+    stalled: briefing.stuck.stalled,
     stall: briefing.stuck.stall,
     datedWaits: briefing.stuck.datedWaits,
     held: briefing.stuck.held,

@@ -1051,14 +1051,29 @@ export const advanced = (before: Binding["status"], after: { phase: string; summ
 
 /**
  * BB-293: the stall the shadow assessment derives from what the plugin can
- * observe, rather than the `noWakeSource` flag stored at report time. A
- * non-empty `waitingOn` with no live tracked source and no dated wait still
- * ahead is a stall the rows show on their own; the flag is the report path's
- * copy of the same fact.
+ * observe, rather than a flag stored at report time. A non-empty `waitingOn`
+ * with no live tracked source and no dated wait still ahead is a stall the rows
+ * show on their own; the report path's stored flag was its copy of the same
+ * fact, and BB-414 retires that flag.
  */
 export function observedStall(binding: Pick<Binding, "status" | "requeueUntil">, live: boolean, now: number): boolean {
   if ((binding.status?.waitingOn ?? "").trim() === "") return false;
   if (live) return false;
   if (binding.requeueUntil !== null && binding.requeueUntil > now) return false;
   return true;
+}
+
+/**
+ * BB-414 (C4): the derived stalled value for a binding, the one helper every
+ * surface reads. A binding with a stored typed wait takes the stall the
+ * reconcile derived for it (the joined assessment's `liveness.stalled`); an ops
+ * binding (no snapshot, so no assessment) and a binding with no stored
+ * assessment keep today's free-text `observedStall` rule computed on read, with
+ * the stored assessment's composed `live` source. The retired
+ * `no_wake_source` column is never read.
+ */
+export function derivedStalled(binding: Pick<Binding, "status" | "requeueUntil" | "assessedLiveness"> & { wait?: Binding["wait"] }, now: number): boolean {
+  const stored = binding.assessedLiveness;
+  if (binding.wait != null && stored != null) return stored.stalled;
+  return observedStall(binding, stored?.live ?? false, now);
 }

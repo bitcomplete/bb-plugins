@@ -53,7 +53,6 @@ const binding = (over: Partial<AssessmentInput["binding"]> = {}): AssessmentInpu
   hold: null,
   deployments: {},
   requeueUntil: null,
-  noWakeSource: false,
   status: null,
   createdAt: 1,
   advancedAt: 1,
@@ -240,34 +239,23 @@ describe("the shadow assessment: the page refusal text (BB-292 #3)", () => {
   });
 });
 
-describe("the shadow assessment: the liveness (bb-plugins#294 and noWakeSource)", () => {
-  it("derives the stall from the rows on the bb-plugins#294 shape, agreeing with the stored flag", () => {
+describe("the shadow assessment: the liveness (bb-plugins#294 and the free-text rule)", () => {
+  it("derives the stall from the rows on the bb-plugins#294 shape", () => {
     // #294: a `pr` binding's own open pull request with a free-text wait and no
-    // other source; the derivation marks it noWakeSource, and the rows say the
-    // same thing.
+    // other source; the derivation marks it stalled.
     const entity = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" });
     const i = input({
-      binding: binding({ kind: "pr", status: status("the dompurify fix on main"), noWakeSource: true }),
+      binding: binding({ kind: "pr", status: status("the dompurify fix on main") }),
       observed: { entity, pulls: [] },
       ownPulls: own(entity),
     });
     const a = assess(i);
     expect(a.liveness.live).toBe(false);
     expect(a.liveness.stalled).toBe(true);
-    expect(a.liveness.reportedNoWakeSource).toBe(true);
-    // Agreement, so nothing is logged.
-    expect(compare(i, a).find((x) => x.surface === "noWakeSource")).toBeUndefined();
-  });
-
-  it("records a noWakeSource divergence when the stored flag and the rows disagree", () => {
-    const i = input({ binding: binding({ noWakeSource: true, status: null }) });
-    const a = assess(i);
-    expect(a.liveness.stalled).toBe(false);
-    expect(compare(i, a).find((x) => x.surface === "noWakeSource")).toMatchObject({ old: "no-wake-source", new: "source-or-no-wait" });
   });
 
   it("does not call a dated wait a stall", () => {
-    const i = input({ binding: binding({ status: status("the vendor's reply"), requeueUntil: 2_000_000, noWakeSource: false }) });
+    const i = input({ binding: binding({ status: status("the vendor's reply"), requeueUntil: 2_000_000 }) });
     const a = assess(i);
     expect(a.liveness.stalled).toBe(false);
   });
@@ -473,10 +461,10 @@ describe("the shadow assessment: the typed wait (BB-333)", () => {
   });
 
   it("keeps the free-text rule exactly for a report with no typed wait", () => {
-    const stalled = assess(input({ binding: binding({ status: status("the vendor"), noWakeSource: false }) }));
+    const stalled = assess(input({ binding: binding({ status: status("the vendor") }) }));
     expect(stalled.liveness.waitLive).toBeNull();
     expect(stalled.liveness.stalled).toBe(true);
-    const dated = assess(input({ binding: binding({ status: status("the vendor"), requeueUntil: 2_000_000, noWakeSource: false }) }));
+    const dated = assess(input({ binding: binding({ status: status("the vendor"), requeueUntil: 2_000_000 }) }));
     expect(dated.liveness.stalled).toBe(false);
   });
 
@@ -622,91 +610,24 @@ describe("the typed-wait divergence store (BB-333)", () => {
     for (const sql of MIGRATIONS) db.exec(sql);
     let now = 1_000;
     const s = createStore(db, () => now);
-    return { s, advance: (ms: number) => (now += ms) };
+    // BB-414 removed the state table's writer with the retired column, so the
+    // test seeds the frozen history directly.
+    const seed = (bindingId: string, derived: boolean, reported: boolean, at: number): void => {
+      db.prepare("INSERT INTO wait_divergence_state (binding_id, derived, reported, at) VALUES (?, ?, ?, ?) ON CONFLICT (binding_id) DO UPDATE SET derived = excluded.derived, reported = excluded.reported, at = excluded.at").run(bindingId, derived ? 1 : 0, reported ? 1 : 0, at);
+    };
+    return { s, seed, advance: (ms: number) => (now += ms) };
   }
 
-  it("writes a noWakeSource row only when the disagreement starts", () => {
-    const { s } = store();
-    // The first observation disagrees: a start row.
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 1_000)).toBe(true);
-    // The same disagreement again: no new row, but the open row is kept fresh.
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 2_000)).toBe(false);
-    let rows = s.divergences({ bindingId: "b1" });
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ old: "source-or-no-wait", new: "no-wake-source", firstSeenAt: 1_000, lastSeenAt: 2_000, count: 1 });
-    expect(rows[0]!.inputs).toMatchObject({ transition: "ongoing" });
-    // It stops disagreeing: noted on the same row, never a row of its own.
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 3_000)).toBe(false);
-    rows = s.divergences({ bindingId: "b1" });
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.inputs).toMatchObject({ transition: "stop" });
-    // It starts again: the same (old, new) row bumps its count rather than adding a row.
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 4_000)).toBe(true);
-    rows = s.divergences({ bindingId: "b1" });
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.count).toBe(2);
-    // The surface filter still reads it as `noWakeSource`.
-    expect(s.divergences({ surface: "noWakeSource" })).toHaveLength(1);
-    // A first observation that agrees is a baseline, not a transition.
-    expect(s.recordWaitDivergence({ bindingId: "b2", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 5_000)).toBe(false);
-    expect(s.divergences({ bindingId: "b2" })).toHaveLength(0);
-  });
-
-  it("keeps a stopped row's own wait kind and liveness, only flipping its transition", () => {
-    const { s } = store();
-    // A worker disagreement: the worker was between turns, so the typed
-    // derivation stalled while the stored flag said live.
-    s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "worker", waitLive: false, inputs: { hasWait: false } }, 1_000);
-    // It stops disagreeing while the current fields say the worker is running
-    // (waitLive true). The stopped row must keep the disagreement's own
-    // `waitKind`/`waitLive`, never the current ones, or it reads as a live
-    // worker stalling.
-    s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: "worker", waitLive: true, inputs: { hasWait: true } }, 2_000);
-    const rows = s.divergences({ bindingId: "b1" });
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.inputs).toMatchObject({ waitKind: "worker", waitLive: false, hasWait: false, transition: "stop" });
-  });
-
-  it("keeps the two directions' rows apart and treats a flip as a stop plus a start", () => {
-    const { s } = store();
-    // start A, stop A, start B, ongoing B.
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 1_000)).toBe(true);
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 2_000)).toBe(false);
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 3_000)).toBe(true);
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 4_000)).toBe(false);
-    let rows = s.divergences({ bindingId: "b1" });
-    expect(rows).toHaveLength(2);
-    const a = rows.find((r) => r.new === "no-wake-source")!;
-    const b = rows.find((r) => r.old === "no-wake-source")!;
-    // The stop touched A, and ongoing B did not touch A again.
-    expect(a.inputs).toMatchObject({ transition: "stop" });
-    expect(a.lastSeenAt).toBe(2_000);
-    expect(b.inputs).toMatchObject({ transition: "ongoing" });
-    expect(b.lastSeenAt).toBe(4_000);
-    // A flip B → A is a stop on B plus a start on A (bumping A's count).
-    expect(s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 5_000)).toBe(true);
-    rows = s.divergences({ bindingId: "b1" });
-    expect(rows).toHaveLength(2);
-    expect(rows.find((r) => r.new === "no-wake-source")!.count).toBe(2);
-    expect(rows.find((r) => r.old === "no-wake-source")!.inputs).toMatchObject({ transition: "stop" });
-  });
-
-  it("reads the state table for the wait-divergences command, joining the log", () => {
-    const { s } = store();
-    // A start, then a flip to the other direction: the state points at the
-    // second row, so the reader must prefer the active direction, not the
-    // newest row by time (both were touched at the flip).
-    s.recordWaitDivergence({ bindingId: "b1", derived: true, reported: false, waitKind: "external", waitLive: false, inputs: {} }, 1_000);
-    s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 2_000);
-    // A first observation that agrees: a state row with no divergence row.
-    s.recordWaitDivergence({ bindingId: "b2", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 3_000);
+  it("reads the frozen state table for the wait-divergences command", () => {
+    const { s, seed } = store();
+    seed("b1", true, false, 1_000);
+    seed("b2", false, false, 3_000);
     const rows = s.waitDivergences();
     expect(rows).toHaveLength(2);
-    expect(rows.find((r) => r.bindingId === "b1")).toEqual({ bindingId: "b1", derived: false, reported: true, kind: "pull", firstSeenAt: 2_000, lastSeenAt: 2_000, count: 1, at: 2_000 });
-    expect(rows.find((r) => r.bindingId === "b2")).toEqual({ bindingId: "b2", derived: false, reported: false, kind: null, firstSeenAt: null, lastSeenAt: null, count: 0, at: 3_000 });
-    // A stopped divergence keeps its most recent row for the seen window, and
-    // that row keeps the wait kind it disagreed about, not the current one.
-    s.recordWaitDivergence({ bindingId: "b1", derived: false, reported: false, waitKind: null, waitLive: false, inputs: {} }, 4_000);
-    expect(s.waitDivergences({ bindingId: "b1" })).toEqual([{ bindingId: "b1", derived: false, reported: false, kind: "pull", firstSeenAt: 2_000, lastSeenAt: 4_000, count: 1, at: 4_000 }]);
+    expect(rows.find((r) => r.bindingId === "b1")).toEqual({ bindingId: "b1", derived: true, reported: false, at: 1_000 });
+    expect(rows.find((r) => r.bindingId === "b2")).toEqual({ bindingId: "b2", derived: false, reported: false, at: 3_000 });
+    // A later state is the table's last word; the reader has no log to join.
+    seed("b1", false, false, 4_000);
+    expect(s.waitDivergences({ bindingId: "b1" })).toEqual([{ bindingId: "b1", derived: false, reported: false, at: 4_000 }]);
   });
 });

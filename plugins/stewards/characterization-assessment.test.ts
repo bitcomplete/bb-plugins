@@ -51,7 +51,6 @@ const binding = (over: Partial<AssessmentInput["binding"]> = {}): AssessmentInpu
   hold: null,
   deployments: {},
   requeueUntil: null,
-  noWakeSource: false,
   status: null,
   createdAt: 1,
   advancedAt: 1,
@@ -174,7 +173,7 @@ function expectedAssessment(entityKey: string): Assessment {
     // BB-413 (C7): the parked worker is the composed `parked-workers`
     // resource, so `live` is true, exactly as the report path's row source read it in
     // production (the old fixture's `sources` omitted the parked worker).
-    liveness: { live: true, waitLive: null, waited: null, idleBase: false, idle: false, stuck: false, stalled: false, reportedNoWakeSource: false, overdue: false, overdueMs: null },
+    liveness: { live: true, waitLive: null, waited: null, idleBase: false, idle: false, stuck: false, stalled: false, overdue: false, overdueMs: null },
     wait: null,
   };
 }
@@ -212,7 +211,7 @@ describe("the full Assessment across binding kinds and stages", () => {
 
   it("pins the liveness flags on the matrix fixture: no tracked source, no typed wait, no stall", () => {
     const a = assess(matrix("ticket", "build"));
-    expect(a.liveness).toEqual({ live: true, waitLive: null, waited: null, idleBase: false, idle: false, stuck: false, stalled: false, reportedNoWakeSource: false, overdue: false, overdueMs: null });
+    expect(a.liveness).toEqual({ live: true, waitLive: null, waited: null, idleBase: false, idle: false, stuck: false, stalled: false, overdue: false, overdueMs: null });
     // `stuck` is the phase backstop: Todo has no limit, and In Progress / In
     // Review are days away from `advancedAt`.
     expect(a.liveness.stuck).toBe(false);
@@ -298,14 +297,13 @@ describe("the full Assessment: the stored typed wait and the stall it derives", 
 describe("the compare surface list (BB-292)", () => {
   const surfaceNames = (i: AssessmentInput): string[] => compare(i, assess(i)).map((d) => d.surface);
 
-  it("registers all six surfaces across the divergence fixtures (BB-413 retired the live-source surface)", () => {
+  it("registers all five surfaces across the divergence fixtures (BB-413 retired the live-source surface, BB-414 the no-wake-source one)", () => {
     const union = new Set<string>([
       ...surfaceNames(matrix("ticket", "build")),
       ...surfaceNames(onlyGateMetAt("build")),
       ...surfaceNames(projectApproved()),
-      ...surfaceNames(noWakeSourceFlag()),
     ]);
-    expect([...union].sort()).toEqual(["approvals.gate", "approvals.pageRefusal", "idleInActiveStage", "noWakeSource", "runningWorkerReason", "workerInFlight"]);
+    expect([...union].sort()).toEqual(["approvals.gate", "approvals.pageRefusal", "idleInActiveStage", "runningWorkerReason", "workerInFlight"]);
   });
 
   // DIVERGENCE: `workerInFlight` counts the parked `finished` worker in flight,
@@ -348,13 +346,6 @@ describe("the compare surface list (BB-292)", () => {
     expect(d.find((x) => x.surface === "approvals.pageRefusal")).toMatchObject({ old: "the pull request has not been observed yet", new: "met" });
   });
 
-  // DIVERGENCE: the report-time `noWakeSource` flag against the stall
-  // recomputed from the rows. The flag says no source while the rows show no
-  // non-empty wait at all, which is not a stall.
-  it("DIVERGENCE: noWakeSource reports the report-time flag against the recomputed stall", () => {
-    const d = compare(noWakeSourceFlag(), assess(noWakeSourceFlag()));
-    expect(d.find((x) => x.surface === "noWakeSource")).toMatchObject({ old: "no-wake-source", new: "source-or-no-wait" });
-  });
 });
 
 /** The matrix fixture without its second open own pull, at one stage (or none); its absence is the point. */
@@ -387,13 +378,3 @@ function projectApproved(): AssessmentInput {
   });
 }
 
-/** The report-time `noWakeSource` flag set with no free-text wait, carrying the rule's parked worker and second open own pull. */
-function noWakeSourceFlag(): AssessmentInput {
-  const second = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
-  return input({
-    binding: binding({ noWakeSource: true, status: null }),
-    observed: { entity: issue({ state: "In Progress" }), pulls: [second] },
-    ownPulls: own(second),
-    workers: [parkedWorker()],
-  });
-}

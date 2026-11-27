@@ -16,6 +16,7 @@ import type { EntitySnapshot, SearchIssue } from "./source-contract.js";
 import type { GuidanceUnit } from "./guidance.js";
 import { parsePullRef } from "./github.js";
 import { latestReviewMarker } from "./gate.js";
+import { derivedStalled } from "./reconcile.js";
 import { idleInitiativeLine } from "./wake.js";
 
 /** One function tool, shaped the way the Realtime API's `realtime.open` expects. */
@@ -769,7 +770,7 @@ function stuckLines(briefing: Briefing, now: number): string[] {
   for (const { escalation, from } of briefing.stuck.stuck) out.push(withAge(`${from.entityKey}: stuck — ${escalation.question}`, now, escalation.createdAt));
   for (const { escalation, from } of briefing.stuck.stall) out.push(withAge(`${from.entityKey}: stalled — ${escalation.question}`, now, escalation.createdAt));
   for (const b of briefing.stuck.held) out.push(`${b.entityKey}: on hold${b.hold === null ? "" : ` — ${b.hold}`}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`);
-  for (const b of briefing.stuck.noWakeSource) out.push(`${b.entityKey}: waiting with nothing the plugin tracks to wake it`);
+  for (const b of briefing.stuck.stalled) out.push(`${b.entityKey}: waiting with nothing the plugin tracks to wake it`);
   for (const b of briefing.stuck.datedWaits) out.push(`${b.entityKey}: waiting until ${b.requeueUntil === null ? "?" : new Date(b.requeueUntil).toISOString()}`);
   // BB-406: an idle initiative, with its duration and unmet count.
   for (const b of briefing.stuck.idle ?? []) {
@@ -906,7 +907,7 @@ function openFlags(binding: Binding, briefing: Briefing, now: number): string[] 
   if (binding.hold !== null || (binding.holdBehind?.length ?? 0) > 0 || (binding.holdStack?.length ?? 0) > 0) {
     flags.push(binding.hold === null ? "held" : `held: ${binding.hold}`);
   }
-  if (binding.noWakeSource) flags.push("no wake source");
+  if (derivedStalled(binding, now)) flags.push("no wake source");
   if (binding.requeueUntil !== null && binding.requeueUntil > now) flags.push(`waiting until ${new Date(binding.requeueUntil).toISOString()}`);
   return flags;
 }
