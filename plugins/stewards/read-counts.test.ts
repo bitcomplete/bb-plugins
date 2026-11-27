@@ -190,7 +190,13 @@ describe("a reconcile pass over a fixed binding set (BB-297)", () => {
     // rows, which `buildAssessmentInput` had already read. That is three store
     // reads per binding (openNeeds is two statements, openEscalations one),
     // twelve over the four bindings.
-    expect(reconcile).toEqual({ storeReads: 185, sourceCalls: 12, reconciles: 4, bindings: 4 });
+    // BB-413 (C7) lowered them 185 → 169: `assess()` no longer reads
+    // `AssessmentInput.sources`, so `buildAssessmentInput` no longer calls
+    // the wake-sources helper, whose `store.workers`, `store.openEscalations` and
+    // `store.openNeeds` (two statements) duplicated rows the look already held.
+    // That is four store reads per binding, sixteen over the four bindings. No
+    // read is added.
+    expect(reconcile).toEqual({ storeReads: 169, sourceCalls: 12, reconciles: 4, bindings: 4 });
     expect(wake).toEqual({ storeReads: 15, sourceCalls: 0, wakes: 1 });
   });
 

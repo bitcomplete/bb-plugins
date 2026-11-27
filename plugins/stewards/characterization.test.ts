@@ -33,7 +33,7 @@ import {
 import { isBusy } from "./sidebar.js";
 import { readyStateSchema, type Worker } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
-import { hasLiveWakeSource, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
+import { rowLiveSource, pullWatchCounts, type WakeSourceInput } from "./wake-source.js";
 
 const tickets: Playbook = (() => {
   const p = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
@@ -194,17 +194,17 @@ describe("the worker-busy predicates: workerInFlight vs runningWorkerReason", ()
 describe("the liveness and stuck predicates", () => {
   const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, parkedWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
-  it("pins hasLiveWakeSource: every tracked source, and a free-text wait is not one", () => {
-    expect(hasLiveWakeSource(noSources)).toBe(false);
-    expect(hasLiveWakeSource({ ...noSources, runningWorkers: 1 })).toBe(true);
-    expect(hasLiveWakeSource({ ...noSources, hold: "a freeze", holdBehind: ["ENG-9"] })).toBe(true);
-    expect(hasLiveWakeSource({ ...noSources, mergeBehind: ["ENG-9"] })).toBe(true);
-    expect(hasLiveWakeSource({ ...noSources, holdStack: ["ENG-9"], hold: "stacked" })).toBe(true);
-    expect(hasLiveWakeSource({ ...noSources, deployments: { "acme/web#7": { state: "deploying" } as never } })).toBe(true);
-    expect(hasLiveWakeSource({ ...noSources, deployments: { "acme/web#7": { state: "deployed" } as never } })).toBe(false);
-    expect(hasLiveWakeSource({ ...noSources, openEscalations: 1 })).toBe(true);
-    expect(hasLiveWakeSource({ ...noSources, openNeeds: 1 })).toBe(true);
-    expect(hasLiveWakeSource({ ...noSources, pullRequestWatch: true })).toBe(true);
+  it("pins rowLiveSource: every tracked source, and a free-text wait is not one", () => {
+    expect(rowLiveSource(noSources)).toBe(false);
+    expect(rowLiveSource({ ...noSources, runningWorkers: 1 })).toBe(true);
+    expect(rowLiveSource({ ...noSources, hold: "a freeze", holdBehind: ["ENG-9"] })).toBe(true);
+    expect(rowLiveSource({ ...noSources, mergeBehind: ["ENG-9"] })).toBe(true);
+    expect(rowLiveSource({ ...noSources, holdStack: ["ENG-9"], hold: "stacked" })).toBe(true);
+    expect(rowLiveSource({ ...noSources, deployments: { "acme/web#7": { state: "deploying" } as never } })).toBe(true);
+    expect(rowLiveSource({ ...noSources, deployments: { "acme/web#7": { state: "deployed" } as never } })).toBe(false);
+    expect(rowLiveSource({ ...noSources, openEscalations: 1 })).toBe(true);
+    expect(rowLiveSource({ ...noSources, openNeeds: 1 })).toBe(true);
+    expect(rowLiveSource({ ...noSources, pullRequestWatch: true })).toBe(true);
   });
 
   it("pins pullWatchCounts: a pr/review binding's own open PR is never a source, a ticket's only while gate-unmet (#294)", () => {
@@ -223,7 +223,7 @@ describe("the liveness and stuck predicates", () => {
     const ownPulls = 1;
     const source: WakeSourceInput = { ...noSources, pullRequestWatch: pullWatchCounts("pr", ownPulls, false) };
     expect(source.pullRequestWatch).toBe(false);
-    expect(hasLiveWakeSource(source)).toBe(false);
+    expect(rowLiveSource(source)).toBe(false);
     expect(pr.state).toBe("open");
   });
 

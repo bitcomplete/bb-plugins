@@ -17,7 +17,6 @@ import { latestReviewMarker, type PrGate, type ProjectApprovalRecord } from "./g
 import { parsePullRef } from "./github.js";
 import { gateState } from "./ready-gate.js";
 import { anyWorkerInFlight, productGateOptions, runningWorkerReason, stuckDue } from "./reconcile.js";
-import { hasLiveWakeSource, type WakeSourceInput } from "./wake-source.js";
 import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
 import type { EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Worker } from "./store.js";
@@ -61,7 +60,7 @@ export type AssessedWorker = {
 };
 
 export type AssessedLiveness = {
-  /** `hasLiveWakeSource` over the observable rows. */
+  /** The composed live-source answer (BB-413): a live wake resource or hold. */
   live: boolean;
   /** The stored typed wait's own liveness (BB-333); null when the binding has no typed wait. */
   waitLive: boolean | null;
@@ -118,7 +117,7 @@ export type AssessmentInput = {
   binding: Pick<
     Binding,
     "id" | "entityKey" | "kind" | "ready" | "stage" | "ending" | "hold" | "deployments" | "requeueUntil" | "noWakeSource" | "status" | "createdAt" | "advancedAt" | "phase"
-  > & { wait?: Binding["wait"]; waitSince?: number | null; holdBehind?: Binding["holdBehind"]; mergeBehind?: Binding["mergeBehind"] };
+  > & { wait?: Binding["wait"]; waitSince?: number | null; holdBehind?: Binding["holdBehind"]; holdStack?: Binding["holdStack"]; mergeBehind?: Binding["mergeBehind"] };
   /**
    * Fresh snapshots of the binding's waited `pull`/`review` refs (BB-333),
    * keyed by lowercased `owner/repo#N`. Read by the look, never stored in the
@@ -139,6 +138,13 @@ export type AssessmentInput = {
    * `ownPulls`, so a caller that does not need the broader set is unchanged.
    */
   gatePulls?: ReadonlySet<string>;
+  /**
+   * The pulls the wake pull watch counts (BB-413, C7): the observed pulls that
+   * belong to the binding (`pullBelongsToTicket`), so a pull handed to another
+   * binding is excluded even while it is still worker-owned. Defaults to
+   * `gatePulls`.
+   */
+  watchedPulls?: ReadonlySet<string>;
   /** The decide-list mark for each own pull, from the files the snapshot already carries. */
   decisions: ReadonlyMap<string, DecideMark>;
   /** The plugin's recorded project approvals for the binding. */
@@ -160,8 +166,6 @@ export type AssessmentInput = {
   workers: readonly Worker[];
   escalations: readonly Escalation[];
   needs: readonly Need[];
-  /** The wake sources the report path already assembles (BB-154). */
-  sources: WakeSourceInput;
   playbook: Playbook;
   /** BB-351: the project's `waitBudgets` overrides; omitted reads as the defaults. */
   waitBudgets?: Partial<Record<WaitBudgetKind, number | null>>;
@@ -268,7 +272,7 @@ function waitReviewers(wait: Wait | null, input: AssessmentInput): readonly stri
  * Whether the stored typed wait is live, resolved against the rows the look
  * holds (BB-333): the freshly read waited pull, the deployment watches, the
  * workers, the other bindings, the page items and the date. The typed wait is
- * judged by its own kind, never by `hasLiveWakeSource`.
+ * judged by its own kind, never by the row live-source predicate.
  */
 export function typedWaitLive(wait: Wait, input: AssessmentInput): boolean {
   switch (wait.kind) {
@@ -323,18 +327,9 @@ export function assessWorker(workers: readonly Worker[]): AssessedWorker {
   return { state, inFlight: anyWorkerInFlight(workers), running, parked, reason: runningWorkerReason(workers) };
 }
 
-/**
- * The live-wake-source answer (BB-154), in one place: `assess` and the report
- * path's `liveWakeSourceFor` both call it, so no surface calls
- * `hasLiveWakeSource` directly.
- */
-export function assessLiveWakeSource(sources: WakeSourceInput): boolean {
-  return hasLiveWakeSource(sources);
-}
-
 /** Derive the one assessment for a binding from the rows the reconcile already read. */
 export function assess(input: AssessmentInput, composed?: ComposedAssessment): Assessment {
-  const { binding, workers, escalations, sources, playbook, now } = input;
+  const { binding, workers, escalations, playbook, now } = input;
   // BB-387 (C3): the merge gate is the github contributor's `merge` items,
   // folded by core. BB-400 (C5): the idle/stall liveness is the composer's,
   // too, so `assess()` names no pull-specific or typed-wait derivation. A
@@ -353,7 +348,9 @@ export function assess(input: AssessmentInput, composed?: ComposedAssessment): A
     gate,
     worker: assessWorker(workers),
     liveness: {
-      live: assessLiveWakeSource(sources),
+      // BB-413 (C7): the live-source answer is the composed resources and
+      // holds, computed once by `composeLiveness`.
+      live: answer.liveness.live,
       waitLive,
       waited: waitFingerprint(wait, input),
       // BB-400 (C5): the idle base, the idle answer and the stall are the
@@ -390,9 +387,9 @@ const verdict = (met: boolean, missing: string | null): string => (met ? "met" :
  * Every place the predicates the assessment will retire answer differently
  * from it, over the same rows. The surfaces:
  *
- * - `workerInFlight`, `runningWorkerReason`, `idleInActiveStage`,
- *   `hasLiveWakeSource`: a parked `finished` worker is in flight to the first
- *   and not mid-turn, idle and not a live source to the others (BB-292 #1).
+ * - `workerInFlight`, `runningWorkerReason`, `idleInActiveStage`: a parked
+ *   `finished` worker is in flight to the first and not mid-turn to the second,
+ *   and idle to the third (BB-292 #1).
  * - `approvals.gate`: the old surface gate, built without the decide mark or
  *   the recorded project approvals, against the assessment (BB-292 #2).
  * - `approvals.pageRefusal`: the page action's refusal on a met gate (BB-292 #3).
@@ -431,7 +428,6 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     if (anyWorkerInFlight(workers)) add("workerInFlight", "in-flight", "parked", workerInputs);
     if (runningWorkerReason(workers) === null) add("runningWorkerReason", "not-mid-turn", "parked", workerInputs);
     if (assessment.liveness.idleBase) add("idleInActiveStage", "idle", "parked", workerInputs);
-    if (!assessment.liveness.live) add("hasLiveWakeSource", "no-live-source", "parked", workerInputs);
   }
 
   // (2) The gate inputs, and (3) the page's refusal text.
@@ -454,9 +450,9 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
   }
 
   // (4) The stored no-wake-source flag against the stall recomputed from the
-  // rows. `hasLiveWakeSource`, `idleInActiveStage` and `stuckDue` are the
-  // assessment's own derivation, so they are compared by construction; only
-  // the flag and the observed stall can disagree.
+  // rows. `idleInActiveStage` and `stuckDue` are the assessment's own
+  // derivation, so they are compared by construction; only the flag and the
+  // observed stall can disagree.
   add("noWakeSource", binding.noWakeSource ? "no-wake-source" : "source-or-no-wait", assessment.liveness.stalled ? "no-wake-source" : "source-or-no-wait", {
     binding: binding.id,
     live: assessment.liveness.live,
@@ -496,6 +492,7 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     // ready-gate hold is held while the binding is in the spec stage (the
     // playbook's Todo) and the ready gate has not passed.
     const holdBehind = binding.holdBehind ?? [];
+    const holdStack = binding.holdStack ?? [];
     const mergeBehind = binding.mergeBehind ?? [];
     const readyPassed = gateState(input.playbook, binding.ready, input.currentSpecHash).passed;
     const assessedHolds = [
@@ -503,6 +500,7 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
       `ending:${binding.ending !== null}`,
       `requeue:${binding.requeueUntil !== null && binding.requeueUntil > input.now}`,
       `behind:${holdBehind.length > 0}`,
+      `stack:${holdStack.length > 0}`,
       `merge-behind:${mergeBehind.length > 0}`,
       `ready-gate:${binding.stage === "spec" && !readyPassed}`,
     ].join(",");
@@ -514,6 +512,7 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
         ending: binding.ending !== null,
         requeue: binding.requeueUntil !== null && binding.requeueUntil > input.now,
         behind: holdBehind.join(","),
+        stack: holdStack.join(","),
         mergeBehind: mergeBehind.join(","),
         readyPassed,
         stage: binding.stage,
@@ -527,15 +526,23 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     // whose effect on idle is the named fixture, not a divergence. The two
     // sides are sorted so contributor order never reads as a difference.
     const gateMetByPull = new Map(assessment.gate.pulls.map((p) => [lc(p.pull), p.met]));
+    const watchedPulls = input.watchedPulls ?? input.gatePulls ?? ownPulls;
     const assessedResources: string[] = [];
+    let pullWatch = false;
     for (const e of ownPullEntities(observed, input.gatePulls ?? ownPulls)) {
-      assessedResources.push(`open-pull:${lc(e.key)}:${pullIsOpen(e) && !(gateMetByPull.get(lc(e.key)) ?? false) && isOwn(e, ownPulls)}`);
+      const open = pullIsOpen(e) && !(gateMetByPull.get(lc(e.key)) ?? false);
+      assessedResources.push(`open-pull:${lc(e.key)}:${open && isOwn(e, ownPulls)}`);
+      if (binding.kind === "ticket" && watchedPulls.has(lc(e.key)) && open) pullWatch = true;
     }
+    if (binding.kind === "ticket") assessedResources.push(`pull-watch:${pullWatch}`);
     for (const key of leasedLinkedPullKeys(input)) assessedResources.push(`linked-pull:${lc(key)}:true`);
     const waitedKey = waitedPullKey(binding.wait ?? null);
     if (waitedKey !== null) assessedResources.push(`waited-pull:${waitedKey}:${typedWaitLive(binding.wait!, input)}`);
     for (const [key, w] of Object.entries(binding.deployments)) assessedResources.push(`deployment:${lc(key)}:${w.state === "merged" || w.state === "deploying"}`);
-    assessedResources.push(`workers:${anyWorkerInFlight(workers)}`);
+    assessedResources.push(`workers:${workers.some((w) => w.status === "running" || (w.status === "finished" && w.parkedWaitingOn !== null))}`);
+    assessedResources.push(`parked-workers:${workers.some((w) => w.status === "finished" && w.parkedWaitingOn !== null)}`);
+    assessedResources.push(`escalations:${input.escalations.length > 0}`);
+    assessedResources.push(`needs:${input.needs.length > 0}`);
     const composedResources = composed.resources.map((r) => `${r.id}:${r.active}`);
     assessedResources.sort();
     composedResources.sort();

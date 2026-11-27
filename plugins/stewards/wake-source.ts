@@ -47,13 +47,20 @@ export type WakeSourceInput = {
 };
 
 /**
- * Whether anything the plugin tracks will wake this binding. The list is the
- * one in the ticket's criterion 1: an open `holdBehind` entry, an open
- * `mergeBehind` entry (BB-256), a deployment watch in `merged`/`deploying`, a
- * running worker, a parked worker (BB-389), an open escalation or need, or a
- * pull-request watch. A free-text `waitingOn` is not on it.
+ * The live-wake-source answer from raw rows, for the two paths that have no
+ * assessment to compose: the ops reconcile (an ops binding has no snapshot to
+ * assess) and a report whose fresh assessment could not be built (a missing
+ * snapshot, playbook or config). Every ticket, pull-request and local binding
+ * reads the composed resources and holds instead (BB-413, C7), so this is not
+ * a second answer a surface derives for itself.
+ *
+ * The list is the one in the ticket's criterion 1: an open `holdBehind` entry,
+ * an open `holdStack` entry, an open `mergeBehind` entry (BB-256), a
+ * deployment watch in `merged`/`deploying`, a running worker, a parked worker
+ * (BB-389), an open escalation or need, or a pull-request watch. A free-text
+ * `waitingOn` is not on it.
  */
-export function hasLiveWakeSource(s: WakeSourceInput): boolean {
+export function rowLiveSource(s: WakeSourceInput): boolean {
   return (
     (s.hold !== null && (s.holdBehind.length > 0 || s.holdStack.length > 0)) ||
     s.mergeBehind.length > 0 ||

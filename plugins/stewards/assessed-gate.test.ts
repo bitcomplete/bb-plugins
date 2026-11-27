@@ -15,7 +15,6 @@ import type { BigDecision } from "./decisions.js";
 import { MIGRATIONS, createStore, readyStateSchema, type StatusRecord } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
 import type { EntitySnapshot } from "./source-contract.js";
-import type { WakeSourceInput } from "./wake-source.js";
 
 const tickets: Playbook = (() => {
   const p = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
@@ -25,7 +24,6 @@ const tickets: Playbook = (() => {
 
 const head = "aaaaaaa1";
 const green = { checks: { state: "success", failing: [] } };
-const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, parkedWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
 const noReviewMarker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
 const ownerMarker = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
@@ -68,7 +66,6 @@ function input(over: Partial<AssessmentInput> = {}): AssessmentInput {
     workers: [],
     escalations: [],
     needs: [],
-    sources: { ...noSources },
     playbook: tickets,
     currentSpecHash: "",
     now: 1_000_000,

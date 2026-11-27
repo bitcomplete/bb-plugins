@@ -20,7 +20,6 @@ import { approvalMarkerLine } from "./gate.js";
 import { readyStateSchema, type StatusRecord } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
 import type { EntitySnapshot } from "./source-contract.js";
-import type { WakeSourceInput } from "./wake-source.js";
 
 const tickets: Playbook = (() => {
   const p = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
@@ -30,7 +29,6 @@ const tickets: Playbook = (() => {
 
 const head = "aaaaaaa1";
 const green = { checks: { state: "success", failing: [] } };
-const noSources: WakeSourceInput = { hold: null, holdBehind: [], mergeBehind: [], holdStack: [], deployments: {}, runningWorkers: 0, parkedWorkers: 0, openEscalations: 0, openNeeds: 0, pullRequestWatch: false };
 
 const noReviewMarker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
 const ownerMarker = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed approver=project -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
@@ -71,7 +69,6 @@ function input(over: Partial<AssessmentInput> = {}): AssessmentInput {
     workers: [],
     escalations: [],
     needs: [],
-    sources: { ...noSources },
     playbook: tickets,
     currentSpecHash: "",
     now: 1_000_000,
@@ -174,7 +171,10 @@ function expectedAssessment(entityKey: string): Assessment {
       readyPassed: false,
     },
     worker: { state: "parked", inFlight: true, running: false, parked: true, reason: null },
-    liveness: { live: false, waitLive: null, waited: null, idleBase: false, idle: false, stuck: false, stalled: false, reportedNoWakeSource: false, overdue: false, overdueMs: null },
+    // BB-413 (C7): the parked worker is the composed `parked-workers`
+    // resource, so `live` is true, exactly as the report path's row source read it in
+    // production (the old fixture's `sources` omitted the parked worker).
+    liveness: { live: true, waitLive: null, waited: null, idleBase: false, idle: false, stuck: false, stalled: false, reportedNoWakeSource: false, overdue: false, overdueMs: null },
     wait: null,
   };
 }
@@ -212,7 +212,7 @@ describe("the full Assessment across binding kinds and stages", () => {
 
   it("pins the liveness flags on the matrix fixture: no tracked source, no typed wait, no stall", () => {
     const a = assess(matrix("ticket", "build"));
-    expect(a.liveness).toEqual({ live: false, waitLive: null, waited: null, idleBase: false, idle: false, stuck: false, stalled: false, reportedNoWakeSource: false, overdue: false, overdueMs: null });
+    expect(a.liveness).toEqual({ live: true, waitLive: null, waited: null, idleBase: false, idle: false, stuck: false, stalled: false, reportedNoWakeSource: false, overdue: false, overdueMs: null });
     // `stuck` is the phase backstop: Todo has no limit, and In Progress / In
     // Review are days away from `advancedAt`.
     expect(a.liveness.stuck).toBe(false);
@@ -298,24 +298,25 @@ describe("the full Assessment: the stored typed wait and the stall it derives", 
 describe("the compare surface list (BB-292)", () => {
   const surfaceNames = (i: AssessmentInput): string[] => compare(i, assess(i)).map((d) => d.surface);
 
-  it("registers all seven surfaces across the divergence fixtures", () => {
+  it("registers all six surfaces across the divergence fixtures (BB-413 retired the live-source surface)", () => {
     const union = new Set<string>([
       ...surfaceNames(matrix("ticket", "build")),
       ...surfaceNames(onlyGateMetAt("build")),
       ...surfaceNames(projectApproved()),
       ...surfaceNames(noWakeSourceFlag()),
     ]);
-    expect([...union].sort()).toEqual(["approvals.gate", "approvals.pageRefusal", "hasLiveWakeSource", "idleInActiveStage", "noWakeSource", "runningWorkerReason", "workerInFlight"]);
+    expect([...union].sort()).toEqual(["approvals.gate", "approvals.pageRefusal", "idleInActiveStage", "noWakeSource", "runningWorkerReason", "workerInFlight"]);
   });
 
   // DIVERGENCE: `workerInFlight` counts the parked `finished` worker in flight,
-  // `runningWorkerReason` says nobody is mid-turn, and `hasLiveWakeSource` says
-  // no tracked source is live; the assessment names the one state `parked`.
-  it("DIVERGENCE: a parked worker is in flight, not mid-turn and no live source at once", () => {
+  // `runningWorkerReason` says nobody is mid-turn; the assessment names the one
+  // state `parked`. BB-413 (C7) retired the live-source row: the live
+  // answer now comes from the composed `parked-workers` resource, which counts
+  // the parked worker exactly as the report path did.
+  it("DIVERGENCE: a parked worker is in flight and not mid-turn at once", () => {
     const d = new Map(compare(matrix("ticket", "build"), assess(matrix("ticket", "build"))).map((x) => [x.surface, x]));
     expect(d.get("workerInFlight")).toMatchObject({ old: "in-flight", new: "parked" });
     expect(d.get("runningWorkerReason")).toMatchObject({ old: "not-mid-turn", new: "parked" });
-    expect(d.get("hasLiveWakeSource")).toMatchObject({ old: "no-live-source", new: "parked" });
     expect(d.get("idleInActiveStage")).toBeUndefined();
   });
 

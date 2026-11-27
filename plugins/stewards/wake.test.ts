@@ -533,6 +533,19 @@ describe("the nightly prompt", () => {
     expect(wake).toMatch(/files no Merge item while it stands/u);
   });
 
+  it("carries the composed hold line with its behind and stack keys (BB-413, C7)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    s.patch(b.id, { hold: "Overlaps ENG-13", holdBehind: ["ENG-13"], holdStack: ["ENG-14"] });
+    const wake = formatWake(wakeInput({ binding: s.binding(b.id)! }));
+    expect(wake).toMatch(/\*\*HOLD: Overlaps ENG-13\*\*/u);
+    expect(wake).toMatch(/behind ENG-13/u);
+    expect(wake).toMatch(/stacked on ENG-14/u);
+    // An unheld binding reads `- Hold: none`.
+    const plain = bind("ENG-15");
+    expect(formatWake(wakeInput({ binding: s.binding(plain.id)! }))).toMatch(/- Hold: none/u);
+  });
+
   it("gives dates in the project's nightly time zone", () => {
     const { s } = world();
     const q = s.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });
