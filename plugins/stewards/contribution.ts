@@ -36,7 +36,7 @@ import { schedulingHolds, type HoldContribution } from "./holds.js";
 import { idleInActiveStage, observedStall, productGateOptions } from "./reconcile.js";
 import { gateState } from "./ready-gate.js";
 import type { NonActionCode } from "./non-actions.js";
-import type { EntitySnapshot } from "./source-contract.js";
+import type { Contribution, EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation } from "./store.js";
 import type { Wait, WaitKind } from "./wait.js";
 
@@ -102,8 +102,13 @@ export function forwardedToOwner(escalations: readonly Escalation[], e: EntitySn
   return escalations.some((x) => x.status === "open" && x.kind === "approval" && x.route === "user" && x.resolutionKind === "approve-decline" && lc(x.url) === url);
 }
 
-/** The source plugins a contribution can come from, as the design names them. */
-export type ContributionSource = "github" | "linear" | "local";
+/**
+ * The source a contribution comes from, as the design names it. The built-in
+ * contributors are `github`, `linear` and `local`; a source plugin that serves
+ * its own contribution over the source contract (BB-418, BB-291 C10) may use
+ * any id, so the core names no closed source set.
+ */
+export type ContributionSource = string;
 
 /** What a contribution is about, as the design names it. */
 export type ContributionSubject = { kind: "pull" | "artifact" | "step" | "entity"; id: string };
@@ -129,8 +134,13 @@ export type GateContribution = {
   product: boolean;
   /** The fingerprint of the gate's inputs (BB-210). */
   inputs: string;
-  /** The wrapped today's gate, so the composer can reproduce `assess()` exactly. */
-  assessed: AssessedGate;
+  /**
+   * The wrapped today's gate, so the composer can reproduce `assess()` exactly.
+   * The built-in github contributor sets it; a contribution served over the
+   * source contract (BB-418, BB-291 C10) never does, so a served item cannot
+   * set or replace the core's per-pull merge gate.
+   */
+  assessed?: AssessedGate;
 };
 
 /** One wait a source contributes, wrapping today's typed-wait derivation. */
@@ -439,8 +449,10 @@ export function compose(contributions: readonly SourceContribution[]): ComposedA
     gate: {
       // The roll-up reads the contribution fields, not the wrapped gate, so
       // `assess()` returns the contributor's `met`, `lane` and `missing`
-      // rather than re-deriving them from the wrapped gate.
-      pulls: gateItems.map((g) => g.assessed),
+      // rather than re-deriving them from the wrapped gate. Only an item with a
+      // wrapped `assessed` gate is a per-pull merge gate; a served item
+      // (BB-418) has none and adds no entry to `pulls`.
+      pulls: gateItems.flatMap((g) => (g.assessed === undefined ? [] : [g.assessed])),
       met: gateItems.every((g) => g.met),
       decision: gateItems[0]?.lane ?? "user",
       missing: gateItems.find((g) => !g.met)?.missing ?? null,
@@ -528,9 +540,25 @@ function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): 
   };
 }
 
+/**
+ * The contributions to fold: the built-in contributors, except for a source
+ * that served its own contribution over the source contract (BB-418, BB-291
+ * C10) — the core never falls back for a source that served, even an empty one
+ * — plus every served contribution whose source has no built-in contributor.
+ * A served contribution rides `sourceSnapshot`, so it adds no store read or
+ * source call here.
+ */
+function contributionsFor(input: AssessmentInput): SourceContribution[] {
+  const served: readonly Contribution[] = input.served ?? [];
+  const servedSources = new Set(served.map((c) => c.source));
+  return [...CONTRIBUTORS.filter((c) => !servedSources.has(c.source)).map((c) => c.contribute(input)), ...served];
+}
+
 /** The composition for one binding, from the rows the look already holds. */
 export function composeAssessment(input: AssessmentInput): ComposedAssessment {
-  const composed = compose(CONTRIBUTORS.map((c) => c.contribute(input)));
+  const composed = compose(contributionsFor(input));
+  // The ready gate is core policy over the playbook and the spec hash, set
+  // after the contributions fold, so a served contribution can never set it.
   composed.gate.readyPassed = gateState(input.playbook, input.binding.ready, input.currentSpecHash).passed;
   composed.liveness = composeLiveness(input, composed);
   return composed;

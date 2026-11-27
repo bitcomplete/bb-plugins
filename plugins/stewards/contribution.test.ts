@@ -17,10 +17,11 @@ import { compose, composeAssessment, githubContributor, linearContributor, local
 import { parsePlaybook, type Playbook } from "./config.js";
 import { comment, issue, parkedWorker, pull } from "./fixtures.js";
 import { approvalMarkerLine } from "./gate.js";
+import { gateState } from "./ready-gate.js";
 import { readyStateSchema, type StatusRecord } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
 import { rowLiveSource, type WakeSourceInput } from "./wake-source.js";
-import type { EntitySnapshot } from "./source-contract.js";
+import type { Contribution, EntitySnapshot } from "./source-contract.js";
 import type { Wait } from "./wait.js";
 
 const tickets: Playbook = (() => {
@@ -699,7 +700,8 @@ describe("the contribution interface (BB-380)", () => {
   it("a gate contribution carries the source, subject, id and inputs the design names", () => {
     const g: GateContribution = githubContributor.contribute(onlyGateMetAt("build")).gate[0]!;
     expect(g).toMatchObject({ source: "github", subject: { kind: "pull", id: "acme/web#7" }, id: "merge", met: true, missing: null, lane: "user" });
-    expect(g.inputs).toBe(g.assessed.key);
+    expect(g.assessed).toBeDefined();
+    expect(g.inputs).toBe(g.assessed!.key);
   });
 });
 
@@ -761,5 +763,61 @@ describe("the composed gate is the github contributor's (BB-387)", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]!.file).toBe("contribution.ts");
     expect(calls[0]!.line).toBe("return prGate(entity, options);");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BB-418 (C10): a source serves a contribution over the source contract.
+// ---------------------------------------------------------------------------
+
+describe("a served contribution (BB-418)", () => {
+  /**
+   * A fake source's contribution for a made-up stage: a gate item for an
+   * artifact, a `person` wait, a resource, a hold and a reason. Nothing here
+   * names figma or a stage in the core; the source id is just a string.
+   */
+  const served: Contribution = {
+    source: "figma",
+    gate: [{ source: "figma", subject: { kind: "artifact", id: "file-1" }, id: "design-approved", met: false, missing: "the design is not approved", lane: "user", escalated: false, product: false, inputs: "design-approved@1" }],
+    waits: [{ source: "figma", kind: "person", ref: "need_design", live: true, fingerprint: null, budgetMs: null, since: null, overdueMs: null }],
+    resources: [{ source: "figma", id: "artifact:file-1", active: true, subject: { kind: "artifact", id: "file-1" } }],
+    holds: [{ source: "figma", id: "design-review", held: true, behind: [] }],
+    reasons: [{ source: "figma", code: "design-pending", detail: "file-1", at: 1_000_000 }],
+  };
+
+  it("composes a served source's gate item, wait, resource, hold and reason through the same path", () => {
+    const composed = composeAssessment(input({ served: [served] }));
+    expect(composed.gate.met).toBe(false);
+    expect(composed.gate.missing).toBe("the design is not approved");
+    expect(composed.waits).toEqual([served.waits[0]]);
+    expect(composed.resources).toEqual(expect.arrayContaining([served.resources[0]]));
+    expect(composed.holds).toEqual(expect.arrayContaining([served.holds[0]]));
+    expect(composed.reasons).toEqual([served.reasons[0]]);
+  });
+
+  it("cannot set the ready gate or the core's per-pull merge gate", () => {
+    const i = input({ served: [served] });
+    const composed = composeAssessment(i);
+    // `pulls` carries only items with a wrapped `assessed` gate, which a served
+    // item never has; the ready gate is core policy set after the fold.
+    expect(composed.gate.pulls).toEqual([]);
+    expect(composed.gate.readyPassed).toBe(gateState(i.playbook, i.binding.ready, i.currentSpecHash).passed);
+  });
+
+  it("never falls back to the in-process contributor for a source that served", () => {
+    // A linear binding with a worker wait: in-process, linear contributes the
+    // wait; a served empty linear contribution drops it, because the core never
+    // falls back when the field is present.
+    const i = waitInput({ kind: "worker", ref: "thr_w1" }, { workers: [{ threadId: "thr_w1", status: "running" } as never] });
+    expect(composeAssessment(i).waits).toHaveLength(1);
+    const servedEmpty: AssessmentInput = { ...i, served: [{ source: "linear", gate: [], waits: [], resources: [], holds: [], reasons: [] }] };
+    expect(composeAssessment(servedEmpty).waits).toEqual([]);
+  });
+
+  it("keeps the in-process contributor for a source that served nothing", () => {
+    // The github contributor's per-pull merge gate is unchanged by a figma
+    // contribution: only github served nothing, so it still composes.
+    const composed = composeAssessment({ ...onlyGateMetAt("build"), served: [served] });
+    expect(composed.gate.pulls.map((p) => p.pull)).toEqual(["acme/web#7"]);
   });
 });

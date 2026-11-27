@@ -133,6 +133,7 @@ import {
   stewardsContract,
   workflowRunSchema,
   type BacklogIssue,
+  type Contribution,
   type DependabotAlert,
   type DependabotSeverity,
   type Deployment,
@@ -3741,9 +3742,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- the sources ---------------------------------------------------------------------
 
-    async function snapshot(source: Source, id: string): Promise<EntitySnapshot | null> {
+    /**
+     * The entity snapshot and, when the source serves one (BB-418, BB-291 C10),
+     * its contribution. The contribution rides the same `sourceSnapshot` call,
+     * so it adds no store read or source call; a source that omits it reads as
+     * null.
+     */
+    async function snapshotWithContribution(source: Source, id: string): Promise<{ entity: EntitySnapshot | null; contribution: Contribution | null }> {
       const out = await sourceRpc(source, "sourceSnapshot", { id }, sourceContract.sourceSnapshot.output);
-      return out.snapshot === null ? null : entitySnapshotSchema.parse(out.snapshot);
+      return { entity: out.snapshot === null ? null : entitySnapshotSchema.parse(out.snapshot), contribution: out.contribution ?? null };
+    }
+
+    async function snapshot(source: Source, id: string): Promise<EntitySnapshot | null> {
+      return (await snapshotWithContribution(source, id)).entity;
     }
 
     /**
@@ -5550,6 +5561,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       playbook: Playbook,
       currentSpecHash: string,
       config: ProjectConfig,
+      served?: readonly Contribution[],
     ): Promise<AssessmentInput> {
       // BB-322: gate every pull request that belongs to the binding, the same
       // set `syncNeeds` acts on, not only the worker-reported own ones. A
@@ -5619,6 +5631,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         waitBudgets: config.file.waitBudgets,
         playbook,
         currentSpecHash,
+        served,
         now: now(),
         waitedPulls,
         hasOpenBinding: (key) => {
@@ -5672,8 +5685,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       playbook: Playbook,
       currentSpecHash: string,
       config: ProjectConfig,
+      served?: readonly Contribution[],
     ): Promise<{ assessment: Assessment; input: AssessmentInput }> {
-      const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config);
+      const input = await buildAssessmentInput(b, observed, workers, ownPulls, playbook, currentSpecHash, config, served);
       // BB-380 (C2) / BB-387 (C3) / BB-400 (C5): the composed answer is the
       // gate's source and the liveness answer, computed once and handed to
       // `assess`, so the reconcile does not compose twice; the waits/holds are
@@ -5787,8 +5801,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       let entity: EntitySnapshot | null;
+      // BB-418 (BB-291 C10): the source's contribution for this entity, read
+      // from the same `sourceSnapshot` output. No live source serves one yet, so
+      // this is null in production; a source that serves it composes in place of
+      // its in-process contributor.
+      let served: Contribution | null = null;
       try {
-        entity = await snapshot(b.source, b.entityId);
+        const read = await snapshotWithContribution(b.source, b.entityId);
+        entity = read.entity;
+        served = read.contribution;
       } catch (error) {
         bb.log.warn(`stewards: could not read ${b.entityKey}: ${errorMessage(error)}`);
         decline(b, "entity-unreadable");
@@ -6102,7 +6123,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // BB-400: the composer's idleBase reads `binding.stage`, so assess with
         // this look's stage (from `phaseAndStage`), not the stage stored before
         // the look. The old `assessIdle` call used the same local.
-        const built = await assessBinding({ ...b, stage }, observed, workers, ownPulls, playbook, currentSpec, config);
+        const built = await assessBinding({ ...b, stage }, observed, workers, ownPulls, playbook, currentSpec, config, served === null ? undefined : [served]);
         assessment = built.assessment;
         assessmentInput = built.input;
       } catch (error) {

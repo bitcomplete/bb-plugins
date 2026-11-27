@@ -8,8 +8,12 @@
 // It is pure over the binding and `now`, so it adds no store read or source
 // call wherever it is called.
 
-/** The source plugins a hold can come from, as the composer names them. */
-export type HoldSource = "github" | "linear" | "local";
+/**
+ * The source a hold comes from, as the composer names it. The built-in
+ * contributors are `github`, `linear` and `local`; a source plugin that serves
+ * its own contribution (BB-418, BB-291 C10) may use any id.
+ */
+export type HoldSource = string;
 
 /**
  * One hold a source contributes: the binding's hold, ending and requeue, the

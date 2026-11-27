@@ -19,7 +19,7 @@ import { gateState } from "./ready-gate.js";
 import { CONTRIBUTED_REASON_CODES, isNonActionCode } from "./non-actions.js";
 import { anyWorkerInFlight, productGateOptions, runningWorkerReason, stuckDue } from "./reconcile.js";
 import { waitBudgetMs, type Playbook, type WaitBudgetKind } from "./config.js";
-import type { EntitySnapshot } from "./source-contract.js";
+import type { Contribution, EntitySnapshot } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Worker } from "./store.js";
 import type { Wait, WaitKind } from "./wait.js";
 
@@ -170,6 +170,14 @@ export type AssessmentInput = {
   waitBudgets?: Partial<Record<WaitBudgetKind, number | null>>;
   /** The spec hash the ready gate compares its approval against. */
   currentSpecHash: string;
+  /**
+   * BB-418 (BB-291 C10): the contributions a source served beside its snapshot,
+   * already validated against `source-contract.ts`. A source present here is
+   * composed from this list and never falls back to its in-process contributor;
+   * a source absent here uses its in-process contributor. Omitted reads as no
+   * served contribution, exactly as today.
+   */
+  served?: readonly Contribution[];
   now: number;
 };
 
