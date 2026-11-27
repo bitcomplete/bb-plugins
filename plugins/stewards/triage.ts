@@ -188,13 +188,8 @@ export function scopedEvidenceLink(url: string | null | undefined, namespace: st
   return null;
 }
 
-/** One untrusted line of evidence: redacted, flattened, clipped, with backticks stripped and `<`/`>`/`&` escaped so it can neither break out of a code span nor post Slack control syntax. */
-const evidenceLine = (text: string, max = 240): string =>
-  redactLine(text.replace(/\s+/gu, " ").trim(), max)
-    .replace(/`/gu, "")
-    .replace(/&/gu, "&amp;")
-    .replace(/</gu, "&lt;")
-    .replace(/>/gu, "&gt;");
+/** One untrusted line of evidence: redacted, flattened, clipped, with backticks and `<`/`>` stripped so it can neither break out of a code span nor post Slack control syntax. `&` is left for the one Markdown→mrkdwn pass to escape. */
+const evidenceLine = (text: string, max = 240): string => redactLine(text.replace(/\s+/gu, " ").trim(), max).replace(/[`<>]/gu, "");
 const safeName = (name: string): string => evidenceLine(name, 200);
 
 /** The "job failed" clause, from the Job's own condition. */
@@ -353,7 +348,11 @@ export interface OccurrenceStore {
   record(occurrenceKey: string, at: number, postedTs: string): Promise<void>;
 }
 
-/** The one write: post the reply into the original Slack thread. */
+/**
+ * The one write: post the reply into the original Slack thread. `text` is
+ * Markdown; the replier converts it to Slack mrkdwn exactly once before posting
+ * (as `slack_reply` does), so the composer must not pre-escape `&`/`<`/`>`.
+ */
 export interface ThreadReplier {
   reply(input: { channel: string; threadTs: string; text: string }): Promise<{ ts: string }>;
 }

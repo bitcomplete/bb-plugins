@@ -141,9 +141,21 @@ describe("composing the reply", () => {
       evidence: { job: { value: failedJob({ reason: null, message: null }), url: null }, pods: [], events: [], logs: [{ pod: "p", container: "sync", lines: [evil], url: null }], successfulJobs: [], successfulJobsUnavailable: false, unavailable: [] },
       owner: "dylan",
     });
+    // The control syntax is removed, not entity-encoded: the one Markdown→mrkdwn
+    // pass escapes `&`/`<`/`>` after this, so pre-escaping would double it.
     expect(text).not.toContain("<!channel>");
     expect(text).not.toContain("<https://x|y>");
-    expect(text).toContain("&lt;!channel&gt;");
+    expect(text).not.toContain("&lt;");
+    expect(text).toContain("!channel");
+  });
+
+  it("leaves & for the one Markdown→mrkdwn pass to escape, and strips <> rather than encoding them", () => {
+    const text = composeTriageReply({ alert: triageAlert({ summary: "lag high & rising" }), evidence: { job: null, pods: [], events: [], logs: [], successfulJobs: [], successfulJobsUnavailable: false, unavailable: [] }, owner: "dylan" });
+    expect(text).toContain("lag high & rising");
+    expect(text).not.toContain("&amp;");
+    const angle = composeTriageReply({ alert: triageAlert({ summary: "a > b" }), evidence: { job: null, pods: [], events: [], logs: [], successfulJobs: [], successfulJobsUnavailable: false, unavailable: [] }, owner: "dylan" });
+    expect(angle).not.toContain("a > b");
+    expect(angle).not.toContain("&gt;");
   });
 
   it("keeps all three headings and the first-contact sentence when evidence is oversized", () => {
