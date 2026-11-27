@@ -144,8 +144,14 @@ describe("derivedStalled: the untyped free-text rule and the ops rule (BB-414)",
     expect(derivedStalled({ ...binding(), assessedLiveness: { stalled: true, live: false } }, NOW)).toBe(false);
   });
 
-  it("ops: no assessment, so the free-text rule is computed on read", () => {
-    const ops = (over: Partial<AssessmentInput["binding"]> = {}) => ({ ...binding({ kind: "ops", ...over }), assessedLiveness: null });
+  it("ops: reads the liveness the ops reconcile stores, so a live source is not stalled", () => {
+    const ops = (over: Partial<AssessmentInput["binding"]> = {}, liveness: { stalled: boolean; live: boolean } | null = null) => ({ ...binding({ kind: "ops", ...over }), assessedLiveness: liveness });
+    // The ops reconcile stores the free-text rule's own liveness, so a running
+    // worker or an open escalation (live: true) keeps the wait un-stalled.
+    expect(derivedStalled(ops({ status: status("the vendor") }, { stalled: false, live: true }), NOW)).toBe(false);
+    expect(derivedStalled(ops({ status: status("the vendor") }, { stalled: true, live: false }), NOW)).toBe(true);
+    // A brand-new binding with no assessment yet falls back to the free-text
+    // rule on read with no live source.
     expect(derivedStalled(ops({ status: status("the vendor") }), NOW)).toBe(true);
     expect(derivedStalled(ops({ status: status("the vendor"), requeueUntil: NOW + 86_400_000 }), NOW)).toBe(false);
     expect(derivedStalled(ops({ status: null }), NOW)).toBe(false);

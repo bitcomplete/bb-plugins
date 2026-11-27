@@ -1981,24 +1981,16 @@ export type DivergenceRow = {
 
 /**
  * BB-333: one binding's typed-wait shadow state, the reader's row for
- * `bb stewards wait-divergences`. `derived` is the stall the typed wait derives
- * on each reconcile; `reported` is the stored assessment's stall that the
- * retired `noWakeSource` column used to hold (a reconcile was its only writer
- * for a ticket or pull request since BB-375; an ops binding's report wrote it
- * before BB-414). The `kind`, `firstSeenAt`, `lastSeenAt` and `count` come from
- * the `waitStall` divergence row the state last wrote, so a divergence that has
- * stopped still reads back with its history. `at` is when the derived/reported
- * pair last changed. Read-only: nothing writes this table since BB-414, and no
- * consumer reads it to decide or render.
+ * `bb stewards wait-divergences`. `derived` is the stall the typed wait derived
+ * on each reconcile; `reported` is the old `no_wake_source` flag as the retired
+ * writer last saw it. BB-414 removed that writer, so the table is frozen
+ * history; `at` is when the pair last changed. Read-only, and nothing reads it
+ * to decide or render.
  */
 export type WaitDivergenceRow = {
   bindingId: string;
   derived: boolean;
   reported: boolean;
-  kind: string | null;
-  firstSeenAt: number | null;
-  lastSeenAt: number | null;
-  count: number;
   at: number;
 };
 
@@ -2347,35 +2339,11 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const pruneDivergencesByCountStmt = lazy<[number], unknown>(
     "DELETE FROM assessment_divergences WHERE id NOT IN (SELECT id FROM assessment_divergences ORDER BY last_seen_at DESC, id LIMIT ?)",
   );
-  // BB-333: the last derived-vs-flag state per binding, so a typed-wait
-  // divergence row is written only when the disagreement starts. The
-  // `(binding_id, surface, old, new)` unique constraint caps the rows at two
-  // per binding, so no separate per-binding prune is needed. Prepared lazily: a
-  // store from before this group has no table yet.
-  const getWaitDivergenceStateStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM wait_divergence_state WHERE binding_id = ?");
-  const upsertWaitDivergenceStateStmt = lazy<[string, number, number, number], unknown>(
-    "INSERT INTO wait_divergence_state (binding_id, derived, reported, at) VALUES (?, ?, ?, ?) ON CONFLICT (binding_id) DO UPDATE SET derived = excluded.derived, reported = excluded.reported, at = excluded.at",
-  );
-  // Keep the open row's `last_seen_at` fresh while the disagreement stands, so
-  // the age prune cannot drop it and leave the state table saying "disagree"
-  // with no row to show for it. Scoped to the state table's pair, so a second
-  // (other-direction) row for the same binding is not touched.
-  const touchWaitDivergenceStmt = lazy<[number, string, string, string, string], unknown>(
-    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = ? WHERE binding_id = ? AND surface = 'waitStall' AND old = ? AND new = ?",
-  );
-  // The stop touch keeps the row's own inputs (the disagreement it records) and
-  // only flips its `transition`, so a stopped row still reads back the wait
-  // kind and liveness it disagreed with. Writing the current fields here would
-  // make a stopped `worker` row read `waitLive: true` next to its `derived
-  // no-wake-source` pair (BB-333). `json_set` keeps this append-only: no
-  // migration for a display-only field.
-  const stopWaitDivergenceStmt = lazy<[number, string, string, string], unknown>(
-    "UPDATE assessment_divergences SET last_seen_at = ?, inputs = json_set(inputs, '$.transition', 'stop') WHERE binding_id = ? AND surface = 'waitStall' AND old = ? AND new = ?",
-  );
-  // BB-333: the reader's side of the state table. The `bb stewards
-  // wait-divergences` command reads the current derived/reported pair per
-  // binding; the `waitStall` divergence row the pair wrote rides along for the
-  // kind and the seen window. Prepared lazily for the same reason.
+  // BB-333: the `wait_divergence_state` table's reader, for `bb stewards
+  // wait-divergences`. BB-414 removed its writer (`recordWaitDivergence`) with
+  // the retired `no_wake_source` column, so the table is frozen history: the
+  // command reads the derived-vs-stored pair per binding and nothing writes it.
+  // Prepared lazily: a store from before this group has no table yet.
   const waitDivergenceStatesStmt = lazy<[], Record<string, unknown>>("SELECT * FROM wait_divergence_state ORDER BY at DESC, binding_id");
   const waitDivergenceStatesByBindingStmt = lazy<[string], Record<string, unknown>>("SELECT * FROM wait_divergence_state WHERE binding_id = ? ORDER BY at DESC");
 
@@ -4373,35 +4341,21 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return rows.map(toDivergenceRow);
     },
     /**
-     * The typed-wait shadow's current derived-vs-flag state, one row per
-     * binding that has ever reported a typed wait (BB-333), for the
-     * `bb stewards wait-divergences` command. Read-only. The `waitStall`
-     * divergence row the pair wrote rides along for the wait kind, the
-     * first/last seen window and the count; the active direction's row is
-     * preferred, and a stopped divergence keeps its most recent row.
+     * The typed-wait shadow's frozen derived-vs-flag state, one row per binding
+     * that ever reported a typed wait (BB-333), for the `bb stewards
+     * wait-divergences` command. BB-414 removed the writer with the retired
+     * `no_wake_source` column, so this is history: `derived` is the stall the
+     * typed wait derived, `reported` the old flag, `at` when the pair last
+     * changed. Read-only; nothing reads it to decide or render.
      */
     waitDivergences(opts: { bindingId?: string } = {}): WaitDivergenceRow[] {
       const states = opts.bindingId === undefined ? waitDivergenceStatesStmt().all() : waitDivergenceStatesByBindingStmt().all(opts.bindingId);
-      const logs = (opts.bindingId === undefined ? divergencesBySurfaceStmt().all("waitStall") : divergencesByBothStmt().all(opts.bindingId, "waitStall")).map(toDivergenceRow);
-      const token = (v: boolean): string => (v ? "no-wake-source" : "source-or-no-wait");
-      return states.map((r) => {
-        const bindingId = String(r.binding_id);
-        const derived = Number(r.derived) !== 0;
-        const reported = Number(r.reported) !== 0;
-        const mine = logs.filter((d) => d.bindingId === bindingId);
-        const active = derived !== reported ? mine.find((d) => d.old === token(reported) && d.new === token(derived)) : undefined;
-        const latest = active ?? [...mine].sort((a, b) => b.lastSeenAt - a.lastSeenAt)[0];
-        return {
-          bindingId,
-          derived,
-          reported,
-          kind: latest !== undefined && typeof latest.inputs.waitKind === "string" ? latest.inputs.waitKind : null,
-          firstSeenAt: latest?.firstSeenAt ?? null,
-          lastSeenAt: latest?.lastSeenAt ?? null,
-          count: latest?.count ?? 0,
-          at: Number(r.at),
-        };
-      });
+      return states.map((r) => ({
+        bindingId: String(r.binding_id),
+        derived: Number(r.derived) !== 0,
+        reported: Number(r.reported) !== 0,
+        at: Number(r.at),
+      }));
     },
     /**
      * Bound the divergence log: drop rows last seen before `maxAgeMs` and keep
@@ -4412,60 +4366,6 @@ export function createStore(db: Database.Database, now: () => number, options: S
       let removed = pruneDivergencesByAgeStmt().run(at - maxAgeMs).changes;
       removed += pruneDivergencesByCountStmt().run(maxRows).changes;
       return removed;
-    },
-    /**
-     * Record a typed-wait divergence from the stored assessment's stall
-     * (BB-333; the reconcile was its only writer since BB-375, and it no longer
-     * writes at all since BB-414). A `waitStall` row is written only when the
-     * disagreement starts; while it stands the open row's `last_seen_at` is
-     * refreshed so the age prune cannot drop it, and when it stops the row is
-     * noted and the state cleared without adding a row that would read as a
-     * divergence. The `(binding_id, surface, old, new)` unique constraint caps
-     * the rows at two per binding. Returns whether a divergence row was written.
-     */
-    recordWaitDivergence(fields: { bindingId: string; derived: boolean; reported: boolean; waitKind: string | null; waitLive: boolean; inputs: Record<string, unknown> }, at = now()): boolean {
-      const derived = fields.derived ? 1 : 0;
-      const reported = fields.reported ? 1 : 0;
-      const disagree = derived !== reported;
-      const prev = getWaitDivergenceStateStmt().get(fields.bindingId);
-      const prevDerived = prev === undefined ? null : Number(prev.derived);
-      const prevReported = prev === undefined ? null : Number(prev.reported);
-      const prevDisagree = prevDerived === null ? null : prevDerived !== prevReported;
-      const old = (v: number): string => (v === 1 ? "no-wake-source" : "source-or-no-wait");
-      const note = (transition: string): string => JSON.stringify({ ...fields.inputs, waitKind: fields.waitKind, waitLive: fields.waitLive, transition });
-      const touch = (transition: string, d: number, r: number): void => {
-        touchWaitDivergenceStmt().run(at, note(transition), fields.bindingId, old(r), old(d));
-      };
-      const stop = (d: number, r: number): void => {
-        stopWaitDivergenceStmt().run(at, fields.bindingId, old(r), old(d));
-      };
-      const pairChanged = prevDerived !== derived || prevReported !== reported;
-      if (!pairChanged) {
-        // No transition. An ongoing disagreement keeps its open row fresh so
-        // the age prune cannot drop it; an agreement writes nothing.
-        if (disagree) touch("ongoing", prevDerived!, prevReported!);
-        return false;
-      }
-      // The pair changed. If the previous pair disagreed, that disagreement
-      // stopped: note it on the old row, never as a row of its own (its `old`
-      // would equal its `new`). A change from one disagreement to the other is
-      // that stop plus a new start.
-      if (prevDisagree === true) stop(prevDerived!, prevReported!);
-      upsertWaitDivergenceStateStmt().run(fields.bindingId, derived, reported, at);
-      if (!disagree) return false;
-      // A start: the first observation of a disagreement, a move from
-      // agreement to disagreement, or a flip to the other direction.
-      insertDivergenceStmt().run(
-        newId("dvg"),
-        fields.bindingId,
-        "waitStall",
-        old(reported),
-        old(derived),
-        note("start"),
-        at,
-        at,
-      );
-      return true;
     },
     /**
      * Forget a deleted project: its bindings and everything keyed by them

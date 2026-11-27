@@ -748,10 +748,10 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
     lastCommentedAt: null,
     ...over,
   });
-  const opsWake = (finding: OpsFinding) =>
+  const opsWake = (finding: OpsFinding, b = binding("k8s-namespace/web-production")) =>
     formatOpsWake({
       reason: "changed",
-      binding: binding("k8s-namespace/web-production"),
+      binding: b,
       playbook: parsedPlaybook(OPS_WATCH, "ops-watch"),
       look: { at, target: "k8s-namespace/web-production", error: null, pods: 1, healthy: 0, deployments: [], warnings: [], logs: "unneeded", notes: [], findings: [finding] },
       target: { target: "ENG", source: "linear" },
@@ -808,6 +808,13 @@ describe("the ops and deps wake classification lines (BB-136)", () => {
   it("shows the class, the ticket and the assignee for every class, in both formatters", () => {
     expect(opsWake(opsFinding())).toMatch(/New \(no ticket found\)/u);
     expect(opsWake(opsFinding())).toMatch(/Assignee: Jane/u);
+    // BB-414: the ops no-wake-source paragraph is the derived stall, so a live
+    // source (the reconcile's stored liveness) suppresses it.
+    const waitStatus = { phase: "watching", summary: "Waiting.", nextAction: "the vendor", actor: "other" as const, waitingOn: "the vendor's reply", requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at };
+    const stalled = { ...binding("k8s-namespace/web-production"), status: waitStatus, assessedLiveness: { stalled: true, live: false } };
+    const live = { ...binding("k8s-namespace/web-production"), status: waitStatus, assessedLiveness: { stalled: false, live: true } };
+    expect(opsWake(opsFinding(), stalled)).toContain("**Waiting with no wake source.**");
+    expect(opsWake(opsFinding(), live)).not.toContain("**Waiting with no wake source.**");
     const recurring = opsWake(opsFinding({ class: "recurring", ticket: "ENG-50", ticketState: "In Progress" }));
     expect(recurring).toMatch(/Recurring on ENG-50 \(open\)/u);
     expect(recurring).toMatch(/ticket ENG-50 \(In Progress\)/u);

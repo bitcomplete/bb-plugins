@@ -11157,9 +11157,9 @@ describe("ops stewards", () => {
     return { t, c, steward, wakes };
   }
 
-  // The ops derived stall is the free-text `observedStall` rule computed on
-  // read (BB-414); an ops binding has no assessment to store, so the report and
-  // the reconcile both leave no column behind.
+  // The ops derived stall is the free-text `observedStall` rule (BB-414): the
+  // ops reconcile stores the rule's own liveness on the assessment row, and
+  // `derivedStalled` reads it.
   it("derives the no-wake-source mark on read for an ops binding", async () => {
     const { t, steward } = await watched();
     const ops = steward()!;
@@ -11173,6 +11173,28 @@ describe("ops stewards", () => {
     // Clearing the wait clears the derivation at once.
     const cleared = await t.tool("steward_report", { phase: "watching", summary: "Nothing waiting.", nextAction: "Watch", actor: "steward", waitingOn: "" }, ops.id);
     expect(cleared.error).toBe(false);
+    await t.hooks.reconcilePass("p1");
+    expect(derivedStalled(t.hooks.store.find(TARGET)!, t.now())).toBe(false);
+  });
+
+  it("keeps an ops wait un-stalled while a worker runs or an escalation is open", async () => {
+    const { t, steward } = await watched();
+    const ops = steward()!;
+    const id = t.hooks.store.find(TARGET)!.id;
+    // A running worker is a live source, so the free-text wait is not stalled
+    // and the ops wake carries no no-wake-source paragraph.
+    await t.created("thr_w9", ops.id, `${TARGET}: restart the router`);
+    const report = await t.tool("steward_report", { phase: "watching", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the worker's result" }, ops.id);
+    expect(report.error).toBe(false);
+    expect(report.text).not.toContain("Nothing the plugin tracks will deliver this wait");
+    await t.hooks.reconcilePass("p1");
+    expect(derivedStalled(t.hooks.store.find(TARGET)!, t.now())).toBe(false);
+    // The worker finishes without parking: the same wait is now stalled.
+    t.hooks.store.setWorker("thr_w9", "finished", "done");
+    await t.hooks.reconcilePass("p1");
+    expect(derivedStalled(t.hooks.store.find(TARGET)!, t.now())).toBe(true);
+    // An open escalation is a live source too.
+    t.hooks.store.escalate({ bindingId: id, kind: "decision", question: "Which model?", meanwhile: "Wait.", route: "project", recommendation: null, projectId: "p1" });
     await t.hooks.reconcilePass("p1");
     expect(derivedStalled(t.hooks.store.find(TARGET)!, t.now())).toBe(false);
   });
@@ -17413,7 +17435,7 @@ describe("a wait with no wake source (BB-154)", () => {
     // BB-375: the report no longer writes the column; a reconcile derives it.
     await t.hooks.reconcilePass("p1");
     const b = t.hooks.store.find("ENG-12")!;
-    expect(b.assessedLiveness?.stalled ?? false).toBe(true);
+    expect(derivedStalled(b, t.now())).toBe(true);
     // The report that set the wait was an adoption wake, not a requeue.
     expect(b.requeueWakeCount).toBe(0);
     // Criterion 2: the CLI status line reads the mark (the page half is `effortPhrase`).
@@ -17432,11 +17454,13 @@ describe("a wait with no wake source (BB-154)", () => {
     const id = t.hooks.store.find("ENG-12")!.id;
     t.hooks.store.patch(id, { hold: "behind ENG-9", holdBehind: ["ENG-9"] });
     await t.tool("steward_report", waitReport("ENG-9"), steward);
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    await t.hooks.reconcilePass("p1");
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
 
     t.hooks.store.patch(id, { hold: null, holdBehind: [], deployments: deploying(t.now()) as never });
     await t.tool("steward_report", waitReport("the deploy"), steward);
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    await t.hooks.reconcilePass("p1");
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
   });
 
   it("counts a merge hold as a live source: no mark and no stall across two requeues (BB-256)", async () => {
@@ -17447,7 +17471,8 @@ describe("a wait with no wake source (BB-154)", () => {
     await t.tool("steward_report", report, steward);
     const b = t.hooks.store.find("ENG-12")!;
     expect(b.mergeBehind).toEqual(["ENG-13"]);
-    expect(b.assessedLiveness?.stalled ?? false).toBe(false);
+    await t.hooks.reconcilePass("p1");
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
     await requeue(t);
     await t.tool("steward_report", report, steward);
     await requeue(t);
@@ -17516,7 +17541,7 @@ describe("the report reply for a wait with no wake source (BB-339)", () => {
     expect(res.text).not.toContain("End the turn now");
     // BB-375: the report reply derives the sentence; only a reconcile writes the column.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(true);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(true);
   });
 
   it("names an open binding the free text mentions, with the exact hold call", async () => {
@@ -17544,7 +17569,7 @@ describe("the report reply for a wait with no wake source (BB-339)", () => {
     const { t, steward } = await bound();
     const res = await t.tool("steward_report", waitReport("the vendor's reply", { until: "2026-12-01" }), steward);
     expect(res.error).toBe(false);
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
     expect(res.text).not.toContain("Nothing the plugin tracks will deliver this wait");
     expect(res.text).toContain("You will be woken when something actionable changes");
   });
@@ -17554,7 +17579,8 @@ describe("the report reply for a wait with no wake source (BB-339)", () => {
     await t.created("thr_w1", steward, "ENG-12: Implement");
     const res = await t.tool("steward_report", waitReport("the worker's result"), steward);
     expect(res.error).toBe(false);
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    await t.hooks.reconcilePass("p1");
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
     expect(res.text).not.toContain("Nothing the plugin tracks will deliver this wait");
     expect(res.text).toContain("You will be woken when something actionable changes");
   });
@@ -17590,24 +17616,24 @@ describe("the report reply for a wait with no wake source (BB-339)", () => {
     expect(res.text).not.toContain("End the turn now");
     // BB-375: the report no longer writes the column; a reconcile derives it.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(true);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(true);
   });
 
-  // BB-375 (BB-291 criterion 4): the report derives the no-wake-source sentence
-  // for its reply and stores nothing. The column the rows and the wake read is
-  // written only by the reconcile, from the one assessment.
-  it("leaves the noWakeSource column to the reconcile, not the report (BB-375)", async () => {
+  // BB-414 (BB-291 criterion 4): the report derives the no-wake-source sentence
+  // for its reply and stores nothing; `derivedStalled` computes the free-text
+  // rule on read, so the new wait is visible at once, not only after a
+  // reconcile.
+  it("derives the no-wake-source answer on read, not from a report-time write (BB-414)", async () => {
     const { t, steward } = await bound();
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
     const res = await t.tool("steward_report", waitReport("the vendor's reply"), steward);
     expect(res.error).toBe(false);
     // The reply warns in the turn the wait is set...
     expect(res.text).toContain("Nothing the plugin tracks will deliver this wait");
-    // ...but the report changed nothing in the column.
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
-    // Only a reconcile writes it.
+    // ...and the derivation reads the new wait at once, with no reconcile.
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(true);
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(true);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(true);
   });
 });
 
@@ -17632,7 +17658,7 @@ describe("a dated wait (BB-247)", () => {
     const b = t.hooks.store.find("ENG-12")!;
     expect(b.requeueUntil).toBe(at);
     expect(b.requeueAt).toBe(at);
-    expect(b.assessedLiveness?.stalled ?? false).toBe(false);
+    expect(derivedStalled(b, t.now())).toBe(false);
     // The date is on `bb stewards show` (the row half is `effortPhrase`).
     expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toContain("waiting on the vendor's reply until 2026-12-01");
     expect(res.text).toContain("at 2026-12-01T00:00:00Z");
@@ -17864,7 +17890,7 @@ describe("a typed wait (BB-333)", () => {
     // BB-375: only a reconcile writes the column now. BB-389: the parked worker
     // and the second open own pull are live, so the column stays false.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
   });
 
   // bb-plugins#294: a `pr` binding's own open pull with a free-text wait. The
@@ -17881,7 +17907,7 @@ describe("a typed wait (BB-333)", () => {
     expect(t.hooks.store.find("acme/web#7")!.wait).toEqual({ kind: "external", ref: "acme/web#7" });
     // BB-375: only a reconcile writes the column now.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("acme/web#7")!.assessedLiveness?.stalled ?? false).toBe(true);
+    expect(derivedStalled(t.hooks.store.find("acme/web#7")!, t.now())).toBe(true);
   });
 
   // prod#422 / BCP-157: a ticket waiting on the owner's approval, with no
@@ -17902,7 +17928,7 @@ describe("a typed wait (BB-333)", () => {
     // BB-375: only a reconcile writes the column now. BB-389: the open pull
     // watch is live, so the column stays false.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
   });
 
   // prod#430 / BCP-160: a ticket waiting on a foreign pull's checks, not
@@ -17917,7 +17943,7 @@ describe("a typed wait (BB-333)", () => {
     expect(t.hooks.store.find("ENG-12")!.wait).toEqual({ kind: "pull", ref: "acme/web#430" });
     // BB-375: only a reconcile writes the column now.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(true);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(true);
   });
 });
 
@@ -17951,7 +17977,7 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     await t.hooks.reconcilePass("p1");
     // BB-389: the parked worker and the second open own pull are live, so the
     // stored flag and the derived stall agree on false.
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
     expect(derived(t, b.id)).toMatchObject({ stalled: false, waitLive: false });
     // The shadow's divergence table stopped being written: the flag and the
     // derivation agree by construction.
@@ -17978,7 +18004,7 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     await t.hooks.reconcilePass("p1");
     // BB-389: the open pull watch is live, so the external person wait does not
     // stall.
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
     expect(derived(t, b.id)).toMatchObject({ stalled: false, waitLive: false });
   });
 
@@ -18060,10 +18086,10 @@ describe("the typed wait's shadow derivation (BB-333)", () => {
     expect(b.wait).toEqual({ kind: "date", ref: "2027-07-01" });
     expect(b.requeueUntil).toBe(Date.UTC(2027, 6, 1));
     // A future date is the plugin's own wake source, so the wait is not marked.
-    expect(b.assessedLiveness?.stalled ?? false).toBe(false);
+    expect(derivedStalled(b, t.now())).toBe(false);
     await t.hooks.reconcilePass("p1");
     expect(derived(t, b.id)).toMatchObject({ stalled: false, waitLive: true });
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
   });
 });
 
@@ -19282,7 +19308,7 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     expect(report.error).toBe(false);
     // BB-375: the report no longer writes the column; a reconcile derives it.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("acme/web#7")!.assessedLiveness?.stalled ?? false).toBe(true);
+    expect(derivedStalled(t.hooks.store.find("acme/web#7")!, t.now())).toBe(true);
   });
 
   it("marks a ticket's free-text wait no-wake-source when its own pull request is gate-met", async () => {
@@ -19295,7 +19321,7 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     expect(report.error).toBe(false);
     // BB-375: the report no longer writes the column; a reconcile derives it.
     await t.hooks.reconcilePass("p1");
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(true);
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(true);
   });
 
   it("does not raise the gate-met stuck for a teammate's approved pull request, and keeps the author hold (BB-382)", async () => {
@@ -19456,7 +19482,8 @@ describe("a gate-met pull request nobody acts on (BB-285)", () => {
     t.hooks.store.setWorker("thr_w1", "finished", "Opened https://github.com/acme/web/pull/7 for ENG-12.");
     const report = await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the reviewer's reply", requeueAfter: "1m" }, b.threadId!);
     expect(report.error).toBe(false);
-    expect(t.hooks.store.find("ENG-12")!.assessedLiveness?.stalled ?? false).toBe(false);
+    await t.hooks.reconcilePass("p1");
+    expect(derivedStalled(t.hooks.store.find("ENG-12")!, t.now())).toBe(false);
   });
 });
 
@@ -19479,7 +19506,7 @@ describe("bb stewards divergences (BB-293)", () => {
       [
         { bindingId: b.id, surface: "workerInFlight", old: "in-flight", new: "parked", inputs: { binding: b.id, workers: 1, states: "finished" } },
         { bindingId: b.id, surface: "approvals.gate", old: "owner approval needed", new: "met", inputs: { binding: b.id } },
-        { bindingId: "bnd_other", surface: "waitStall", old: "no-wake-source", new: "source-or-no-wait", inputs: {} },
+        { bindingId: "bnd_other", surface: "idleInActiveStage", old: "idle", new: "parked", inputs: {} },
       ],
       5_000,
     );
@@ -19488,13 +19515,13 @@ describe("bb stewards divergences (BB-293)", () => {
     expect(all.exitCode).toBe(0);
     expect(all.stdout).toContain("workerInFlight");
     expect(all.stdout).toContain("approvals.gate");
-    expect(all.stdout).toContain("waitStall");
+    expect(all.stdout).toContain("idleInActiveStage");
 
     // --binding resolves an entity key to the binding and keeps only its rows.
     const one = await t.harness.behavior.runCli(["divergences", "--binding", "ENG-12"]);
     expect(one.stdout).toContain("workerInFlight");
     expect(one.stdout).toContain("approvals.gate");
-    expect(one.stdout).not.toContain("waitStall");
+    expect(one.stdout).not.toContain("idleInActiveStage");
 
     // --surface keeps only that surface.
     const surface = await t.harness.behavior.runCli(["divergences", "--surface", "approvals.gate"]);
@@ -19526,27 +19553,29 @@ describe("bb stewards divergences (BB-293)", () => {
 });
 
 // BB-333: the typed-wait shadow's state table has a read-only reader, `bb
-// stewards wait-divergences`, the sibling of the BB-293 divergence log. The
-// reconcile writes the state; the command only reads it, and nothing decides
-// or renders from what it prints.
+// stewards wait-divergences`, the sibling of the BB-293 divergence log. BB-414
+// removed the state's writer with the retired column, so the command reads
+// frozen history; nothing decides or renders from what it prints.
 describe("bb stewards wait-divergences (BB-333)", () => {
-  it("lists the derived-vs-noWakeSource state, with a binding filter and --json", async () => {
+  it("lists the frozen derived-vs-stored state, with a binding filter and --json", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const b = t.hooks.store.find("ENG-12")!;
-    // Seed the state the way the shadow reconcile writes it: a typed wait that
-    // derives a stall the stored flag did not, and the other direction
-    // under a second binding.
-    t.hooks.store.recordWaitDivergence({ bindingId: b.id, derived: true, reported: false, waitKind: "person", waitLive: false, inputs: {} }, 1_000);
-    t.hooks.store.recordWaitDivergence({ bindingId: "bnd_other", derived: false, reported: true, waitKind: "pull", waitLive: true, inputs: {} }, 2_000);
+    // Seed the frozen state directly: a typed wait that derived a stall the
+    // stored flag did not, and the other direction under a second binding.
+    const seed = (bindingId: string, derived: number, reported: number, at: number): void => {
+      t.hooks.db.prepare("INSERT INTO wait_divergence_state (binding_id, derived, reported, at) VALUES (?, ?, ?, ?)").run(bindingId, derived, reported, at);
+    };
+    seed(b.id, 1, 0, 1_000);
+    seed("bnd_other", 0, 1, 2_000);
 
     const all = await t.harness.behavior.runCli(["wait-divergences"]);
     expect(all.exitCode).toBe(0);
     expect(all.stdout).toContain(b.id);
     expect(all.stdout).toContain("bnd_other");
-    expect(all.stdout).toContain("kind=person");
-    expect(all.stdout).toContain("kind=pull");
+    expect(all.stdout).toContain("derived=no-wake-source  stored=source-or-no-wait");
+    expect(all.stdout).toContain("derived=source-or-no-wait  stored=no-wake-source");
 
     // --binding resolves an entity key to the binding and keeps only its rows;
     // --project is the same resolution scope the `divergences` command uses.
@@ -19557,7 +19586,7 @@ describe("bb stewards wait-divergences (BB-333)", () => {
 
     // --json emits the rows, booleans and all.
     const json = await t.harness.behavior.runCli(["wait-divergences", "--binding", "ENG-12", "--json"]);
-    expect(JSON.parse(json.stdout)).toEqual([{ bindingId: b.id, derived: true, reported: false, kind: "person", firstSeenAt: 1_000, lastSeenAt: 1_000, count: 1, at: 1_000 }]);
+    expect(JSON.parse(json.stdout)).toEqual([{ bindingId: b.id, derived: true, reported: false, at: 1_000 }]);
   });
 
   it("is registered with its own help text", async () => {

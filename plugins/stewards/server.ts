@@ -424,21 +424,17 @@ export function formatDivergences(rows: ReadonlyArray<Pick<DivergenceRow, "bindi
 
 /**
  * BB-333: the human-readable typed-wait shadow state, one line per binding
- * (derived result, stored result, kind, count, first/last seen). The reader for
+ * (derived result, old stored flag, when the pair last changed). The reader for
  * the `wait_divergence_state` table behind `bb stewards wait-divergences`; like
- * `formatDivergences`, nothing reads it to decide. BB-414 retires the surface's
- * writer, so the rows are frozen history.
+ * `formatDivergences`, nothing reads it to decide. BB-414 removed the table's
+ * writer with the retired `no_wake_source` column, so the rows are frozen
+ * history.
  */
 export function formatWaitDivergences(rows: ReadonlyArray<WaitDivergenceRow>): string {
   if (rows.length === 0) return "No wait divergences recorded.";
   const at = (ms: number): string => new Date(ms).toISOString().replace("T", " ").slice(0, 19);
   const result = (v: boolean): string => (v ? "no-wake-source" : "source-or-no-wait");
-  return rows
-    .map((d) => {
-      const window = d.firstSeenAt === null || d.lastSeenAt === null ? "never" : `${at(d.firstSeenAt)} -> ${at(d.lastSeenAt)}`;
-      return `${d.bindingId}  derived=${result(d.derived)}  stored=${result(d.reported)}  kind=${d.kind ?? "-"}  x${d.count}  ${window}`;
-    })
-    .join("\n");
+  return rows.map((d) => `${d.bindingId}  derived=${result(d.derived)}  stored=${result(d.reported)}  ${at(d.at)}`).join("\n");
 }
 
 /** Whitespace-normalised text, so a lesson matches however the playbook wraps it. */
@@ -6894,9 +6890,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const target = parseOpsTargetKey(b.entityId);
       // A target no longer listed is ended by the sweep.
       if (target === null || !allOpsTargets(config).some((t) => opsTargetKey(t) === b.entityId)) return;
-      // BB-414: the ops no-wake-source mark is no longer written; an ops
-      // binding's derived stall is the free-text `observedStall` rule computed
-      // on read by `derivedStalled` (ops has no snapshot, so no assessment).
+      // BB-414: an ops binding has no snapshot, so `assess()` never runs for
+      // it. The reconcile stores the free-text rule's own liveness here, so
+      // `derivedStalled` reads a real live source instead of assuming none; the
+      // stall is recomputed on every ops reconcile, never a report-time flag.
+      // `bindingWakeSources` is the same live-source read the retired column
+      // used, so the ops cost is unchanged.
+      const opsLive = rowLiveSource(bindingWakeSources(b, new Set()));
+      store.recordAssessment({ bindingId: b.id, at: now(), gate: {}, worker: {}, liveness: { stalled: observedStall(b, opsLive, now()), live: opsLive }, resources: [], holds: [] });
       if (target.kind === "dependabot") {
         await reconcileDeps(b, config, playbook, target, force);
         return;
@@ -17025,7 +17026,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             description: "Every place the shadow assessment disagrees with the predicate it will replace, one row per distinct (binding, surface, old, new) with a first/last seen time and a count. --binding filters by binding id or entity key, --surface by surface name. --json emits the rows. Nothing reads the log to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's divergences (binding id or entity key)" },
-              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, approvals.gate, approvals.pageRefusal, waitStall, compose.waits, compose.holds, compose.resources)" },
+              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, approvals.gate, approvals.pageRefusal, compose.waits, compose.holds, compose.resources)" },
               project: PROJECT_OPTION,
               json: JSON_OPTION,
             },
@@ -17040,7 +17041,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           "wait-divergences": cliCommand({
             summary: "The typed wait's shadow state, derived vs stored (BB-333), read-only",
-            description: "One row per binding that has reported a typed wait: the stall derived from the wait kind on the last reconcile, the stored assessment's stall (a reconcile was its only writer since BB-375; the retired column it mirrored is never read), and the wait kind, first/last seen time and count from the waitStall divergence row behind that state. --binding filters by binding id or entity key. --json emits the rows. Read-only: nothing reads the state to decide or render.",
+            description: "One row per binding that has ever reported a typed wait: the stall the typed wait derived on its last reconcile, the old no_wake_source flag as the retired writer last saw it, and when the pair last changed. BB-414 removed that writer with the column, so this is frozen history. --binding filters by binding id or entity key. --json emits the rows. Read-only: nothing reads the state to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's wait divergences (binding id or entity key)" },
               project: PROJECT_OPTION,
