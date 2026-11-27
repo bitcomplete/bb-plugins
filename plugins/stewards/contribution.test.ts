@@ -265,15 +265,28 @@ describe("the github contributor (BB-380)", () => {
     // A gate-unmet own pull is `gate-not-met`, named by its key.
     expect(githubContributor.contribute(matrix("ticket", "build")).reasons).toEqual([{ source: "github", code: "gate-not-met", detail: "acme/web#8", at: 1_000_000 }]);
 
-    // A closed own pull is `pull-closed`, even while its gate is unmet.
+    // A closed or merged own pull is `pull-closed`, matching `syncPullApproval`,
+    // even while its gate is unmet.
     const closed = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", state: "closed" }, { merged: false });
     const closedInput = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [closed] }, ownPulls: own(closed), decisions: new Map([[closed.key.toLowerCase(), "user"]]) });
     expect(githubContributor.contribute(closedInput).reasons).toEqual([{ source: "github", code: "pull-closed", detail: "acme/web#7", at: 1_000_000 }]);
+    const mergedPull = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", state: "merged" }, { merged: true });
+    const mergedInput = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [mergedPull] }, ownPulls: own(mergedPull), decisions: new Map([[mergedPull.key.toLowerCase(), "user"]]) });
+    expect(githubContributor.contribute(mergedInput).reasons).toEqual([{ source: "github", code: "pull-closed", detail: "acme/web#7", at: 1_000_000 }]);
 
     // A gate-met draft is `pull-draft`.
     const draft = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [noReviewMarker] }, { headSha: head, ...green, draft: true });
     const draftInput = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [draft] }, ownPulls: own(draft), decisions: new Map([[draft.key.toLowerCase(), "user"]]) });
     expect(githubContributor.contribute(draftInput).reasons).toEqual([{ source: "github", code: "pull-draft", detail: "acme/web#7", at: 1_000_000 }]);
+
+    // `merge-steward-filed` and `worker-running` precede `pull-draft` in
+    // `syncNeeds`; neither is a contributor-owned reason, so the composer
+    // yields and composes nothing rather than a draft reason the recorded
+    // branch would not have reached.
+    const stewardFiled = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [draft] }, ownPulls: own(draft), decisions: new Map([[draft.key.toLowerCase(), "user"]]), needs: [{ kind: "merge", url: draft.url!, filedBy: "steward" } as never] });
+    expect(githubContributor.contribute(stewardFiled).reasons).toEqual([]);
+    const running = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [draft] }, ownPulls: own(draft), decisions: new Map([[draft.key.toLowerCase(), "user"]]), workers: [{ threadId: "thr_w1", status: "running" } as never] });
+    expect(githubContributor.contribute(running).reasons).toEqual([]);
 
     // A gate-met pull under the binding's merge hold is `merge-held`.
     const merged = gateMetPull("acme/web#7", "https://github.com/acme/web/pull/7");

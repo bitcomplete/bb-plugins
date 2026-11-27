@@ -460,6 +460,32 @@ describe("the declining branches record their reason (BB-335)", () => {
   });
 });
 
+// BB-415 (C8): the `compose.reasons` shadow, wired through the reconcile. The
+// old side is the look's declines filtered to the contributor-owned codes; a
+// stale history or a reconcile-level decline records nothing.
+describe("the compose.reasons divergence (BB-415)", () => {
+  it("records a row for an owned decline the composer cannot derive", async () => {
+    const t = await setup();
+    const b = await gateMetTicket(t, { base: "release" });
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    const rows = t.hooks.store.divergences({ bindingId: b.id, surface: "compose.reasons" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ surface: "compose.reasons", old: "base-not-default", new: "" });
+  });
+
+  it("records nothing for a reconcile-level decline no contributor owns", async () => {
+    const t = await setup();
+    t.threads.set("thr_steward", { status: "idle", archivedAt: null });
+    t.entities.set("uuid-12", issue());
+    const b = create(t);
+    t.hooks.store.patch(b.id, { threadId: "thr_steward" });
+    await t.hooks.reconcilePass("p1");
+    await t.flush();
+    expect(t.hooks.store.divergences({ bindingId: b.id, surface: "compose.reasons" })).toEqual([]);
+  });
+});
+
 // ---- the render surfaces -----------------------------------------------------
 
 describe("the non-action render surfaces (BB-335)", () => {

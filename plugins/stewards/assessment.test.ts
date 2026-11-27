@@ -325,25 +325,40 @@ describe("the composed resources and holds divergences (BB-412, C6)", () => {
   });
 });
 
-// BB-415 (C8): the composed reasons divergence. The recorded non-action codes
-// are the old side; a mismatch records, a match records nothing.
+// BB-415 (C8): the composed reasons divergence. The old side is the codes this
+// look declined, filtered to the codes a contributor owns; a mismatch records,
+// a match records nothing. The binding's whole non-action history is not read.
 describe("the composed reasons divergence (BB-415, C8)", () => {
-  it("records a compose.reasons row when the recorded codes and the composed codes differ", () => {
-    const i = input({ binding: binding({ nonActions: { "merge-refused": { date: "2026-11-27", text: "x" } } }) });
-    const rows = compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface === "compose.reasons");
+  it("records a compose.reasons row when the look's owned declined codes and the composed codes differ", () => {
+    const i = input();
+    const rows = compare(i, assess(i), composeAssessment(i), new Set(["base-not-default"])).filter((d) => d.surface === "compose.reasons");
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ surface: "compose.reasons", old: "merge-refused", new: "", inputs: { binding: "b1", recorded: 1, composed: 0 } });
+    expect(rows[0]).toMatchObject({ surface: "compose.reasons", old: "base-not-default", new: "", inputs: { binding: "b1", recorded: 1, composed: 0 } });
   });
 
-  it("records nothing when the recorded codes and the composed codes match", () => {
+  it("records nothing when the look's owned declined codes and the composed codes match", () => {
     const second = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
     const i = input({
-      binding: binding({ nonActions: { "gate-not-met": { date: "2026-11-27", text: "x" } } }),
       observed: { entity: issue({ state: "In Progress" }), pulls: [second] },
       ownPulls: own(second),
       decisions: new Map([[second.key.toLowerCase(), "user"]]),
     });
-    expect(compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface === "compose.reasons")).toEqual([]);
+    expect(compare(i, assess(i), composeAssessment(i), new Set(["gate-not-met"])).filter((d) => d.surface === "compose.reasons")).toEqual([]);
+  });
+
+  it("ignores a stale recorded code from an earlier look", () => {
+    // The binding's non-action history says `gate-not-met`, but this look
+    // declined nothing and composed nothing, so no row records. The store's
+    // merge never removes a code, so reading the history would make the surface
+    // diverge for the rest of the binding's life.
+    const stale = { ...binding(), nonActions: { "gate-not-met": { date: "2026-11-26", text: "x" } } } as AssessmentInput["binding"];
+    const i = input({ binding: stale });
+    expect(compare(i, assess(i), composeAssessment(i), new Set()).filter((d) => d.surface === "compose.reasons")).toEqual([]);
+  });
+
+  it("ignores a reconcile-level code no contributor owns", () => {
+    const i = input();
+    expect(compare(i, assess(i), composeAssessment(i), new Set(["nothing-to-do", "worker-busy"])).filter((d) => d.surface === "compose.reasons")).toEqual([]);
   });
 });
 

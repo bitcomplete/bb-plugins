@@ -19,6 +19,7 @@
 // from the `AssessmentInput` the reconcile already holds.
 import { createHash } from "node:crypto";
 import {
+  assessWorker,
   isOwn,
   leasedLinkedPullKeys,
   ownPullEntities,
@@ -296,9 +297,17 @@ function entityContribution(source: ContributionSource, input: AssessmentInput):
  */
 function pullReasons(input: AssessmentInput, e: EntitySnapshot, g: PrGate): Reason[] {
   const reason = (code: NonActionCode): Reason => ({ source: "github", code, detail: e.key, at: input.now });
-  if (e.pull !== null && lc(e.state) === "closed" && e.pull.merged !== true) return [reason("pull-closed")];
+  // `syncPullApproval` reads a merged or closed pull as closed, so the recorded
+  // decline is `pull-closed` for a merged pull too, not `gate-not-met`.
+  if (e.pull !== null && (e.pull.merged === true || lc(e.state) === "merged" || lc(e.state) === "closed")) return [reason("pull-closed")];
   if (!g.gateMet) return [reason("gate-not-met")];
   if ((input.binding.mergeBehind ?? []).length > 0) return [reason("merge-held")];
+  // `merge-steward-filed` and `worker-running` are not source-state reasons and
+  // no contributor owns them, but they precede `pull-draft` in `syncNeeds`, so
+  // the composer yields to them rather than composing a draft reason the
+  // recorded branch would not have reached.
+  if (input.needs.some((n) => n.kind === "merge" && n.url === (e.url ?? e.key) && n.filedBy !== "plugin")) return [];
+  if (assessWorker(input.workers).reason !== null) return [];
   if (e.pull?.draft === true) return [reason("pull-draft")];
   return [];
 }
