@@ -10,7 +10,7 @@ import { randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import { entitySnapshotSchema, type Source } from "./source-contract.js";
-import type { BindingKind, EscalationKind, Stage } from "./config.js";
+import type { BindingKind, EscalationKind } from "./config.js";
 import { depsLookSchema, type DepsLook } from "./deps.js";
 import { deploymentsSchema, type Deployments } from "./deploy.js";
 import { backlogLookSchema, backlogSnapshotSchema, opsLookSchema, type BacklogLook, type BacklogSnapshot, type FingerprintRow, type OpsLook } from "./ops.js";
@@ -1162,7 +1162,8 @@ export type Binding = {
   threadId: string | null;
   parentBindingId: string | null;
   phase: string | null;
-  stage: Stage | null;
+  /** BB-417: a declared stage name; the column stays a plain string, so a new stage needs no migration. */
+  stage: string | null;
   guidance: GuidanceEntry[];
   ready: ReadyState;
   priority: string | null;
@@ -1330,7 +1331,7 @@ function rowToBinding(r: BindingRow): Binding {
     threadId: str("thread_id"),
     parentBindingId: str("parent_binding_id"),
     phase: str("phase"),
-    stage: str("stage") as Stage | null,
+    stage: str("stage"),
     guidance: json(z.array(guidanceEntrySchema), str("guidance"), []),
     ready: json(readyStateSchema, str("ready"), readyDefault()),
     priority: str("priority"),

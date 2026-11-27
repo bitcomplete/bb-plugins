@@ -58,7 +58,12 @@ import {
   playbookPath,
   playbookStates,
   roleBacklogTargets,
-  STAGES,
+  activeStageSet,
+  DEFAULT_ACTIVE_STAGES,
+  DEFAULT_STAGES,
+  firstActiveStage,
+  isStartStage,
+  lastActiveStage,
   ticketWatchId,
   ticketWatchProblems,
   validTimezone,
@@ -3606,6 +3611,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return playbookFor(config, b.kind, b.source === "ops" ? undefined : b.source);
     }
 
+    /** The declared `active` stages for a binding, from its playbook; the default set when the playbook cannot be resolved. */
+    function bindingActiveStages(config: ProjectConfig, b: Binding): ReadonlySet<string> {
+      const playbook = bindingPlaybook(config, b);
+      return playbook === null ? DEFAULT_ACTIVE_STAGES : activeStageSet(playbook.stages);
+    }
+
     /**
      * Every deployment target a project's playbooks name, each once, by
      * repo/environment. The repos are what the github plugin leases as
@@ -3941,7 +3952,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * (BB-54, BB-89): the schedule wake names the pull request facts from the
      * same read the judgement used.
      */
-    async function atWorkWithRead(b: Binding): Promise<{ atWork: boolean; observed: Observed; complete: boolean } | null> {
+    async function atWorkWithRead(b: Binding, activeStages: ReadonlySet<string>): Promise<{ atWork: boolean; observed: Observed; complete: boolean } | null> {
       const running = assessWorker(store.workers(b.id)).running;
       const fresh = await freshObserved(b);
       if (fresh === null) return null;
@@ -3950,7 +3961,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // this judgement: the project steward is woken rather than a request
       // skipped.
       const base = { ...b, lastSnapshot: fresh.observed, ...(fresh.complete ? {} : { noMorePulls: null }) };
-      return { atWork: atWork(base, { runningWorker: running }), observed: fresh.observed, complete: fresh.complete };
+      return { atWork: atWork(base, { runningWorker: running, activeStages }), observed: fresh.observed, complete: fresh.complete };
     }
 
     /**
@@ -3958,11 +3969,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * GitHub read (BB-54), each with the read the schedule wake reports from
      * (BB-89).
      */
-    async function conflictsFresh(b: Binding): Promise<Array<Conflict & { observed: Observed | null; complete: boolean }>> {
+    async function conflictsFresh(b: Binding, activeStages: ReadonlySet<string>): Promise<Array<Conflict & { observed: Observed | null; complete: boolean }>> {
       const conflicts: Array<Conflict & { observed: Observed | null; complete: boolean }> = [];
       for (const c of overlapping(b, store.open(b.projectId))) {
-        const read = await atWorkWithRead(c.with);
-        if (read === null ? atWork(c.with, { runningWorker: assessWorker(store.workers(c.with.id)).running }) : read.atWork) {
+        const read = await atWorkWithRead(c.with, activeStages);
+        if (read === null ? atWork(c.with, { runningWorker: assessWorker(store.workers(c.with.id)).running, activeStages }) : read.atWork) {
           conflicts.push({ ...c, observed: read?.observed ?? null, complete: read?.complete ?? false });
         }
       }
@@ -5272,7 +5283,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // caller reads the stored copy.
         assessedGates: assessment !== null ? assessment.gate.pulls : storedGates(store.assessment(b.id)?.gate),
         label: config.file.label,
-        conflicts: conflictsOf(b, store.open(b.projectId)),
+        conflicts: conflictsOf(b, store.open(b.projectId), activeStageSet(playbook.stages)),
         deployments: b.deployments,
         assumptions: store.openAssumptions(b.id),
         lessons: store.lessonsByTier(b.projectId, "trial").slice(0, config.file.lessons.trial.max),
@@ -6208,14 +6219,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // BB-203: an open need or `user` escalation keeps the worker's own pull
       // request activity loud, so the steward can reconcile the user's item.
       const userWaiting = store.openNeeds(b.id).length > 0 || store.openEscalations(b.id).some((x) => x.status === "open" && x.route === "user");
-      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: (threadId) => isUserThread(approvalsCtx, threadId), source: observed.entity.source, owner: observed.entity.source === "local" ? observed.entity.viewer : null });
+      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userWaiting, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, activeStages: activeStageSet(playbook.stages), userThread: (threadId) => isUserThread(approvalsCtx, threadId), source: observed.entity.source, owner: observed.entity.source === "local" ? observed.entity.viewer : null });
       changes.push(...fresh);
       // BB-248: a label that changes the phase with no state change is news
       // on its own; a state move already carries its own actionable line. The
       // worker's own build/review loop stays quiet (BB-52).
       const stateMoved = prev !== null && prev.entity.state !== entity.state;
       if (!stateMoved && phase !== b.phase) {
-        const own = workerInFlight && isOwnStageChange(b.stage, stage);
+        const own = workerInFlight && isOwnStageChange(b.stage, stage, activeStageSet(playbook.stages));
         changes.push({ text: `Phase: ${b.phase ?? entity.state} → ${phase}`, actionable: !own });
       }
       changes.push(...deploymentChanges);
@@ -6278,10 +6289,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "user", approvedText: specTextFor(b, entity) }, voidedAt: null, voidedApprovedText: null, voidedApprovedAt: null, declinedSpecHash: null };
         changes.push({ text: "The user's spec comment approves the spec (approval: user)", actionable: true });
       }
-      // Only an entry into build from spec: review → build is the worker's
-      // normal loop, and an unreported checklist is not an unmet one.
-      if (stage === "build" && b.stage === "spec" && prev !== null && gateKnownUnmet(playbook, ready, currentSpec)) {
-        changes.push({ text: `Moved into a build stage (${phase}) before the ready gate passed`, actionable: true });
+      // Only an entry into the first active stage from the start stage: a
+      // later active stage is the worker's normal loop, and an unreported
+      // checklist is not an unmet one (BB-7). The first active stage is the
+      // declared order's first, never a hardcoded name (BB-417).
+      if (stage === firstActiveStage(playbook.stages) && isStartStage(playbook.stages, b.stage) && prev !== null && gateKnownUnmet(playbook, ready, currentSpec)) {
+        changes.push({ text: `Moved into an active stage (${phase}) before the ready gate passed`, actionable: true });
       }
       // BB-374: a routed escalation's clock. The "What changed" line is built
       // from what is open now, never a stored note, so a resolution elsewhere
@@ -6335,7 +6348,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // stored time alone so the duration is stable across sweeps. A look with
       // no assessment leaves the clock untouched rather than clearing it.
       if (assessment !== null) {
-        const idleInitiative = initiativeIdle(b, observed.entity.children, assessment.liveness.waitLive);
+        const idleInitiative = initiativeIdle(b, observed.entity.children, assessment.liveness.waitLive, activeStageSet(playbook.stages));
         const idleInitiativeSince = idleInitiative ? (b.idleInitiativeSince ?? now()) : null;
         if (idleInitiativeSince !== b.idleInitiativeSince) b = store.patch(b.id, { idleInitiativeSince });
       }
@@ -6423,7 +6436,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // filed, and drop the note rather than wake a steward that started.
       if (b.pending.some((n) => n.text === START_WORKER_WAKE)) {
         const startStillDue =
-          b.stage === "spec" &&
+          isStartStage(playbook.stages, b.stage) &&
           gateState(playbook, b.ready, currentSpec).passed &&
           !assessWorker(store.workers(b.id)).inFlight &&
           !bindingHeld(b) &&
@@ -9461,8 +9474,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (!gate.passed) return withdraw("Withdrawn: the ready gate no longer passes.", false);
       // Finished work is not scheduled against anything: there is nothing left to start.
       if (b.lastSnapshot !== null && finished(b, b.lastSnapshot)) return withdraw("Withdrawn: the work is finished.", false);
-      if (b.stage === "review" || assessWorker(store.workers(b.id)).running) return withdraw("Withdrawn: the work has started.", true);
-      const conflicts = await conflictsFresh(b);
+      if (b.stage === lastActiveStage(playbook.stages) || assessWorker(store.workers(b.id)).running) return withdraw("Withdrawn: the work has started.", true);
+      const conflicts = await conflictsFresh(b, activeStageSet(playbook.stages));
       if (conflicts.length === 0) return withdraw("Withdrawn: nothing in flight overlaps it now.", true);
       const keys = conflicts.map((c) => c.with.entityKey);
       if (open.length > 0) {
@@ -12262,7 +12275,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             paused: (await settings.get()).paused,
             projectStewardThreadId: row.threadId,
             roleNames: boardConfig?.roleNames ?? [],
-            stages: [...STAGES],
+            stages: Object.keys(boardConfig?.playbooks.ticket?.stages ?? DEFAULT_STAGES),
             digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
             standup: await standupAvailability(row.threadId !== null),
             questions,
@@ -13383,7 +13396,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const hostId = cachedProjectHost(b.projectId);
       const flags = hostId === undefined ? null : [environmentFlags(config?.source ?? null, hostId), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
       return formatBrief(
-        { binding: b, playbook, gate: briefGate(readyGateCtx, b, playbook), workerFlags: flags, escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)), guidance: cachedWakeGuidance(b.projectId, playbook.name) },
+        { binding: b, playbook, gate: briefGate(readyGateCtx, b, playbook), workerFlags: flags, escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId), activeStageSet(playbook.stages)), guidance: cachedWakeGuidance(b.projectId, playbook.name) },
         BRIEF_MAX_CHARS,
       );
     });
@@ -14744,7 +14757,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             b.kind === "ticket" &&
             b.endedAt === null &&
             b.ending === null &&
-            b.stage === "spec" &&
+            isStartStage(playbook?.stages ?? DEFAULT_STAGES, b.stage) &&
             !assessWorker(store.workers(b.id)).running &&
             nothingPending;
           if (startDue) {
@@ -15850,7 +15863,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const lines = [formatBindings([b], (x) => rolesForBinding(roleMap, x)), "", `Project source: ${projectSourceLabel(config?.source.kind ?? null)}`, `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
       if (b.kind !== "ops") lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
       if (b.kind !== "ops") {
-        const conflicts = conflictsOf(b, store.open(b.projectId));
+        const conflicts = conflictsOf(b, store.open(b.projectId), config === null ? DEFAULT_ACTIVE_STAGES : bindingActiveStages(config, b));
         lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; file-level overlap: ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
       }
       // BB-412 (C6): the composed resources and holds stored beside the
@@ -16986,7 +16999,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
               return {
                 exitCode: 0,
-                stdout: formatBrief({ binding: b, playbook, gate: briefGate(readyGateCtx, b, playbook), workerFlags: await workerFlagsFor(b, playbook, config.source), escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)), guidance: await wakeGuidance(b.projectId, playbook.name) }),
+                stdout: formatBrief({ binding: b, playbook, gate: briefGate(readyGateCtx, b, playbook), workerFlags: await workerFlagsFor(b, playbook, config.source), escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId), activeStageSet(playbook.stages)), guidance: await wakeGuidance(b.projectId, playbook.name) }),
               };
             },
           }),

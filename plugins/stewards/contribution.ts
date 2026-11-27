@@ -30,7 +30,7 @@ import {
   waitOverdueMs,
 } from "./assessment.js";
 import type { AssessedGate, Assessment, AssessmentInput, DecideMark } from "./assessment.js";
-import { waitBudgetMs } from "./config.js";
+import { activeStageSet, isStartStage, waitBudgetMs } from "./config.js";
 import { prGate, type PrGate, type PrGateOptions, type ProjectApprovalRecord } from "./gate.js";
 import { schedulingHolds, type HoldContribution } from "./holds.js";
 import { idleInActiveStage, observedStall, productGateOptions } from "./reconcile.js";
@@ -257,7 +257,7 @@ function bindingHolds(source: ContributionSource, input: AssessmentInput): HoldC
   const readyPassed = gateState(input.playbook, b.ready, input.currentSpecHash).passed;
   return [
     ...schedulingHolds(b, input.now).map((h) => ({ ...h, source })),
-    { source, id: "ready-gate", held: b.stage === "spec" && !readyPassed, behind: [] },
+    { source, id: "ready-gate", held: isStartStage(input.playbook.stages, b.stage) && !readyPassed, behind: [] },
   ];
 }
 
@@ -522,6 +522,7 @@ function composeLiveness(input: AssessmentInput, composed: ComposedAssessment): 
       },
       observed,
       now,
+      activeStageSet(input.playbook.stages),
     ) && !composed.resources.some((r) => r.id.startsWith("open-pull:") && r.active);
   // A binding has at most one stored typed wait, so the composed waits hold at
   // most that one item.

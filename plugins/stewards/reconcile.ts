@@ -6,7 +6,7 @@
 // The rule throughout: an event is a hint to look again, never the input a
 // decision is made from. Every function here compares two states.
 import { createHash } from "node:crypto";
-import { INITIATIVE_PLAYBOOK, isTerminal, labelPhaseName, phaseOf, type Playbook } from "./config.js";
+import { DEFAULT_ACTIVE_STAGES, INITIATIVE_PLAYBOOK, isTerminal, labelPhaseName, phaseOf, type Playbook } from "./config.js";
 import type { Deployments } from "./deploy.js";
 import { isMarkerComment, latestReviewMarker, reviewMarker } from "./gate.js";
 import { schedulingHolds } from "./holds.js";
@@ -440,25 +440,25 @@ export function workerReportedTerminal(result: string | null, entityKey: string,
 const ownPull = (key: string | null, url: string | null, own: ReadonlySet<string>): boolean =>
   (key !== null && own.has(key.toLowerCase())) || (url !== null && url !== "" && own.has(url.toLowerCase()));
 
-/** The stages a worker of the binding moves an entity between: a move within them is its own (rule 1). */
-const OWN_MOVE_STAGES = new Set(["build", "review"]);
 /**
- * Whether a move between two stages is the worker's own build/review loop
- * (BB-52): both stages are build or review and they differ. Used for a state
- * move and, since a label can move the phase too, for a label-driven one
- * (BB-248).
+ * Whether a move between two stages is the worker's own loop (BB-52): both
+ * stages are `active` (the playbook's declared worker loop, every `active`
+ * stage by default) and they differ. Used for a state move and, since a label
+ * can move the phase too, for a label-driven one (BB-248). `activeStages`
+ * defaults to the default set so the pure predicate keeps working without a
+ * playbook in hand; the reconcile passes the binding's declared set.
  */
-export const isOwnStageChange = (before: string | null, after: string | null): boolean =>
-  before !== null && after !== null && before !== after && OWN_MOVE_STAGES.has(before) && OWN_MOVE_STAGES.has(after);
+export const isOwnStageChange = (before: string | null, after: string | null, activeStages: ReadonlySet<string> = DEFAULT_ACTIVE_STAGES): boolean =>
+  before !== null && after !== null && before !== after && activeStages.has(before) && activeStages.has(after);
 
 /**
- * Whether a state change is the worker's own build/review loop: both states map
- * to a build or review stage and they differ. A terminal state is handled by
- * the lifecycle before this, and any other move still wakes the steward.
+ * Whether a state change is the worker's own active-stage loop: both states map
+ * to an `active` stage and they differ. A terminal state is handled by the
+ * lifecycle before this, and any other move still wakes the steward.
  */
-export function isOwnStageMove(stageOf: ((state: string) => string | null) | undefined, before: string, after: string): boolean {
+export function isOwnStageMove(stageOf: ((state: string) => string | null) | undefined, before: string, after: string, activeStages: ReadonlySet<string> = DEFAULT_ACTIVE_STAGES): boolean {
   if (stageOf === undefined) return false;
-  return isOwnStageChange(stageOf(before), stageOf(after));
+  return isOwnStageChange(stageOf(before), stageOf(after), activeStages);
 }
 
 /**
@@ -485,7 +485,7 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
   if (before.state !== after.state) {
     // BB-52 rule 1: a worker moving the entity between the playbook's build
     // and review stages is its own loop, not news.
-    const own = ctx.workerInFlight && isOwnStageMove(ctx.stageOf, before.state, after.state);
+    const own = ctx.workerInFlight && isOwnStageMove(ctx.stageOf, before.state, after.state, ctx.activeStages);
     changes.push({ text: `${p}State: ${before.state} → ${after.state}`, actionable: !own });
   }
   if ((before.title ?? "") !== (after.title ?? "")) changes.push({ text: `${p}Title: ${after.title ?? "(none)"}`, actionable: false });
@@ -596,8 +596,10 @@ export type ObservedDiffContext = {
   workerInFlight: boolean;
   /** Lowercased keys and URLs of the pull requests this binding's worker owns (BB-52 rule 0). */
   ownPulls?: ReadonlySet<string>;
-  /** The stage an entity state maps to in this binding's playbook, for the build/review move (rule 1). */
+  /** The stage an entity state maps to in this binding's playbook, for the active-stage move (rule 1). */
   stageOf?: (state: string) => string | null;
+  /** BB-417: the binding's declared `active` stages, so a move within them is the worker's own loop; the default set when absent. */
+  activeStages?: ReadonlySet<string>;
   userThread?: (threadId: string) => boolean;
   /** The entity's own login, so an owner-entered local comment counts as the user's spec comment (BB-361). */
   owner?: string | null;
@@ -768,14 +770,15 @@ const pullOpen = (e: EntitySnapshot): boolean => e.pull !== null && e.state !== 
 
 /**
  * Whether a binding in an active stage has nothing left to wait on (BB-83):
- * its playbook stage is `build` or `review`, it is not ending or held, it has
- * no dated wait still ahead (BB-247), no worker is running, no own pull
- * request (BB-52 rule 0) is open, no deployment watch is merged or deploying,
- * and no escalation or need waits on the user. It says nothing about the grace
- * or the once-per-idle-period guard; the server measures those.
+ * its playbook stage is `active` (the declared worker loop, or the default set
+ * when no playbook is in hand), it is not ending or held, it has no dated wait
+ * still ahead (BB-247), no worker is running, no own pull request (BB-52 rule
+ * 0) is open, no deployment watch is merged or deploying, and no escalation or
+ * need waits on the user. It says nothing about the grace or the
+ * once-per-idle-period guard; the server measures those.
  */
-export function idleInActiveStage(b: IdleBinding, observed: Observed, now: number = Date.now()): boolean {
-  if (b.stage !== "build" && b.stage !== "review") return false;
+export function idleInActiveStage(b: IdleBinding, observed: Observed, now: number = Date.now(), activeStages: ReadonlySet<string> = DEFAULT_ACTIVE_STAGES): boolean {
+  if (b.stage === null || !activeStages.has(b.stage)) return false;
   // BB-413 (C7): the `hold`/`ending`/`requeue` answer is the composed holds,
   // the same derivation the composer folds, not a second test of the fields.
   const holds = schedulingHolds(b, now);

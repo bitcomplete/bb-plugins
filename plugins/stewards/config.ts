@@ -770,8 +770,81 @@ export function ticketWatchProblems(file: ProjectFile, playbooks: ReadonlyMap<st
 
 // ---- playbooks ---------------------------------------------------------------------
 
+/**
+ * The default stage names a playbook runs under when it declares no `stages`
+ * (BB-417). They are the default, not a closed set: a playbook declares its
+ * own stages and any names it likes. Kept under the old name so the BB-377
+ * characterization test reads the default names unchanged.
+ */
 export const STAGES = ["spec", "build", "review"] as const;
-export type Stage = (typeof STAGES)[number];
+
+/** What a stage is for (BB-417): the one `start` stage is where the ready gate applies, and the worker loop runs in every `active` stage. */
+export const STAGE_KINDS = ["start", "active"] as const;
+export type StageKind = (typeof STAGE_KINDS)[number];
+
+/** A declared stage: its kind, and the stuck window a phase without its own `stuck` inherits. */
+export type StageDecl = { kind: StageKind; stuckMs: number | null };
+
+/** The declared stages, by name, in declaration order. */
+export type Stages = Record<string, StageDecl>;
+
+/**
+ * The stage set a playbook runs under when it declares no `stages` (BB-417):
+ * the three names the core used to hardcode, with their kinds. `stuckMs` is
+ * null because the stuck window stays on the phase, exactly as before.
+ */
+export const DEFAULT_STAGES: Stages = {
+  spec: { kind: "start", stuckMs: null },
+  build: { kind: "active", stuckMs: null },
+  review: { kind: "active", stuckMs: null },
+};
+
+/** The declared stages a front-matter `stages` block names, or the default set when it declares none. */
+export function declaredStages(decl: Record<string, { kind: StageKind; stuck?: number }> | undefined): Stages {
+  if (decl === undefined) return DEFAULT_STAGES;
+  return Object.fromEntries(Object.entries(decl).map(([name, d]) => [name, { kind: d.kind, stuckMs: d.stuck ?? null }]));
+}
+
+/**
+ * BB-417: a playbook must declare exactly one `start` stage, and every
+ * `phases.<state>.stage` must name a declared stage. Returns a problem line, or
+ * null when the declaration is sound. The default set always satisfies it.
+ */
+export function stageProblems(stages: Stages, phases: Record<string, { stage?: string }>): string | null {
+  const starts = Object.values(stages).filter((d) => d.kind === "start").length;
+  if (starts !== 1) return `stages must declare exactly one start stage; this playbook declares ${starts}`;
+  for (const [state, phase] of Object.entries(phases)) {
+    if (phase.stage !== undefined && !(phase.stage in stages)) return `phases.${state}.stage names ${JSON.stringify(phase.stage)}, which stages does not declare`;
+  }
+  return null;
+}
+
+/** The kind of a declared stage, or null when the set does not declare it. */
+export function stageKind(stages: Stages, stage: string | null | undefined): StageKind | null {
+  if (stage === null || stage === undefined) return null;
+  return stages[stage]?.kind ?? null;
+}
+
+/** Whether a stage is the one `start` stage (the ready gate applies there). */
+export const isStartStage = (stages: Stages, stage: string | null | undefined): boolean => stageKind(stages, stage) === "start";
+
+/** Whether a stage is an `active` stage (the worker loop runs there). */
+export const isActiveStage = (stages: Stages, stage: string | null | undefined): boolean => stageKind(stages, stage) === "active";
+
+/** Every `active` stage's name, in declaration order: the declared worker loop. */
+export const activeStages = (stages: Stages): string[] => Object.entries(stages).filter(([, d]) => d.kind === "active").map(([name]) => name);
+
+/** The first `active` stage's name in declaration order (the stage a move out of `start` enters), or null when the playbook declares none. */
+export const firstActiveStage = (stages: Stages): string | null => activeStages(stages)[0] ?? null;
+
+/** The last `active` stage's name in declaration order (the stage a scheduling request withdraws at), or null when the playbook declares none. */
+export const lastActiveStage = (stages: Stages): string | null => activeStages(stages).at(-1) ?? null;
+
+/** The `active` stage names as a set, for the predicates that read a binding's stored stage. */
+export const activeStageSet = (stages: Stages): ReadonlySet<string> => new Set(activeStages(stages));
+
+/** The default worker loop: every `active` stage of the default set. */
+export const DEFAULT_ACTIVE_STAGES: ReadonlySet<string> = activeStageSet(DEFAULT_STAGES);
 
 /** What a steward raises. */
 export const ESCALATION_KINDS = ["blocked", "decision", "scope", "conflict", "stuck"] as const;
@@ -799,11 +872,24 @@ const phaseKeySchema = z
 
 const phaseSchema = z
   .object({
-    stage: z.enum(STAGES).optional(),
+    /** BB-417: any name the playbook's `stages` declares; validated against them after parsing. */
+    stage: z.string().trim().min(1).max(100).optional(),
     /** A status record that has not advanced in this long raises `stuck`. */
     stuck: durationSchema.optional(),
   })
   .strict();
+
+/** One declared stage (BB-417): `kind` is a strict enum, so an unknown kind from a newer image is the BB-355 "unsupported until restart" line, never a silent last-good copy. */
+const stageDeclSchema = z
+  .object({
+    kind: z.enum(STAGE_KINDS),
+    /** A status record in this stage that has not advanced in this long raises `stuck`, unless the phase sets its own. */
+    stuck: durationSchema.optional(),
+  })
+  .strict();
+
+/** The playbook's declared stages (BB-417): any names, each with a kind. */
+const stagesSchema = z.record(z.string().trim().min(1).max(100), stageDeclSchema);
 
 /** Who approves a substantial ticket: the project steward (default), the user, or a source state (a Linear workflow state, or a GitHub status label). */
 export const approvalModeSchema = z.union([
@@ -983,6 +1069,12 @@ export const frontMatterSchema = z
     source: z.enum(PLAYBOOK_SOURCES),
     /** Required for every kind but ops, which has none. */
     phases: z.record(phaseKeySchema, phaseSchema.nullable().transform((p) => p ?? {})).optional(),
+    /**
+     * BB-417: the stages the playbook declares, by name, each with a kind.
+     * Omitted means the default set (spec, build, review). `phases.<state>.stage`
+     * must name one of these.
+     */
+    stages: stagesSchema.optional(),
     terminal: z.array(z.string().trim().min(1).max(100)).default([]),
     ready: readySchema.optional(),
     /**
@@ -1041,7 +1133,9 @@ export type Playbook = {
   name: string;
   kind: BindingKind;
   source: (typeof PLAYBOOK_SOURCES)[number];
-  phases: Record<string, { stage?: Stage; stuck?: number }>;
+  phases: Record<string, { stage?: string; stuck?: number }>;
+  /** BB-417: the declared stages, by name, or the default set when the playbook declares none. */
+  stages: Stages;
   terminal: string[];
   ready: ReadyConfig | null;
   /** The review playbook's substantial criteria (BB-207); empty on every other kind. */
@@ -1112,11 +1206,16 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
     if (fm.terminal.length === 0) return { ok: false, error: `${file}: terminal: name at least one state that ends the binding` };
   }
   const phases = fm.phases ?? {};
+  // BB-417: resolve the declared stages (or the default), require exactly one
+  // `start`, and check every phase's stage against the declared names.
+  const stages = declaredStages(fm.stages);
+  const stageProblem = stageProblems(stages, phases);
+  if (stageProblem !== null) return { ok: false, error: `${file}: ${stageProblem}` };
   const lowerPhases = new Set(Object.keys(phases).map((p) => p.toLowerCase()));
   const overlap = fm.terminal.filter((t) => lowerPhases.has(t.toLowerCase()));
   if (overlap.length > 0) return { ok: false, error: `${file}: ${overlap.join(", ")} cannot be both a phase and terminal` };
-  if (fm.ready === undefined && fm.kind === "ticket" && Object.values(phases).some((p) => p.stage === "build")) {
-    return { ok: false, error: `${file}: a ticket playbook with a build stage needs a ready gate` };
+  if (fm.ready === undefined && fm.kind === "ticket" && Object.values(phases).some((p) => isActiveStage(stages, p.stage))) {
+    return { ok: false, error: `${file}: a ticket playbook with an active stage needs a ready gate` };
   }
 
   const { general, sections } = splitSections(m[2] ?? "");
@@ -1134,6 +1233,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       kind: fm.kind,
       source: fm.source,
       phases,
+      stages,
       terminal: fm.terminal,
       ready,
       substantial: fm.substantial,
@@ -1178,11 +1278,15 @@ function splitSections(body: string): { general: string; sections: Record<string
 }
 
 /** A phase's entry, matched ignoring case, or null when the playbook does not name the state. */
-export function phaseOf(playbook: Playbook, state: string): { name: string; stage: Stage | null; stuckMs: number | null } | null {
+export function phaseOf(playbook: Playbook, state: string): { name: string; stage: string | null; stuckMs: number | null } | null {
   const key = Object.keys(playbook.phases).find((p) => p.toLowerCase() === state.toLowerCase());
   if (key === undefined) return null;
   const phase = playbook.phases[key]!;
-  return { name: key, stage: phase.stage ?? null, stuckMs: phase.stuck ?? null };
+  const stage = phase.stage ?? null;
+  // The phase's own `stuck` wins; a stage-declared `stuck` is the fallback, so
+  // a playbook that moves its windows onto `stages` reads the same either way.
+  const stuckMs = phase.stuck ?? (stage === null ? null : (playbook.stages?.[stage]?.stuckMs ?? null));
+  return { name: key, stage, stuckMs };
 }
 
 export const isTerminal = (playbook: Playbook, state: string): boolean => playbook.terminal.some((t) => t.toLowerCase() === state.toLowerCase());

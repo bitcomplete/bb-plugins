@@ -5,7 +5,7 @@
 // Each wake is self-contained. A steward that has compacted away everything
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
-import { formatDuration, GITHUB_TODO_LABEL, INITIATIVE_LABEL, INITIATIVE_PLAYBOOK, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
+import { DEFAULT_ACTIVE_STAGES, formatDuration, GITHUB_TODO_LABEL, INITIATIVE_LABEL, INITIATIVE_PLAYBOOK, phaseInstructions, type FilingTarget, type LessonRules, type Playbook } from "./config.js";
 import { formatAge } from "./duration.js";
 import { bindingHeld, schedulingHolds } from "./holds.js";
 import { landLessonInstruction } from "./lessons.js";
@@ -1738,9 +1738,10 @@ export function initiativeIdle(
   binding: Pick<Binding, "kind" | "playbook" | "lastSnapshot" | "stage" | "hold" | "ending" | "requeueUntil" | "wait">,
   children: readonly SnapshotChild[],
   waitLive: boolean | null,
+  activeStages: ReadonlySet<string> = DEFAULT_ACTIVE_STAGES,
 ): boolean {
   if (initiativeProgress(binding) === null) return false;
-  if (binding.stage !== "build") return false;
+  if (binding.stage === null || !activeStages.has(binding.stage)) return false;
   if (bindingHeld(binding)) return false;
   // An unreadable count (null) is not "all met", so it still reads idle.
   if (initiativeUnmet(binding) === 0) return false;
