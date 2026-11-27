@@ -556,6 +556,15 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
     // otherwise make the surface never run clean. `declined` is the codes
     // `decline()` wrote in this look, so a stale code from an earlier look is
     // not compared. `inputs` carries counts and the codes, never free text.
+    //
+    // BB-416: both sides key the distinct code set, not occurrences. The
+    // recorded side is a `Set`, so a code is held once however many pulls
+    // declined it; the composer deliberately emits one `Reason` per pull (the
+    // detail names the pull), so several foreign-owner pulls compose
+    // `pull-foreign-owner` once per pull. Comparing occurrences read as
+    // recorded 1 vs composed 14 on a binding with fourteen foreign pulls, and
+    // would never clear. The Reason shape is unchanged; only this comparison
+    // dedupes.
     if (declined !== undefined) {
       const recordedReasons = [...declined].filter((c) => isNonActionCode(c) && CONTRIBUTED_REASON_CODES.has(c)).sort();
       // `deferred` is the one local reason the composer approximates: it
@@ -563,10 +572,13 @@ export function compare(input: AssessmentInput, assessment: Assessment, composed
       // `nothing-to-do` or `worker-busy` before it ever reaches its own defer
       // check, so a held binding with nothing changed or a busy steward would
       // otherwise read as `""` against `deferred` on most looks.
-      const composedReasons = composed.reasons
-        .filter((r) => r.code !== "deferred" || (!declined.has("nothing-to-do") && !declined.has("worker-busy")))
-        .map((r) => r.code)
-        .sort();
+      const composedReasons = [
+        ...new Set(
+          composed.reasons
+            .filter((r) => r.code !== "deferred" || (!declined.has("nothing-to-do") && !declined.has("worker-busy")))
+            .map((r) => r.code),
+        ),
+      ].sort();
       if (recordedReasons.join(",") !== composedReasons.join(",")) {
         add("compose.reasons", recordedReasons.join(","), composedReasons.join(","), {
           binding: binding.id,
