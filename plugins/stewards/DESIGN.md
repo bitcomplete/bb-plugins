@@ -733,6 +733,28 @@ disagreement.
   read-only. Nothing reads the assessment to decide or render anything: a
   consumer is added only after the comparison has run clean in production for
   several days. The log's `inputs` hold only ids, shas, states and timestamps.
+- **The `compose.reasons` surface (BB-415, C8).** Each source contributes the
+  reasons it has for not acting, from rows `assess()` already reads. The
+  github contributor derives the per-pull declines it can see in the snapshot,
+  the gate and the binding's merge hold (`gate-not-met`, `pull-draft`,
+  `pull-closed`, `pull-foreign-owner`, `merge-held`); the local contributor the
+  binding's hold (`deferred`); the linear contributor none. `stay-ended`,
+  `ending-in-progress` and `follow-through-ran-out` are recorded on looks that
+  return before the assessment, so no compared look reaches their branches;
+  they cannot be compared under no-added-reads and stay with the recorded
+  non-actions. The `reasons` are shadow: the existing `non_actions` writes and
+  renders stay the answer. `compare` logs the codes the look itself declined
+  against the composed codes, both sorted and both restricted to the codes a
+  contributor owns, under `compose.reasons`; the reconcile passes the look's
+  declines once it ends, because the per-pull declines run after `assess()`.
+  `deferred` yields to the `nothing-to-do` and `worker-busy` declines, which run
+  before the reconcile's own defer check. A code whose condition needs a source
+  call or a merge race (`base-not-default`, `retarget-needed`, `head-moved`) is
+  not derivable from those rows, so it appears as a divergence until a later
+  consumer gives it a home; `merge-steward-filed` and `worker-running` are not
+  contributor-owned, but the composer yields to them so it never composes a
+  `pull-draft` the recorded branch would not have reached. The contribution
+  adds no store read and no source call.
 
 ### Non-action reasons (BB-335)
 

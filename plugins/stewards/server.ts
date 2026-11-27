@@ -5631,6 +5631,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-415 (C8): the reason codes each binding's current look declined, and
+     * the assessment that look composed. `decline` fills the first; the look's
+     * end compares the two in `compare`'s `compose.reasons` surface and clears
+     * both. The per-pull declines run in `syncNeeds`, after `assess()`, so the
+     * comparison cannot happen inside `recordAssessed`.
+     */
+    const declinedThisLook = new Map<string, Set<string>>();
+    const pendingCompare = new Map<string, { input: AssessmentInput; assessment: Assessment; composed: ComposedAssessment }>();
+
+    /**
      * BB-293/BB-322/BB-333/BB-375/BB-400/BB-414: the binding's one assessment,
      * from the rows the look already holds. BB-333 made the typed-wait
      * derivation authoritative; BB-375 made the reconcile its only writer;
@@ -5643,9 +5653,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function recordAssessed(b: Binding, input: AssessmentInput, composed: ComposedAssessment, assessment: Assessment): void {
       store.recordAssessment({ bindingId: b.id, at: input.now, gate: assessment.gate, worker: assessment.worker, liveness: assessment.liveness, resources: composed.resources, holds: composed.holds });
       // BB-414: the `noWakeSource` divergence surface is retired with the column
-      // it compared, so the other surfaces' rows are all that record now.
+      // it compared, so the other surfaces' rows are all that record now. BB-415
+      // (C8) keeps the `compose.reasons` row for the look's end
+      // (`recordLookDivergences`), because the per-pull declines run after
+      // `assess()` composes; `compare` skips that surface when `declined` is
+      // omitted. The last assessment of the look wins; the refreshed liveness
+      // path replaces this entry.
       store.recordDivergences(compare(input, assessment, composed));
       store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, input.now);
+      pendingCompare.set(b.id, { input, assessment, composed });
     }
 
     async function assessBinding(
@@ -5685,13 +5701,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const interest = (b: Binding): string => [...leasedPulls(b), ...waitedPullKeys(b)].sort().join(" ");
         const before = store.binding(bindingId);
         const leased = before === null ? "" : interest(before);
+        // BB-415 (C8): a look starts with a clean decline set. `syncNeedsFresh`
+        // (the report path) also declines, outside a look, and its codes must
+        // not leak into this look's `compose.reasons` comparison.
+        declinedThisLook.delete(bindingId);
+        pendingCompare.delete(bindingId);
         try {
           await reconcileOnce(bindingId, force);
         } finally {
           const after = store.binding(bindingId);
           if (after !== null && interest(after) !== leased) pushInterest();
+          recordLookDivergences(bindingId);
         }
       });
+    }
+
+    /**
+     * BB-415 (C8): record the look's divergences once every decline has run.
+     * `compare` reads `declinedThisLook` for the `compose.reasons` surface and
+     * the other surfaces as before. Clears the look's maps so a binding that
+     * never reaches an assessment does not leak them.
+     */
+    function recordLookDivergences(bindingId: string): void {
+      const pending = pendingCompare.get(bindingId);
+      const declined = declinedThisLook.get(bindingId) ?? new Set<string>();
+      pendingCompare.delete(bindingId);
+      declinedThisLook.delete(bindingId);
+      if (pending === undefined) return;
+      try {
+        const reasons = compare(pending.input, pending.assessment, pending.composed, declined).filter((d) => d.surface === "compose.reasons");
+        if (reasons.length > 0) store.recordDivergences(reasons);
+        store.pruneDivergences(ASSESSMENT_DIVERGENCE_MAX_AGE_MS, ASSESSMENT_DIVERGENCE_MAX_ROWS, pending.input.now);
+      } catch (error) {
+        // BB-293: a divergence-table failure must never fail the reconcile.
+        bb.log.warn(`stewards: assessment failed for ${pending.input.binding.entityKey}: ${errorMessage(error)}`);
+      }
     }
 
     /**
@@ -5702,6 +5746,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     function decline(b: Binding, code: NonActionCode, detail: string | null = null): void {
       store.recordNonAction(b.id, code, detail, now());
+      const declined = declinedThisLook.get(b.id);
+      if (declined === undefined) declinedThisLook.set(b.id, new Set([code]));
+      else declined.add(code);
     }
 
     async function reconcileOnce(bindingId: string, force: WakeReason | null): Promise<void> {
@@ -17029,7 +17076,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             description: "Every place the shadow assessment disagrees with the predicate it will replace, one row per distinct (binding, surface, old, new) with a first/last seen time and a count. --binding filters by binding id or entity key, --surface by surface name. --json emits the rows. Nothing reads the log to decide or render.",
             options: {
               binding: { type: "string", description: "Only this binding's divergences (binding id or entity key)" },
-              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, approvals.gate, approvals.pageRefusal, compose.waits, compose.holds, compose.resources)" },
+              surface: { type: "string", description: "Only this surface (workerInFlight, runningWorkerReason, idleInActiveStage, approvals.gate, approvals.pageRefusal, compose.waits, compose.holds, compose.resources, compose.reasons)" },
               project: PROJECT_OPTION,
               json: JSON_OPTION,
             },

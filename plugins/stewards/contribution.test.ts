@@ -261,9 +261,69 @@ describe("the github contributor (BB-380)", () => {
     expect(held.holds.find((h) => h.id === "requeue")!.held).toBe(true);
   });
 
-  it("reports a reason naming the first unmet gate's missing text", () => {
-    const reasons = githubContributor.contribute(matrix("ticket", "build")).reasons;
-    expect(reasons).toEqual([{ source: "github", code: "gate-not-met", detail: "no reviewer round yet", at: 1_000_000 }]);
+  it("reports the github reasons from the snapshot, the gate and the binding's hold", () => {
+    // A gate-unmet own pull is `gate-not-met`, named by its key.
+    expect(githubContributor.contribute(matrix("ticket", "build")).reasons).toEqual([{ source: "github", code: "gate-not-met", detail: "acme/web#8", at: 1_000_000 }]);
+
+    // A closed or merged own pull is `pull-closed`, matching `syncPullApproval`,
+    // even while its gate is unmet.
+    const closed = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", state: "closed" }, { merged: false });
+    const closedInput = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [closed] }, ownPulls: own(closed), decisions: new Map([[closed.key.toLowerCase(), "user"]]) });
+    expect(githubContributor.contribute(closedInput).reasons).toEqual([{ source: "github", code: "pull-closed", detail: "acme/web#7", at: 1_000_000 }]);
+    const mergedPull = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", state: "merged" }, { merged: true });
+    const mergedInput = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [mergedPull] }, ownPulls: own(mergedPull), decisions: new Map([[mergedPull.key.toLowerCase(), "user"]]) });
+    expect(githubContributor.contribute(mergedInput).reasons).toEqual([{ source: "github", code: "pull-closed", detail: "acme/web#7", at: 1_000_000 }]);
+
+    // A gate-met draft is `pull-draft`.
+    const draft = pull({ key: "acme/web#7", url: "https://github.com/acme/web/pull/7", comments: [noReviewMarker] }, { headSha: head, ...green, draft: true });
+    const draftInput = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [draft] }, ownPulls: own(draft), decisions: new Map([[draft.key.toLowerCase(), "user"]]) });
+    expect(githubContributor.contribute(draftInput).reasons).toEqual([{ source: "github", code: "pull-draft", detail: "acme/web#7", at: 1_000_000 }]);
+
+    // `merge-steward-filed` and `worker-running` precede `pull-draft` in
+    // `syncNeeds`; neither is a contributor-owned reason, so the composer
+    // yields and composes nothing rather than a draft reason the recorded
+    // branch would not have reached.
+    const stewardFiled = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [draft] }, ownPulls: own(draft), decisions: new Map([[draft.key.toLowerCase(), "user"]]), needs: [{ kind: "merge", url: draft.url!, filedBy: "steward" } as never] });
+    expect(githubContributor.contribute(stewardFiled).reasons).toEqual([]);
+    const running = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [draft] }, ownPulls: own(draft), decisions: new Map([[draft.key.toLowerCase(), "user"]]), workers: [{ threadId: "thr_w1", status: "running" } as never] });
+    expect(githubContributor.contribute(running).reasons).toEqual([]);
+
+    // A gate-met pull under the binding's merge hold is `merge-held`.
+    const merged = gateMetPull("acme/web#7", "https://github.com/acme/web/pull/7");
+    const heldInput = input({ binding: binding({ mergeBehind: ["ENG-13"] }), observed: { entity: issue({ state: "In Progress" }), pulls: [merged] }, ownPulls: own(merged), decisions: new Map([[merged.key.toLowerCase(), "user"]]) });
+    expect(githubContributor.contribute(heldInput).reasons).toEqual([{ source: "github", code: "merge-held", detail: "acme/web#7", at: 1_000_000 }]);
+
+    // A pull the ticket observed but does not own is `pull-foreign-owner`.
+    const foreign = pull({ key: "acme/web#9", url: "https://github.com/acme/web/pull/9" });
+    const foreignInput = input({ observed: { entity: issue({ state: "In Progress" }), pulls: [foreign] }, ownPulls: new Set<string>(), gatePulls: new Set<string>(), decisions: new Map() });
+    expect(githubContributor.contribute(foreignInput).reasons).toEqual([{ source: "github", code: "pull-foreign-owner", detail: "acme/web#9", at: 1_000_000 }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BB-415 (C8): the reasons contribution, in shadow.
+// ---------------------------------------------------------------------------
+
+describe("the reasons contribution (BB-415, C8)", () => {
+  it("derives the local binding-level decline from the binding row", () => {
+    // `stay-ended`, `ending-in-progress` and `follow-through-ran-out` are
+    // recorded on looks that return before `assessBinding`, so the composer
+    // never sees their state; only the hold's `deferred` is derived.
+    expect(localContributor.contribute(input({ binding: binding({ ending: "terminal" }) })).reasons).toEqual([]);
+    expect(localContributor.contribute(input({ binding: binding({ hold: "a freeze" }) })).reasons).toEqual([{ source: "local", code: "deferred", detail: "a freeze", at: 1_000_000 }]);
+  });
+
+  it("contributes no linear reason", () => {
+    expect(linearContributor.contribute(input({ observed: { entity: issue({ state: "In Progress" }), pulls: [] } })).reasons).toEqual([]);
+  });
+
+  it("merges the sources' reasons in contributor order", () => {
+    const second = secondOpenPull("acme/web#8", "https://github.com/acme/web/pull/8");
+    const i = input({ binding: binding({ hold: "a freeze" }), observed: { entity: issue({ state: "In Progress" }), pulls: [second] }, ownPulls: own(second), decisions: new Map([[second.key.toLowerCase(), "user"]]) });
+    expect(composeAssessment(i).reasons).toEqual([
+      { source: "github", code: "gate-not-met", detail: "acme/web#8", at: 1_000_000 },
+      { source: "local", code: "deferred", detail: "a freeze", at: 1_000_000 },
+    ]);
   });
 });
 
@@ -275,7 +335,9 @@ describe("the linear and local contributors (BB-380)", () => {
   it("each contributes only for its own entity source, wrapping the binding's holds and non-pull wait", () => {
     const linear = input({ binding: binding({ hold: "a freeze" }), observed: { entity: issue(), pulls: [] } });
     expect(linearContributor.contribute(linear).holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "stack", "merge-behind", "ready-gate"]);
-    expect(localContributor.contribute(linear)).toEqual({ source: "local", gate: [], waits: [], resources: [], holds: [], reasons: [] });
+    // BB-415 (C8): the local source owns the binding-level reasons, so the hold
+    // is the `deferred` reason even though the entity is Linear's.
+    expect(localContributor.contribute(linear)).toEqual({ source: "local", gate: [], waits: [], resources: [], holds: [], reasons: [{ source: "local", code: "deferred", detail: "a freeze", at: 1_000_000 }] });
 
     const github = input({ observed: { entity: pull({}), pulls: [] } });
     expect(githubContributor.contribute(github).holds.map((h) => h.id)).toEqual(["hold", "ending", "requeue", "behind", "stack", "merge-behind", "ready-gate"]);
@@ -336,7 +398,7 @@ describe("the composed answer equals today's assess() on the C1 characterization
   it("records no compose divergence through the existing compare path", () => {
     for (const [label, i] of characterizationFixtures()) {
       const a = assess(i);
-      const rows = compare(i, a, composeAssessment(i)).filter((d) => d.surface.startsWith("compose."));
+      const rows = compare(i, a, composeAssessment(i)).filter((d) => d.surface !== "compose.reasons" && d.surface.startsWith("compose."));
       expect(rows, label).toEqual([]);
     }
   });
@@ -540,7 +602,7 @@ describe("the resources and holds contributions (BB-412, C6)", () => {
     // worker (a parked worker is `parked-workers`).
     expect(composed.resources).toEqual(expect.arrayContaining([expect.objectContaining({ id: "linked-pull:acme/web#8", active: true }), expect.objectContaining({ id: "workers", active: true })]));
     expect(composed.liveness.idle).toBe(true);
-    expect(compare(resourceCases()[1]![1], assess(resourceCases()[1]![1]), composed).filter((d) => d.surface.startsWith("compose."))).toEqual([]);
+    expect(compare(resourceCases()[1]![1], assess(resourceCases()[1]![1]), composed).filter((d) => d.surface !== "compose.reasons" && d.surface.startsWith("compose."))).toEqual([]);
   });
 
   it("records no compose divergence for any resource or hold fixture", () => {
@@ -549,7 +611,7 @@ describe("the resources and holds contributions (BB-412, C6)", () => {
       return [[`hold ${id}`, input({ binding: binding(over) })] as [string, AssessmentInput]];
     })];
     for (const [label, i] of fixtures) {
-      expect(compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface.startsWith("compose.")), label).toEqual([]);
+      expect(compare(i, assess(i), composeAssessment(i)).filter((d) => d.surface !== "compose.reasons" && d.surface.startsWith("compose.")), label).toEqual([]);
     }
   });
 });

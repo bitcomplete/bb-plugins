@@ -67,6 +67,30 @@ const codeSet = new Set<string>(NON_ACTION_CODES);
 export const isNonActionCode = (value: string): value is NonActionCode => codeSet.has(value);
 
 /**
+ * BB-415 (C8): the codes the per-source contributors own. A `compose.reasons`
+ * divergence is only meaningful for these: the reconcile-level codes
+ * (`nothing-to-do`, `worker-busy`, `config-unreadable`, `wait-slack-unsent`
+ * and the rest) are declined by branches no contributor wraps, so comparing
+ * them would make the surface never run clean. The underivable codes
+ * (`base-not-default`, `retarget-needed`, `head-moved`, `stay-ended`) are kept
+ * so a recorded decline of one still shows as a divergence.
+ */
+export const CONTRIBUTED_REASON_CODES: ReadonlySet<NonActionCode> = new Set([
+  "gate-not-met",
+  "pull-draft",
+  "pull-closed",
+  "base-not-default",
+  "head-moved",
+  "merge-held",
+  "retarget-needed",
+  "pull-foreign-owner",
+  "deferred",
+  "stay-ended",
+  "ending-in-progress",
+  "follow-through-ran-out",
+]);
+
+/**
  * The one-line text for each code. `detail` is an optional binding-specific
  * fact (a pull request's key, the end reason); `day` is the recorded date
  * (YYYY-MM-DD). Kept short: it renders inside a card row.
