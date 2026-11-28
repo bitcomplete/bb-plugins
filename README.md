@@ -21,6 +21,7 @@ Plugins for [bb](https://getbb.app), maintained by Bit Complete.
 | [review-watch](plugins/review-watch) | Queues the GitHub pull requests that need your review and opens a thread for one when you press Start |
 | [pr-board](plugins/pr-board) | A plain-language board of your open GitHub pull requests: what can merge, what needs you, and who you wait on |
 | [voice-transcription](plugins/voice-transcription) | Adds a voice-input service that transcribes through any OpenAI-compatible `/audio/transcriptions` endpoint from the server process |
+| [tmux](plugins/tmux) | Drives bb with the keys of tmux: stock tmux bindings with your own tmux config applied on top, and a copy mode. Off until you switch it on |
 
 Install one:
 

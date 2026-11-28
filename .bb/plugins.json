@@ -20,6 +20,7 @@
     { "name": "slack", "source": "./plugins/slack" },
     { "name": "review-watch", "source": "./plugins/review-watch" },
     { "name": "pr-board", "source": "./plugins/pr-board" },
-    { "name": "voice-transcription", "source": "./plugins/voice-transcription" }
+    { "name": "voice-transcription", "source": "./plugins/voice-transcription" },
+    { "name": "tmux", "source": "./plugins/tmux" }
   ]
 }
