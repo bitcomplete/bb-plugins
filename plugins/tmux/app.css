@@ -1,0 +1,26 @@
+/*
+ * Global, not scoped to the plugin's own elements: the rules reach into bb's
+ * page. Each one starts with the mark that the page only carries while the
+ * plugin is switched on (SWITCHED_ON_ATTRIBUTE in src/constants.ts), so
+ * nothing is drawn while it is off. The selectors after the mark mirror
+ * SELECTORS.sidebarRow, SELECTORS.focusedThreadPane and
+ * SELECTORS.paneFocusScrim in src/constants.ts, and
+ * src/overlay/app-css.test.ts fails when they drift apart.
+ *
+ * The pane border follows bb's own focused-pane mark, not keyboard focus, so
+ * it stays while the cursor is in the message box. It is drawn on bb's overlay
+ * for the pane, because an outline on the pane itself is covered by the pane's
+ * header and content and its top edge sits under the window's title strip.
+ * The overlay of the focused pane is see-through, so lifting it above the
+ * pane header (z-index 21 in bb) changes nothing else.
+ */
+
+:root[data-tmux-keys] a[data-sidebar-thread-shortcut-target][data-sidebar-thread-id]:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+:root[data-tmux-keys] [data-split-pane-id][data-focused="true"]:not([aria-hidden="true"]):not([data-sidebar-split-container] *) > [data-pane-focus-scrim] {
+  z-index: 26;
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
