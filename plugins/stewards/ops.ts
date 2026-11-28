@@ -170,6 +170,61 @@ export function deploymentsOf(list: unknown): OpsDeployment[] {
   return arr(obj(list).items).map((d) => ({ name: str(obj(d.metadata).name) ?? "?", ready: num(obj(d.status).readyReplicas) ?? 0, desired: num(obj(d.spec).replicas) ?? 1 }));
 }
 
+/**
+ * A Kubernetes Job as the triage evidence reader reports it (BB-419). The
+ * Job's own status is the primary "what failed?" signal: a `Failed` condition
+ * carries the reason (`BackoffLimitExceeded`, `DeadlineExceeded`, …), a
+ * `Complete` condition is a later successful run, and neither means it is
+ * still running or unknown. A Job is read read-only and never rerun.
+ */
+export type OpsJob = {
+  name: string;
+  namespace: string;
+  outcome: "succeeded" | "failed" | "running" | "unknown";
+  /** The failed/complete condition's reason, when the Job carries one. */
+  reason: string | null;
+  message: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  succeeded: number;
+  failed: number;
+  active: number;
+};
+
+/**
+ * The Job's outcome. A terminal condition decides first, so a Job with
+ * `succeeded: 1` and `Failed=True` still reads as failed; only with neither
+ * condition do the active counter and then the counters decide. A Job retrying
+ * (`failed: 1`, `active: 1`, no condition) reads as running, not failed.
+ */
+export function jobsOf(list: unknown): OpsJob[] {
+  return arr(obj(list).items).map((j) => {
+    const meta = obj(j.metadata);
+    const status = obj(j.status);
+    const conditions = arr(status.conditions);
+    const complete = conditions.find((c) => c.type === "Complete" && c.status === "True");
+    const failed = conditions.find((c) => c.type === "Failed" && c.status === "True");
+    const succeeded = num(status.succeeded) ?? 0;
+    const failures = num(status.failed) ?? 0;
+    const active = num(status.active) ?? 0;
+    const outcome: OpsJob["outcome"] =
+      failed !== undefined ? "failed" : complete !== undefined ? "succeeded" : active > 0 ? "running" : succeeded > 0 ? "succeeded" : failures > 0 ? "failed" : status.startTime !== undefined ? "running" : "unknown";
+    const condition = failed ?? complete;
+    return {
+      name: str(meta.name) ?? "?",
+      namespace: str(meta.namespace) ?? "",
+      outcome,
+      reason: str(condition?.reason),
+      message: str(condition?.message),
+      startedAt: str(status.startTime),
+      finishedAt: str(status.completionTime) ?? str(condition?.lastTransitionTime),
+      succeeded,
+      failed: failures,
+      active,
+    };
+  });
+}
+
 // ---- findings ------------------------------------------------------------------------
 
 /** Waiting reasons that mean a container cannot run, not that it is starting. */

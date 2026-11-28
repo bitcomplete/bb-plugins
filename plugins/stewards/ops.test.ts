@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { crashingPod, healthyPod, warningEvent } from "./fixtures.js";
-import { classify, eventsOf, findingsOf, hasFingerprintLine, logTail, lookChanges, opsTargetKey, parseOpsTargetKey, podsOf, workloadOf, type OpsLook, type Sighting } from "./ops.js";
+import { classify, eventsOf, findingsOf, hasFingerprintLine, jobsOf, logTail, lookChanges, opsTargetKey, parseOpsTargetKey, podsOf, workloadOf, type OpsLook, type Sighting } from "./ops.js";
 
 const target = { kind: "k8s-namespace", name: "web-production" } as const;
 const now = Date.parse("2026-10-14T15:00:00Z");
@@ -153,5 +153,27 @@ describe("the fingerprint map", () => {
     expect(lookChanges(filed, broken)).toEqual([{ text: "Cannot read k8s-namespace/web-production: 403: forbidden", actionable: false }]);
     expect(lookChanges(broken, broken)).toEqual([]);
     expect(lookChanges(broken, lookWith([]))).toEqual([{ text: "k8s-namespace/web-production is readable again", actionable: false }]);
+  });
+});
+
+describe("Job status (BB-419)", () => {
+  it("reads a Job's outcome from its conditions and counters, for the triage reply", () => {
+    const jobs = jobsOf({
+      items: [
+        { metadata: { name: "sync-1", namespace: "bithub" }, status: { conditions: [{ type: "Failed", status: "True", reason: "BackoffLimitExceeded", message: "backoff limit reached", lastTransitionTime: "2026-10-20T14:00:00Z" }], succeeded: 0, failed: 3, startTime: "2026-10-20T13:00:00Z" } },
+        { metadata: { name: "sync-2", namespace: "bithub" }, status: { conditions: [{ type: "Complete", status: "True", reason: "CompletionsReached" }], succeeded: 1, failed: 0, startTime: "2026-10-20T13:00:00Z", completionTime: "2026-10-20T13:05:00Z" } },
+        { metadata: { name: "sync-3", namespace: "bithub" }, status: { startTime: "2026-10-20T14:00:00Z" } },
+        { metadata: { name: "sync-4", namespace: "bithub" }, status: {} },
+        // A Failed condition wins even with succeeded>0 (a partial run over backoffLimit).
+        { metadata: { name: "sync-5", namespace: "bithub" }, status: { conditions: [{ type: "Failed", status: "True", reason: "BackoffLimitExceeded" }], succeeded: 1, failed: 4 } },
+        // A retrying Job (failed>0, active>0, no terminal condition) is running, not failed.
+        { metadata: { name: "sync-6", namespace: "bithub" }, status: { active: 1, failed: 1, startTime: "2026-10-20T14:00:00Z" } },
+      ],
+    });
+    expect(jobs.map((j) => j.outcome)).toEqual(["failed", "succeeded", "running", "unknown", "failed", "running"]);
+    expect(jobs[0]).toMatchObject({ name: "sync-1", namespace: "bithub", reason: "BackoffLimitExceeded", failed: 3, finishedAt: "2026-10-20T14:00:00Z" });
+    expect(jobs[1]).toMatchObject({ outcome: "succeeded", finishedAt: "2026-10-20T13:05:00Z", succeeded: 1 });
+    expect(jobs[5]).toMatchObject({ outcome: "running", active: 1, failed: 1 });
+    expect(jobsOf({ not: "a list" })).toEqual([]);
   });
 });

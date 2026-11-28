@@ -117,7 +117,7 @@ import { STANDUP_TOOLS, buildStandupBrief, buildStandupInstructions, readbackLin
 import { EntityCache, type EntityRecord } from "./entity-cache.js";
 import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, redactLine, scrubCredentials, ticketResolved, type AlertmanagerTarget, type BacklogLook, type BacklogTarget, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
+import { ALERTMANAGER_URL_ENV, alertmanagerChanges, alertmanagerOccurrenceKey, alertmanagerSightings, alertmanagerSummary, createAlertmanagerReader, emptyAlertmanagerLook, resolveAlertmanagerUrl, type AlertmanagerFinding, type AlertmanagerLook, type AlertmanagerReader, type AlertmanagerRung } from "./alertmanager.js";
 import { advanced, adoptedBySource, answerDiffers, asksForOpenApproval, commentDiffersFromRecommendation, compactDue, deploymentSettled, derivedStalled, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, hasLabel, IDLE_WAKE_TEXT, isCommentNews, isOwnStageChange, lifecycle, mechanicalStatus, mentionsOwnerOrUser, newHumanComments, newestCommentAt, observedStall, openUserFacingItems, ownChecksFinished, ownPullClosed, ownPullMerged, phaseAndStage, productGateOptions, newestEditComment, repinInitiativeSpecText, specDiff, specHash, specText, stuckDue, workerInFlight, workerReportedTerminal, type Change, type MechanicalEvent, type OpenUserItem } from "./reconcile.js";
 import { classifyApproval, latestProjectApprovalMarker, latestReviewMarker, prGate, reviewMarker, type ReviewMarker } from "./gate.js";
 import { approveOwnerReviewedPull, approvePrPageAction, declineOwnerReviewedPull, delegateWaitNames, deliverApproval, deliverReviewRound, fileForwardedApprovePrNeed, isDelegateWait, isProjectSteward, isUserThread, markerKey, normalizeText, specApprovedByProject, syncPullApproval, userApprovedOnEntity, userSaid, type ApprovalsContext } from "./approvals.js";
@@ -7534,10 +7534,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const c = classified[i]!;
           const a = s.alert;
           const prev = a === null ? prevByFp.get(s.fingerprint) : undefined;
+          const jobName = a?.jobName ?? prev?.jobName ?? null;
           return {
             fingerprint: s.fingerprint,
             alertname: a?.alertname ?? prev?.alertname ?? "(resolved)",
             namespace: a?.namespace ?? prev?.namespace ?? target.namespace,
+            jobName,
+            // The occurrence key is derived from the resolved values, so a
+            // resolved alert (which has no current alert to read) keeps the
+            // key the firing look computed and a late resolved doorbell cannot
+            // re-open an occurrence that already had its reply.
+            occurrenceKey: alertmanagerOccurrenceKey({ fingerprint: s.fingerprint, jobName, startsAt: a?.startsAt ?? prev?.startsAt ?? null }),
             severity: a?.severity ?? prev?.severity ?? null,
             status: a?.status ?? "resolved",
             summary: a?.summary ?? prev?.summary ?? null,

@@ -87,6 +87,14 @@ export type AlertmanagerAlert = {
   fingerprint: string;
   alertname: string;
   namespace: string;
+  /**
+   * The Kubernetes Job the alert is about, from the `job_name` label
+   * (BB-419). Alertmanager's `fingerprint` is stable across a Job's
+   * firing/resolved lifecycle but does not name the run, so the occurrence key
+   * below pairs it with this and `startsAt`. Null when the alert carries no
+   * `job_name` (it is not a Job alert, or the rule does not label one).
+   */
+  jobName: string | null;
   severity: string | null;
   /** active, suppressed or unprocessed, from `status.state`. */
   status: string;
@@ -114,6 +122,7 @@ export function alertOf(json: unknown): AlertmanagerAlert | null {
     fingerprint,
     alertname: safeAlertLabel(str(labels.alertname) ?? "(no alertname)"),
     namespace: safeAlertLabel(str(labels.namespace) ?? ""),
+    jobName: str(labels.job_name) === null ? null : safeAlertLabel(str(labels.job_name)!),
     severity: str(labels.severity) === null ? null : safeAlertLabel(str(labels.severity)!, 60),
     status: safeAlertLabel(state, 60),
     summary: annotations.summary === undefined ? null : redactLine(safeAlertText(String(annotations.summary))),
@@ -128,6 +137,17 @@ export function alertOf(json: unknown): AlertmanagerAlert | null {
 }
 
 export const alertsOf = (json: unknown): AlertmanagerAlert[] => arr(json).map(alertOf).filter((a): a is AlertmanagerAlert => a !== null);
+
+/**
+ * The occurrence key for a Job-failure alert (BB-419): the Alertmanager
+ * fingerprint, the exact Job name and the alert's `startsAt`. The fingerprint
+ * is stable across a firing and its resolution and across a re-fire of the
+ * same label set, so on its own it would collapse two runs of the same Job
+ * into one occurrence. `startsAt` moves on a re-fire and the Job name names
+ * the run, so the three together are one occurrence. The reply dedupe records
+ * this key, never the bare fingerprint.
+ */
+export const alertmanagerOccurrenceKey = (alert: Pick<AlertmanagerAlert, "fingerprint" | "jobName" | "startsAt">): string => `${alert.fingerprint}#${alert.jobName ?? ""}@${alert.startsAt ?? ""}`;
 
 // ---- the reader ---------------------------------------------------------------------------
 
@@ -256,6 +276,10 @@ export const alertmanagerFindingSchema = z.object({
   fingerprint: z.string(),
   alertname: z.string(),
   namespace: z.string(),
+  /** The exact Kubernetes Job the alert names, or null when it names none (BB-419). Defaulted so a look stored before this field parses. */
+  jobName: z.string().nullable().default(null),
+  /** The reply dedupe key: fingerprint + exact Job + startsAt (BB-419). Defaulted so a look stored before this field parses. */
+  occurrenceKey: z.string().default(""),
   severity: z.string().nullable(),
   status: z.string(),
   summary: z.string().nullable(),
